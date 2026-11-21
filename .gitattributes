@@ -1,0 +1,2 @@
+data/** -text
+crates/yiime-core/tests/golden/** -text

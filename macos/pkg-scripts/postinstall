@@ -1,0 +1,5 @@
+#!/bin/bash
+# After installation, end the old input method process, and the system will start the new version
+# the next time you switch to YiIME.
+/usr/bin/killall YiIME 2>/dev/null || true
+exit 0

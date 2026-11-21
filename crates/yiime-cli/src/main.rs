@@ -1,0 +1,178 @@
+//! `yiime query <code>…`: Print candidates using the same core engine as Windows floating boxes,
+//! demonstrating that the core can run headless. The full CLI is step 2.
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+use yiime_core::{ComposeOptions, Composer, Learned, MixedInput, PAGE_SIZE, PAGE_SIZE_RANGE};
+
+const USAGE: &str = "用法：yiime translate <中文>…（免费 Google 翻译，打印每次请求的计时）
+      yiime query <编码>… [--page-size N] [--pages N] [--traditional] [--fuzzy] [--words 文件 | --no-words] [--tsv]
+  大词库默认查找顺序：--words、环境变量 YIIME_WORDS、程序旁的 InputTranslation-words.txt、
+  上级目录中的 data/frost/InputTranslation-words.txt 或 share/yiime/InputTranslation-words.txt。";
+
+const WORDS_FILE: &str = "InputTranslation-words.txt";
+
+fn find_words() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("YIIME_WORDS") {
+        return Some(PathBuf::from(path));
+    }
+    let exe = std::env::current_exe().ok()?;
+    exe.ancestors().skip(1).find_map(|dir| {
+        [
+            dir.join(WORDS_FILE),
+            dir.join("data").join("frost").join(WORDS_FILE),
+            dir.join("share").join("yiime").join(WORDS_FILE),
+        ]
+        .into_iter()
+        .find(|path| path.is_file())
+    })
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("translate") {
+        return translate(&args[1..]);
+    }
+    if args.first().map(String::as_str) != Some("query") {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    }
+    let mut codes = Vec::new();
+    let mut page_size = PAGE_SIZE;
+    let mut pages = 1usize;
+    let mut traditional = false;
+    let mut fuzzy = false;
+    let mut tsv = false;
+    let mut words: Option<Option<PathBuf>> = None;
+    let mut rest = args[1..].iter();
+    let fail = |error: &str| {
+        eprintln!("{error}\n{USAGE}");
+        ExitCode::from(2)
+    };
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--page-size" | "--pages" => {
+                let Some(value) = rest.next().and_then(|value| value.parse::<usize>().ok()) else {
+                    return fail(&format!("{arg} 需要一个数字"));
+                };
+                if arg == "--pages" {
+                    pages = value.max(1);
+                } else {
+                    page_size = value.clamp(*PAGE_SIZE_RANGE.start(), *PAGE_SIZE_RANGE.end());
+                }
+            }
+            "--traditional" => traditional = true,
+            "--fuzzy" => fuzzy = true,
+            "--tsv" => tsv = true,
+            "--no-words" => words = Some(None),
+            "--words" => {
+                let Some(path) = rest.next() else {
+                    return fail("--words 需要文件路径");
+                };
+                words = Some(Some(PathBuf::from(path)));
+            }
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                return ExitCode::SUCCESS;
+            }
+            other if other.starts_with("--") => return fail(&format!("未知选项 {other}")),
+            code => codes.push(code.to_owned()),
+        }
+    }
+    if codes.is_empty() {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    }
+    let mut input = MixedInput::bundled();
+    let words = words.unwrap_or_else(find_words);
+    if let Some(path) = &words {
+        match std::fs::read_to_string(path) {
+            Ok(text) => input = input.with_frequency_words(text),
+            Err(error) => {
+                eprintln!("读取大词库 {} 失败：{error}", path.display());
+                return ExitCode::FAILURE;
+            }
+        }
+    } else if !tsv {
+        eprintln!("（未找到大词库，只用内置词库）");
+    }
+    let options = ComposeOptions {
+        page_size,
+        traditional,
+        learn: false,
+        fuzzy,
+    };
+    let learned = Learned::default();
+    let mut composer = Composer::default();
+    for code in codes {
+        composer.set_code(&input, code.to_lowercase(), &options, &learned);
+        if !tsv {
+            println!("{}  {}", composer.code, composer.page_label());
+        }
+        for page in 0..pages.min(composer.page_count()) {
+            composer.page = page;
+            for (index, candidate) in composer.page_items().iter().enumerate() {
+                let overall = page * page_size + index;
+                if tsv {
+                    println!(
+                        "{page_size}\t{}\t{overall}\t{}\t{:?}\t{}\t{}",
+                        composer.code,
+                        candidate.text,
+                        candidate.source,
+                        candidate.complete,
+                        composer.hint(candidate)
+                    );
+                } else {
+                    println!(
+                        "  {}{}. {}{}  [{:?}{}{}]",
+                        if pages > 1 {
+                            format!("p{} ", page + 1)
+                        } else {
+                            String::new()
+                        },
+                        index + 1,
+                        candidate.text,
+                        composer.hint(candidate),
+                        candidate.source,
+                        if candidate.complete { "" } else { ", 前缀" },
+                        if candidate.rest.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", 余 {}", candidate.rest)
+                        }
+                    );
+                }
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+/// Free Google Translate (same engine as default in Windows version), multiplexed connections
+/// between segments, print timing.
+fn translate(texts: &[String]) -> ExitCode {
+    if texts.is_empty() {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    }
+    let settings = yiime_core::ApiSettings::default();
+    let mut failed = false;
+    for text in texts {
+        let outcome = yiime_core::translate(&settings, text);
+        for attempt in &outcome.attempts {
+            eprintln!("{}", attempt.log_line());
+        }
+        match outcome.result {
+            Ok(english) => println!("{english}"),
+            Err(error) => {
+                eprintln!("翻译失败：{error}");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
+}

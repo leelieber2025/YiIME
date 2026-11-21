@@ -1,0 +1,10 @@
+/target
+/dist/
+**/.ipynb_checkpoints/
+**/__pycache__/
+
+# internal notes
+AGENTS.md
+review.md
+*.log
+*.png

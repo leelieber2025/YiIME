@@ -1,0 +1,180 @@
+import Cocoa
+import InputMethodKit
+import Security
+
+var candidatesWindow: IMKCandidates?
+
+/// Maximum hold time for Shift-click (same as Windows version).
+private let shiftTapMax: TimeInterval = 0.6
+
+private func takeString(_ pointer: UnsafeMutablePointer<CChar>?) -> String {
+    guard let pointer else { return "" }
+    defer { yiime_string_free(pointer) }
+    return String(cString: pointer)
+}
+
+/// Large model settings: address and model name in UserDefaults (llmUrl, llmModel of
+/// com.yiime.inputmethod.YiIME), keys in keychain (common password, service YiIME, account llm). If
+/// nothing is filled in, just use free Google Translate.
+private func llmSettings() -> (String, String, String) {
+    let defaults = UserDefaults(suiteName: "com.yiime.inputmethod.YiIME") ?? .standard
+    let url = defaults.string(forKey: "llmUrl") ?? ""
+    let model = defaults.string(forKey: "llmModel") ?? ""
+    var item: CFTypeRef?
+    let query: [String: Any] = [
+        kSecClass as String: kSecClassGenericPassword,
+        kSecAttrService as String: "YiIME",
+        kSecAttrAccount as String: "llm",
+        kSecReturnData as String: true,
+        kSecMatchLimit as String: kSecMatchLimitOne,
+    ]
+    var key = ""
+    if SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess, let data = item as? Data {
+        key = String(decoding: data, as: UTF8.self)
+    }
+    return (url, model, key)
+}
+
+@objc(YiIMEInputController)
+class YiIMEInputController: IMKInputController {
+    private let ime = yiime_new()
+    private var candidates: [String] = []
+    private var shiftDown: Date?
+    private var translating = false
+
+    deinit { yiime_free(ime) }
+
+    override func recognizedEvents(_ sender: Any!) -> Int {
+        Int(NSEvent.EventTypeMask([.keyDown, .flagsChanged]).rawValue)
+    }
+
+    override func handle(_ event: NSEvent!, client sender: Any!) -> Bool {
+        guard let event, let client = sender as? IMKTextInput else { return false }
+        if event.type == .flagsChanged {
+            return handleFlags(event, client: client)
+        }
+        guard event.type == .keyDown else { return false }
+        shiftDown = nil
+        if translating { return true }
+        let flags = event.modifierFlags.intersection([.command, .control, .option])
+        if !flags.isEmpty { return false }
+        let active = yiime_active(ime)
+        switch event.keyCode {
+        case 36, 76: // Return / Enter
+            guard active else { return false }
+            // Press Enter during grouping: the code is put into the draft alphabetically (same as
+            // Microsoft Pinyin), and then displayed together on the screen.
+            yiime_commit_code(ime)
+            if event.modifierFlags.contains(.shift) {
+                commit(takeString(yiime_take_text(ime)), client: client)
+            } else {
+                translate(client: client)
+            }
+            return true
+        case 51: // Backspace
+            return send("\u{8}", client: client)
+        case 53: // Esc
+            return send("\u{1b}", client: client)
+        case 48, 123, 124, 125, 126: // Tab, arrow keys
+            return active
+        default:
+            break
+        }
+        guard let chars = event.characters, let scalar = chars.unicodeScalars.first, chars.unicodeScalars.count == 1 else {
+            return active
+        }
+        return send(Character(scalar), client: client)
+    }
+
+    private func handleFlags(_ event: NSEvent, client: IMKTextInput) -> Bool {
+        let shift = event.modifierFlags.contains(.shift)
+        let others = !event.modifierFlags.intersection([.command, .control, .option]).isEmpty
+        if shift && !others && (event.keyCode == 56 || event.keyCode == 60) {
+            if shiftDown == nil { shiftDown = Date() }
+            return false
+        }
+        if !shift, let start = shiftDown, Date().timeIntervalSince(start) <= shiftTapMax, yiime_active(ime) {
+            shiftDown = nil
+            yiime_shift_tap(ime)
+            refresh(client: client)
+            return true
+        }
+        shiftDown = nil
+        return false
+    }
+
+    private func send(_ ch: Character, client: IMKTextInput) -> Bool {
+        guard let scalar = ch.unicodeScalars.first else { return false }
+        let handled = yiime_key(ime, scalar.value)
+        if handled { refresh(client: client) }
+        return handled
+    }
+
+    private func state() -> [String: Any] {
+        let json = takeString(yiime_state(ime))
+        return (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any] ?? [:]
+    }
+
+    /// The draft + code is displayed as marked text at the cursor, and the candidate is in the
+    /// candidate window.
+    private func refresh(client: IMKTextInput) {
+        let state = self.state()
+        let draft = state["draft"] as? String ?? ""
+        let code = state["code"] as? String ?? ""
+        let english = state["english"] as? Bool ?? false
+        // English paragraphs are marked with "[英]" at the end (only displayed, not on the screen).
+        let marked = draft + code + (english ? "[英]" : "")
+        let attributes: [NSAttributedString.Key: Any] = [.underlineStyle: NSUnderlineStyle.single.rawValue]
+        client.setMarkedText(NSAttributedString(string: marked, attributes: attributes),
+                             selectionRange: NSRange(location: ((draft + code) as NSString).length, length: 0),
+                             replacementRange: NSRange(location: NSNotFound, length: NSNotFound))
+        let items = state["candidates"] as? [[String: Any]] ?? []
+        candidates = items.enumerated().map { index, item in
+            "\(index + 1).\(item["text"] as? String ?? "")\(item["hint"] as? String ?? "")"
+        }
+        if candidates.isEmpty {
+            candidatesWindow?.hide()
+        } else {
+            candidatesWindow?.update()
+            candidatesWindow?.show(kIMKLocateCandidatesBelowHint)
+        }
+    }
+
+    override func candidates(_ sender: Any!) -> [Any]! { candidates }
+
+    private func commit(_ text: String, client: IMKTextInput) {
+        candidatesWindow?.hide()
+        client.insertText(text, replacementRange: NSRange(location: NSNotFound, length: NSNotFound))
+    }
+
+    private func translate(client: IMKTextInput) {
+        let source = takeString(yiime_take_text(ime))
+        guard !source.isEmpty else { return }
+        candidatesWindow?.hide()
+        translating = true
+        client.setMarkedText(source + " …", selectionRange: NSRange(location: 0, length: 0),
+                             replacementRange: NSRange(location: NSNotFound, length: NSNotFound))
+        let (url, model, key) = llmSettings()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let json = takeString(yiime_translate(source, url, model, key))
+            let value = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any] ?? [:]
+            let ok = value["ok"] as? Bool ?? false
+            let text = ok ? (value["text"] as? String ?? source) : source
+            if !ok { NSLog("YiIME: 翻译失败，上屏中文：%@", value["error"] as? String ?? "") }
+            DispatchQueue.main.async {
+                self.translating = false
+                self.commit(text, client: client)
+            }
+        }
+    }
+
+    override func commitComposition(_ sender: Any!) {
+        guard let client = sender as? IMKTextInput, yiime_active(ime) else { return }
+        commit(takeString(yiime_take_text(ime)), client: client)
+    }
+
+    override func deactivateServer(_ sender: Any!) {
+        candidatesWindow?.hide()
+        super.deactivateServer(sender)
+    }
+}

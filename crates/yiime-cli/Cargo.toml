@@ -1,0 +1,39 @@
+[package]
+name = "yiime-cli"
+version = "0.1.0"
+license = "GPL-3.0-only"
+edition = "2024"
+rust-version = "1.85"
+description = "YiIME command line: candidate lookup and translation test"
+
+[[bin]]
+name = "yiime"
+path = "src/main.rs"
+
+[dependencies]
+yiime-core = { path = "../yiime-core", default-features = false, features = ["bundled", "translate"] }
+
+# Debian package (cargo deb -p yiime-cli): command line + Baishuang lexicon and each lexicon
+# license.
+[package.metadata.deb]
+name = "yiime"
+maintainer = "YiIME <https://github.com/leelieber2025/YiIME>"
+copyright = "YiIME contributors"
+license-file = ["../../LICENSE", "0"]
+section = "utils"
+priority = "optional"
+extended-description = "YiIME command line: wubi/pinyin candidate lookup (yiime query) and Chinese-to-English translation test (yiime translate)."
+assets = [
+    ["target/release/yiime", "usr/bin/", "755"],
+    ["../../data/frost/InputTranslation-words.txt", "usr/share/yiime/", "644"],
+    ["../../README.md", "usr/share/doc/yiime/README.md", "644"],
+    ["../../data/README.md", "usr/share/doc/yiime/data/README.md", "644"],
+    ["../../data/frost/LICENSE", "usr/share/doc/yiime/data/frost/LICENSE", "644"],
+    ["../../data/wubi/LICENSE", "usr/share/doc/yiime/data/wubi/LICENSE", "644"],
+    ["../../data/wubi/AUTHORS", "usr/share/doc/yiime/data/wubi/AUTHORS", "644"],
+    ["../../data/pinyin/LICENSE", "usr/share/doc/yiime/data/pinyin/LICENSE", "644"],
+    ["../../data/pinyin/AUTHORS", "usr/share/doc/yiime/data/pinyin/AUTHORS", "644"],
+    ["../../data/opencc/LICENSE", "usr/share/doc/yiime/data/opencc/LICENSE", "644"],
+    ["../../data/wubi_extra/LICENSE-chinese-xinhua", "usr/share/doc/yiime/data/wubi_extra/", "644"],
+    ["../../data/wubi_extra/LICENSE-rime-wubi86-jidian", "usr/share/doc/yiime/data/wubi_extra/", "644"],
+]

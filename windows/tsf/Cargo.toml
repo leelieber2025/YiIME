@@ -1,0 +1,29 @@
+[package]
+name = "input_translation_tsf"
+version = "0.1.0"
+license = "GPL-3.0-only"
+edition = "2024"
+rust-version = "1.88"
+
+[lib]
+crate-type = ["cdylib"]
+
+[build-dependencies]
+embed-resource = "3"
+
+[target.'cfg(windows)'.dependencies]
+# Platform-independent core: setting names and default values, shortcut key parsing, punctuation
+# mapping (do not translate the client and built-in lexicon).
+yiime-core = { path = "../../crates/yiime-core", default-features = false }
+windows-core = "0.62.2"
+windows-registry = "0.6"
+windows = { version = "0.62.2", features = [
+  "Win32_Foundation", "Win32_System_Com", "Win32_System_Ole", "Win32_System_Variant", "Win32_System_LibraryLoader",
+  "Win32_System_SystemServices", "Win32_UI_TextServices",
+  "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"
+] }
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_System_DataExchange",
+  "Win32_System_LibraryLoader", "Win32_System_Threading", "Win32_System_Diagnostics_Debug",
+  "Win32_UI_WindowsAndMessaging", "Win32_UI_Input_KeyboardAndMouse"
+] }
