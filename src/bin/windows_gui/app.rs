@@ -145,7 +145,7 @@ const WM_OPEN_HISTORY: u32 = WM_APP + 6;
 /// The dictionary with the large lexicon finished loading in the background.
 const WM_FULL_INPUT: u32 = WM_APP + 7;
 /// From the TSF DLL (wParam = receiver): the focus in that application moved (another text field,
-/// the page, another window).
+/// the page, another window); lParam 1: the DLL ended the session (another text field).
 const WM_TSF_FOCUS_MOVED: u32 = WM_APP + 8;
 /// From the TSF DLL (wParam = receiver): that application switched to English (Shift tap,
 /// Ctrl+Space, the mode button…); its session ends.
@@ -1650,7 +1650,24 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 && w != 0
                 && w as HWND == state.tsf_receiver.get()
             {
-                unsafe { hide_if_empty(hwnd, state, true) };
+                if l == 1 {
+                    // The DLL already ended this session (focus moved to another text field):
+                    // close the box whatever it shows (draft kept), so the next letter opens a
+                    // fresh one there.
+                    if yiime_core::english_ends_session(yiime_core::BoxView {
+                        visible: unsafe { IsWindowVisible(hwnd) } != 0,
+                        busy: state.pending.get(),
+                        ..Default::default()
+                    }) {
+                        service_log("session end: host focus moved to another field");
+                        // Not told back: the DLL may already have opened the next session,
+                        // which an empty commit would end.
+                        state.finished.set(true);
+                        unsafe { deactivate(hwnd, state) };
+                    }
+                } else {
+                    unsafe { hide_if_empty(hwnd, state, true) };
+                }
             }
             0
         }

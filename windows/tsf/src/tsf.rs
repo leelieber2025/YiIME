@@ -570,6 +570,28 @@ impl TextService {
             }
         }
     }
+    /// Ends this application's input session on the DLL side because the focus moved to another
+    /// text field, and tells the box to close (WM_APP + 8 with lParam 1). The context is kept, so
+    /// a translation still in flight lands where it was started unless a new session begins
+    /// (the box then drops the stale result).
+    fn drop_stale_session(&self, reason: &str) {
+        if !self.buffering() {
+            return;
+        }
+        log(&format!("结束旧的输入会话：{reason}"));
+        self.kill_timers();
+        self.editor_open.set(false);
+        self.pending_keys.borrow_mut().clear();
+        self.first_key.set(None);
+        self.flush_attempts.set(0);
+        let editor_window = self.editor_window.get();
+        let receiver = self.receiver.get();
+        if !editor_window.is_null() && !receiver.is_null() {
+            unsafe {
+                let _ = PostMessageW(editor_window, WM_APP + 8, receiver as usize, 1);
+            }
+        }
+    }
     /// Tells the shared input box that the focus in this application moved (another text field,
     /// the page, another window), so an empty box is hidden at once instead of lingering
     /// (WM_APP + 8, wParam = receiver; the box ignores it when it has content or the keyboard).
@@ -875,12 +897,17 @@ impl TextService {
         if !self.keyboard_open() {
             return false;
         }
-        if self.buffering() {
-            return self
-                .context
-                .borrow()
-                .as_ref()
-                .is_some_and(|active| active == context);
+        let same_context = self
+            .context
+            .borrow()
+            .as_ref()
+            .is_some_and(|active| active == context);
+        match yiime_core::key_route(self.buffering(), same_context) {
+            yiime_core::KeyRoute::Buffer => return true,
+            // The box still belongs to another text field: drop that session so this letter
+            // starts a fresh one instead of being refused.
+            yiime_core::KeyRoute::StaleSession => self.drop_stale_session("按键来自另一个输入框"),
+            yiime_core::KeyRoute::NewSession => {}
         }
         // No session: plain letters start one. Shift+letter and letters under Caps Lock go to the
         // application as usual (capitals typed directly, no box, as in Microsoft Wubi).
@@ -1575,9 +1602,14 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
     fn OnSetFocus(
         &self,
         document: Ref<ITfDocumentMgr>,
-        _previous: Ref<ITfDocumentMgr>,
+        previous: Ref<ITfDocumentMgr>,
     ) -> Result<()> {
         com_guard("OnSetFocus", || {
+            // Focus moved to another text field of this application (not to the input box, which
+            // leaves no focused document here): the old session ends now.
+            if document.is_some() && document.as_ref() != previous.as_ref() {
+                self.drop_stale_session("焦点移到另一个输入框");
+            }
             self.notify_focus_moved();
             self.scope_cache.borrow_mut().take();
             self.tested_key.borrow_mut().take();

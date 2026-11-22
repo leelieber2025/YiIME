@@ -274,6 +274,29 @@ pub fn english_ends_session(view: BoxView) -> bool {
     view.visible && !view.busy
 }
 
+/// Where a letter typed in the host goes, in the TSF DLL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyRoute {
+    /// A session is open in this text field: buffer the letter for the box.
+    Buffer,
+    /// A session is open, but for another text field (the user clicked elsewhere while the box
+    /// lingered): end that session at once and start a fresh one with this letter.
+    StaleSession,
+    /// No session: the letter starts one.
+    NewSession,
+}
+
+/// `session_open`: the DLL has an input session; `same_context`: the key comes from the text
+/// field (TSF context) that session belongs to. A session for another field never swallows
+/// input: before 0.2.0-rc.2 those letters were refused until the old box ended.
+pub fn key_route(session_open: bool, same_context: bool) -> KeyRoute {
+    match (session_open, same_context) {
+        (true, true) => KeyRoute::Buffer,
+        (true, false) => KeyRoute::StaleSession,
+        (false, _) => KeyRoute::NewSession,
+    }
+}
+
 /// What a Shift tap in the input box does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShiftTapAction {
@@ -611,5 +634,21 @@ mod tests {
             visible: false,
             ..shown
         }));
+    }
+
+    #[test]
+    fn a_session_for_another_field_never_blocks_input() {
+        assert_eq!(key_route(true, true), KeyRoute::Buffer);
+        assert_eq!(key_route(true, false), KeyRoute::StaleSession);
+        assert_eq!(key_route(false, false), KeyRoute::NewSession);
+        assert_eq!(key_route(false, true), KeyRoute::NewSession);
+        // After the DLL drops the stale session it tells the box (focus moved, session dropped):
+        // the box closes even with a draft or the foreground (draft kept), unless translating.
+        let lingering = BoxView {
+            visible: true,
+            empty: false,
+            ..BoxView::default()
+        };
+        assert!(english_ends_session(lingering));
     }
 }

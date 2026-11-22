@@ -70,10 +70,10 @@ pub use reload::{FileStamp, UserWordsReloader};
 pub use request::RequestGate;
 pub use service::{
     Activation, BACKOFF_RESET, BoxView, EMPTY_BOX_GRACE_MS, FIRST_BACKOFF, HIGH_INTEGRITY,
-    HostOwner, MAX_BACKOFF, MEDIUM_INTEGRITY, ProcessSecurity, REQUEST_TIMEOUT_MS, ServiceHealth,
-    ShiftTapAction, TSF_PROTOCOL, TSF_RECEIVER_CLASS, WATCHDOG_GRACE, WATCHDOG_LIMIT, Watchdog,
-    WatchedHosts, english_ends_session, hide_empty_box, may_share_service, needs_private_editor,
-    service_window_title, shift_tap_action,
+    HostOwner, KeyRoute, MAX_BACKOFF, MEDIUM_INTEGRITY, ProcessSecurity, REQUEST_TIMEOUT_MS,
+    ServiceHealth, ShiftTapAction, TSF_PROTOCOL, TSF_RECEIVER_CLASS, WATCHDOG_GRACE,
+    WATCHDOG_LIMIT, Watchdog, WatchedHosts, english_ends_session, hide_empty_box, key_route,
+    may_share_service, needs_private_editor, service_window_title, shift_tap_action,
 };
 pub use settings::{
     AZURE_KEY_FILE, ApiSettings, DEFAULT_HISTORY_KEY, DEFAULT_URL, Engine, Flag, GOOGLE_KEY_FILE,
