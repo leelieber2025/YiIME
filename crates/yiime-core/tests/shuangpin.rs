@@ -1,4 +1,5 @@
 //! Shuangpin through the composer: keys stay as typed, candidates come from full pinyin only.
+#![allow(clippy::unwrap_used)] // Tests may unwrap.
 
 use yiime_core::{ComposeOptions, Composer, Learned, LetterRules, MixedInput, Shuangpin};
 

@@ -12,3 +12,7 @@ crate-type = ["staticlib", "rlib"]
 [dependencies]
 yiime-core = { path = "../yiime-core" }
 serde_json = "1"
+
+[lints.clippy]
+# Errors are propagated or defaulted; tests may unwrap (clippy.toml).
+unwrap_used = "warn"

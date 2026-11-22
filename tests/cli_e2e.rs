@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)] // Tests may unwrap.
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};

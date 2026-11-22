@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)] // Tests may unwrap.
 #![cfg(feature = "bundled")]
 //! Golden test for pinyin tolerance (v13): typo correction, mixed full syllables and initials,
 //! syllable segmentation with partial picks, whole sentences and fuzzy pinyin (off by default).

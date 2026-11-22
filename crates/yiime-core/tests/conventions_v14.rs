@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)] // Tests may unwrap.
 #![cfg(feature = "bundled")]
 //! Common input-method conventions (Microsoft Pinyin, Sogou, Rime): picking a character from a
 //! word, comma/period paging, forgetting learned picks, auto-closing brackets and quotes, numpad

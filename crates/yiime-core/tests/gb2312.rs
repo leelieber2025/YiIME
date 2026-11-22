@@ -1,5 +1,6 @@
 //! With only common characters shown and Simplified output, single pinyin characters outside
 //! GB 2312 (mostly Traditional forms) rank after the GB 2312 ones; --all-chars keeps the old order.
+#![allow(clippy::unwrap_used)] // Tests may unwrap.
 
 use yiime_core::{ComposeOptions, Composer, Learned, MixedInput, is_gb2312_hanzi};
 

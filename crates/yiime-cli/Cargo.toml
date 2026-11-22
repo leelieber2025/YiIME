@@ -37,3 +37,7 @@ assets = [
     ["../../data/wubi_extra/LICENSE-chinese-xinhua", "usr/share/doc/yiime/data/wubi_extra/", "644"],
     ["../../data/wubi_extra/LICENSE-rime-wubi86-jidian", "usr/share/doc/yiime/data/wubi_extra/", "644"],
 ]
+
+[lints.clippy]
+# Errors are propagated or defaulted; tests may unwrap (clippy.toml).
+unwrap_used = "warn"

@@ -20,3 +20,7 @@ translate = ["dep:ureq", "dep:url"]
 serde_json = "1"
 ureq = { version = "2", features = ["json", "proxy-from-env"], optional = true }
 url = { version = "2", optional = true }
+
+[lints.clippy]
+# Errors are propagated or defaulted; tests may unwrap (clippy.toml).
+unwrap_used = "warn"

@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)] // Tests may unwrap.
 #![cfg(feature = "bundled")]
 //! Shift tap mid-composition switches to inline English: simulates the Windows input box's key
 //! handling.

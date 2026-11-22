@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)] // Tests may unwrap.
 #![cfg(feature = "bundled")]
 //! Golden test: engine output must match v11 (the tested Windows release) line by line.
 //!

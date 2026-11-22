@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)] // Tests may unwrap.
 use std::process::Command;
 
 fn query(args: &[&str]) -> (i32, String) {

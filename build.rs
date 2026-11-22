@@ -10,7 +10,8 @@ fn main() {
 
 /// VERSIONINFO comes from the Cargo package version.
 fn version_macros() -> [String; 3] {
-    let part = |name: &str| std::env::var(name).unwrap();
+    let part =
+        |name: &str| std::env::var(name).expect("Cargo sets CARGO_PKG_VERSION_* for build scripts");
     [
         format!("YIIME_VERSION_MAJOR={}", part("CARGO_PKG_VERSION_MAJOR")),
         format!("YIIME_VERSION_MINOR={}", part("CARGO_PKG_VERSION_MINOR")),
