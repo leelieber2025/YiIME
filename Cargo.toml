@@ -7,7 +7,7 @@ rust-version = "1.88"
 default-run = "input_translation"
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 
 [workspace]
 members = ["crates/yiime-core", "crates/yiime-cli", "crates/yiime-ffi", "windows/tsf"]
