@@ -103,6 +103,8 @@ const GOOGLE_FREE_TIMEOUT: Duration = Duration::from_secs(4);
 const GOOGLE_CLOUD_TIMEOUT: Duration = Duration::from_secs(8);
 const LLM_TIMEOUT: Duration = Duration::from_secs(20);
 const GOOGLE_FREE_URL: &str = "https://translate.googleapis.com/translate_a/single";
+const AZURE_TIMEOUT: Duration = Duration::from_secs(6);
+const AZURE_URL: &str = "https://api.cognitive.microsofttranslator.com/translate";
 const GOOGLE_CLOUD_URL: &str = "https://translation.googleapis.com/language/translate/v2";
 
 /// Shared HTTP clients (with and without proxy) so connections are reused and DNS/TCP/TLS happen
@@ -219,19 +221,27 @@ pub fn translate(settings: &ApiSettings, source: &str) -> Outcome {
     }
     let mut attempts = Vec::new();
     let llm_ok = settings.validate_llm().is_ok();
-    let skip_google = settings.engine == Engine::GoogleFree && llm_ok && google_blocked();
+    let engine = match settings.engine {
+        Engine::Azure if settings.azure_key.trim().is_empty() => Engine::GoogleFree,
+        other => other,
+    };
+    let skip_google = engine == Engine::GoogleFree && llm_ok && google_blocked();
     let result = if skip_google {
         run(settings, Engine::Llm, source, &mut attempts)
     } else {
-        let first = run(settings, settings.engine, source, &mut attempts);
-        if settings.engine == Engine::GoogleFree {
+        let first = run(settings, engine, source, &mut attempts);
+        if engine == Engine::GoogleFree {
             let limited = attempts.last().and_then(|a| a.failure.as_deref()) == Some("http 429");
             set_google_blocked(limited);
         }
         match first {
-            Err(error) if settings.engine != Engine::Llm && llm_ok => {
+            Err(error) if engine != Engine::Llm && llm_ok => {
                 run(settings, Engine::Llm, source, &mut attempts)
                     .map_err(|llm| format!("{error}；改用大模型也失败：{llm}"))
+            }
+            Err(error) if engine == Engine::Azure && !google_blocked() => {
+                run(settings, Engine::GoogleFree, source, &mut attempts)
+                    .map_err(|google| format!("{error}；改用 Google 也失败：{google}"))
             }
             other => other,
         }
@@ -255,6 +265,17 @@ fn run(
     let started = Instant::now();
     let mut first_byte = None;
     let (host, model, result) = match engine {
+        Engine::Azure => (
+            host_of(AZURE_URL),
+            String::new(),
+            azure(
+                source,
+                settings.azure_key.trim(),
+                settings.azure_region.trim(),
+                &mut first_byte,
+                started,
+            ),
+        ),
         Engine::GoogleFree => (
             host_of(GOOGLE_FREE_URL),
             String::new(),
@@ -328,6 +349,43 @@ fn parse_google_free(json: &Value) -> Result<String, String> {
     } else {
         Ok(text.to_owned())
     }
+}
+
+/// Azure Translator v3; region is required for regional resources, optional for global.
+fn azure(
+    source: &str,
+    key: &str,
+    region: &str,
+    first_byte: &mut Option<u128>,
+    started: Instant,
+) -> Result<String, Fail> {
+    if key.is_empty() {
+        return Err(Fail::new("config", "缺少 Azure 翻译的密钥"));
+    }
+    let mut request = agent(false)
+        .post(AZURE_URL)
+        .timeout(AZURE_TIMEOUT)
+        .query("api-version", "3.0")
+        .query("from", "zh-Hans")
+        .query("to", "en")
+        .set("Ocp-Apim-Subscription-Key", key);
+    if !region.is_empty() && !region.eq_ignore_ascii_case("global") {
+        request = request.set("Ocp-Apim-Subscription-Region", region);
+    }
+    let response = request
+        .send_json(json!([{ "Text": source }]))
+        .map_err(http_error)?;
+    *first_byte = Some(started.elapsed().as_millis());
+    let json: Value = response.into_json().map_err(|_| "Azure 翻译返回格式不对")?;
+    parse_azure(&json).map_err(|message| Fail::new("empty", message))
+}
+
+fn parse_azure(json: &Value) -> Result<String, String> {
+    json[0]["translations"][0]["text"]
+        .as_str()
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| "Azure 翻译没有返回译文".into())
 }
 
 /// Google Cloud Translation v2 (`?key=`).
@@ -509,6 +567,10 @@ pub fn prewarm(settings: &ApiSettings) {
     }
     let mut targets = Vec::new();
     match settings.engine {
+        Engine::Azure if settings.azure_key.trim().is_empty() => {
+            targets.push((GOOGLE_FREE_URL.to_owned(), false))
+        }
+        Engine::Azure => targets.push((AZURE_URL.to_owned(), false)),
         Engine::GoogleFree => targets.push((GOOGLE_FREE_URL.to_owned(), false)),
         Engine::GoogleCloud => targets.push((GOOGLE_CLOUD_URL.to_owned(), false)),
         Engine::Llm => {}
@@ -702,7 +764,7 @@ mod tests {
     fn google_free_needs_no_settings_and_falls_back_only_when_llm_ready() {
         // No network: only checks the fallback condition.
         let defaults = ApiSettings::default();
-        assert_eq!(defaults.engine, Engine::GoogleFree);
+        assert_eq!(defaults.engine, Engine::Azure);
         assert!(defaults.validate().is_ok());
         assert!(defaults.validate_llm().is_err());
     }
@@ -806,5 +868,12 @@ mod tests {
         assert!(line.ends_with("error=http 500"), "{line}");
         assert!(line.contains("chars=4"));
         assert!(!line.contains("秘密") && !line.contains("echo") && !line.contains("secret"));
+    }
+
+    #[test]
+    fn parses_azure_response() {
+        let json = serde_json::json!([{"translations": [{"text": " Hello ", "to": "en"}]}]);
+        assert_eq!(super::parse_azure(&json).unwrap(), "Hello");
+        assert!(super::parse_azure(&serde_json::json!([])).is_err());
     }
 }

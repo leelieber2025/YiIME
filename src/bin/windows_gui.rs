@@ -127,9 +127,11 @@ mod app {
     const SETTINGS_PAGE_SIZE: i32 = 223;
     const SETTINGS_ENGINE: i32 = 224;
     const SETTINGS_GOOGLE_KEY: i32 = 225;
+    const SETTINGS_AZURE_KEY: i32 = 226;
+    const SETTINGS_AZURE_REGION: i32 = 227;
     /// Height of the Translation Engine row at the top of the settings window; the other controls
     /// move down by this much.
-    const ENGINE_SHIFT: i32 = 56;
+    const ENGINE_SHIFT: i32 = 112;
     /// Longest custom LLM instruction kept from the settings window, in characters.
     const MAX_CUSTOM_LEN: usize = 500;
     const PAD: i32 = 6;
@@ -2583,9 +2585,35 @@ mod app {
                     24,
                     SETTINGS_GOOGLE_KEY,
                 );
+                label(hwnd, "Azure 翻译密钥（加密保存）", 16, 68, 196);
+                let azure_key = control(
+                    hwnd,
+                    "EDIT",
+                    &settings.azure_key,
+                    ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+                    16,
+                    90,
+                    196,
+                    24,
+                    SETTINGS_AZURE_KEY,
+                );
+                label(hwnd, "Azure 区域（如 eastus，全局可留空）", 228, 68, 196);
+                let azure_region = control(
+                    hwnd,
+                    "EDIT",
+                    &settings.azure_region,
+                    ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+                    228,
+                    90,
+                    196,
+                    24,
+                    SETTINGS_AZURE_REGION,
+                );
                 let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
                 SetWindowPos(engine, HWND_TOP, 0, 0, 0, 0, flags);
                 SetWindowPos(google_key, engine, 0, 0, 0, 0, flags);
+                SetWindowPos(azure_key, google_key, 0, 0, 0, 0, flags);
+                SetWindowPos(azure_region, azure_key, 0, 0, 0, 0, flags);
                 0
             },
             WM_COMMAND => unsafe {
@@ -2606,6 +2634,8 @@ mod app {
                                 .and_then(|index| Engine::ALL.get(index).copied())
                                 .unwrap_or_default(),
                             google_key: field(SETTINGS_GOOGLE_KEY),
+                            azure_key: field(SETTINGS_AZURE_KEY),
+                            azure_region: field(SETTINGS_AZURE_REGION),
                             url: field(SETTINGS_URL),
                             model: field(SETTINGS_MODEL),
                             key: field(SETTINGS_KEY),

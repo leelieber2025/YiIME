@@ -46,9 +46,9 @@ pub use inline::{
 #[cfg(feature = "engine")]
 pub use learn::{LEARNED_FILE, Learned};
 pub use settings::{
-    ApiSettings, DEFAULT_HISTORY_KEY, DEFAULT_URL, Engine, Flag, GOOGLE_KEY_FILE, KEY_FILE,
-    MemoryStore, OptionStore, Options, PAGE_SIZE, PAGE_SIZE_RANGE, PlainSealer, SETTINGS_FILE,
-    Sealer, USER_WORDS_FILE, parse_page_size,
+    AZURE_KEY_FILE, ApiSettings, DEFAULT_HISTORY_KEY, DEFAULT_URL, Engine, Flag, GOOGLE_KEY_FILE,
+    KEY_FILE, MemoryStore, OptionStore, Options, PAGE_SIZE, PAGE_SIZE_RANGE, PlainSealer,
+    SETTINGS_FILE, Sealer, USER_WORDS_FILE, parse_page_size,
 };
 pub use style::{TranslationStyle, system_prompt};
 #[cfg(feature = "engine")]

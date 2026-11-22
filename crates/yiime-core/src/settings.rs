@@ -201,7 +201,7 @@ impl Sealer for PlainSealer {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiSettings {
-    /// Translation engine; free Google by default. If it fails and an LLM is configured, the LLM is
+    /// Translation engine; Azure by default (free Google until an Azure key is set). If it fails and an LLM is configured, the LLM is
     /// used instead.
     pub engine: Engine,
     pub url: String,
@@ -211,16 +211,23 @@ pub struct ApiSettings {
     pub custom: String,
     /// Google Cloud Translation v2 API key (stored encrypted in [`GOOGLE_KEY_FILE`]).
     pub google_key: String,
+    /// Azure Translator key (stored encrypted in [`AZURE_KEY_FILE`]) and resource region.
+    pub azure_key: String,
+    pub azure_region: String,
 }
 
 /// Encrypted Google Cloud key file (separate from the LLM key).
 pub const GOOGLE_KEY_FILE: &str = "google.dpapi";
+/// Encrypted Azure Translator key file.
+pub const AZURE_KEY_FILE: &str = "azure.dpapi";
 
 /// Translation engine; `id` is what settings.json stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Engine {
-    /// Free translate.googleapis.com endpoint (no key, unofficial, may be rate-limited).
+    /// Azure Translator (F0 free tier); without a key, free Google is used.
     #[default]
+    Azure,
+    /// Free translate.googleapis.com endpoint (no key, unofficial, may be rate-limited).
     GoogleFree,
     /// Google Cloud Translation v2 (API key required).
     GoogleCloud,
@@ -229,9 +236,10 @@ pub enum Engine {
 }
 
 impl Engine {
-    pub const ALL: [Self; 3] = [Self::GoogleFree, Self::GoogleCloud, Self::Llm];
+    pub const ALL: [Self; 4] = [Self::Azure, Self::GoogleFree, Self::GoogleCloud, Self::Llm];
     pub fn id(self) -> &'static str {
         match self {
+            Self::Azure => "azure",
             Self::GoogleFree => "google_free",
             Self::GoogleCloud => "google_cloud",
             Self::Llm => "llm",
@@ -245,7 +253,8 @@ impl Engine {
     }
     pub fn label(self) -> &'static str {
         match self {
-            Self::GoogleFree => "Google 翻译（免费，默认）",
+            Self::Azure => "Azure 翻译（F0 免费，默认）",
+            Self::GoogleFree => "Google 翻译（免费）",
             Self::GoogleCloud => "Google Cloud 翻译（需密钥）",
             Self::Llm => "大模型（OpenAI 兼容）",
         }
@@ -262,6 +271,8 @@ impl Default for ApiSettings {
             style: TranslationStyle::default(),
             custom: String::new(),
             google_key: String::new(),
+            azure_key: String::new(),
+            azure_region: String::new(),
         }
     }
 }
@@ -286,6 +297,9 @@ impl ApiSettings {
             if let Some(text) = value["custom"].as_str() {
                 settings.custom = text.to_owned();
             }
+            if let Some(text) = value["azure_region"].as_str() {
+                settings.azure_region = text.to_owned();
+            }
             if let Some(text) = value["engine"].as_str() {
                 settings.engine = Engine::from_id(text);
             }
@@ -303,6 +317,13 @@ impl ApiSettings {
             .and_then(|clear| String::from_utf8(clear).ok());
         if let Some(text) = google {
             settings.google_key = text;
+        }
+        let azure = std::fs::read(dir.join(AZURE_KEY_FILE))
+            .ok()
+            .and_then(|bytes| sealer.open(&bytes))
+            .and_then(|clear| String::from_utf8(clear).ok());
+        if let Some(text) = azure {
+            settings.azure_key = text;
         }
         settings
     }
@@ -323,6 +344,17 @@ impl ApiSettings {
                 .ok_or_else(|| std::io::Error::other("密钥加密失败"))?;
             std::fs::write(google, sealed)?;
         }
+        let azure = dir.join(AZURE_KEY_FILE);
+        if self.azure_key.trim().is_empty() {
+            if azure.exists() {
+                std::fs::remove_file(&azure)?;
+            }
+        } else {
+            let sealed = sealer
+                .seal(self.azure_key.trim().as_bytes())
+                .ok_or_else(|| std::io::Error::other("密钥加密失败"))?;
+            std::fs::write(azure, sealed)?;
+        }
         std::fs::write(
             dir.join(SETTINGS_FILE),
             serde_json::to_vec(&serde_json::json!({
@@ -331,6 +363,7 @@ impl ApiSettings {
                 "style": self.style.id(),
                 "custom": self.custom,
                 "engine": self.engine.id(),
+                "azure_region": self.azure_region.trim(),
             }))?,
         )
     }
@@ -338,7 +371,7 @@ impl ApiSettings {
     /// [`Self::validate_llm`] for the LLM.
     pub fn validate(&self) -> Result<(), &'static str> {
         match self.engine {
-            Engine::GoogleFree => Ok(()),
+            Engine::Azure | Engine::GoogleFree => Ok(()),
             Engine::GoogleCloud if self.google_key.trim().is_empty() => {
                 Err("请先在“设置”中填写 Google Cloud 翻译的 API 密钥")
             }
@@ -419,8 +452,11 @@ mod tests {
             style: TranslationStyle::Academic,
             custom: "x".into(),
             google_key: "gkey".into(),
+            azure_key: "akey".into(),
+            azure_region: "eastus".into(),
         };
         settings.save(&dir, &Xor).unwrap();
+        assert_ne!(std::fs::read(dir.join(AZURE_KEY_FILE)).unwrap(), b"akey");
         let raw = std::fs::read(dir.join(KEY_FILE)).unwrap();
         assert_ne!(raw, b"secret");
         let json = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
@@ -434,7 +470,7 @@ mod tests {
         assert!(bad.validate().is_ok());
         bad.key = " ".into();
         assert!(bad.validate().is_err());
-        assert_eq!(ApiSettings::default().engine, Engine::GoogleFree);
+        assert_eq!(ApiSettings::default().engine, Engine::Azure);
         assert!(ApiSettings::default().validate().is_ok());
         let cloud = ApiSettings {
             engine: Engine::GoogleCloud,
