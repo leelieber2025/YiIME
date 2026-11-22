@@ -351,8 +351,17 @@ pub(super) unsafe extern "system" fn edit_proc(
         let tapped = tap.key_up(w as u32, std::time::Instant::now());
         state.shift_tap.set(tap);
         if tapped && !state.pending.get() {
+            let action = yiime_core::shift_tap_action(
+                state.tsf_service && !state.tsf_receiver.get().is_null(),
+                state.composition.borrow().code.is_empty(),
+                unsafe { GetWindowTextLengthW(state.edit) } == 0,
+                state.english.get(),
+            );
             unsafe {
-                toggle_inline_english(hwnd, state);
+                match action {
+                    yiime_core::ShiftTapAction::ToggleSegment => toggle_inline_english(hwnd, state),
+                    yiime_core::ShiftTapAction::SwitchToEnglish => switch_to_english(hwnd, state),
+                }
             }
         }
     }

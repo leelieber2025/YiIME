@@ -72,6 +72,11 @@ unsafe fn receiver_proc_impl(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> 
             }
             return ready as LRESULT;
         }
+        // The input box was empty and the user tapped Shift: switch to English like a Shift tap
+        // in the application (the box has already closed).
+        if packet.dwData == 4 {
+            return unsafe { (*pointer).switch_to_english() } as LRESULT;
+        }
         if packet.dwData != 0 {
             return 0;
         }

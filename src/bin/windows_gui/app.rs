@@ -5,7 +5,7 @@ mod history;
 mod ipc;
 mod key;
 use candidate::{create_font, paint, relayout};
-use ipc::{notify_tsf_ready, send_tsf_text, watch_tsf_owner};
+use ipc::{notify_tsf_ready, send_tsf_english, send_tsf_text, watch_tsf_owner};
 use key::{edit_proc, handle_char, insert_text, pick, set_code};
 mod settings;
 mod tray;
@@ -632,6 +632,17 @@ unsafe fn toggle_inline_english(hwnd: HWND, state: &State) {
         relayout(hwnd, state);
         if !english {
             flush_plain(hwnd, state);
+        }
+    }
+}
+/// Shift tap in an empty TSF box: like a Shift tap in the application, switch it to English, and
+/// close the box right away (end the session, give the focus back).
+unsafe fn switch_to_english(hwnd: HWND, state: &State) {
+    let receiver = state.tsf_receiver.get();
+    unsafe {
+        cancel_session(hwnd, state);
+        if !receiver.is_null() && !send_tsf_english(receiver, hwnd) {
+            service_log("Shift 切换英文：输入法没有响应");
         }
     }
 }

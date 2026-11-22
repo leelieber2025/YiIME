@@ -266,6 +266,31 @@ pub fn hide_empty_box(view: BoxView, host_focus_moved: bool) -> bool {
         && (host_focus_moved || view.shown_for_ms >= EMPTY_BOX_GRACE_MS)
 }
 
+/// What a Shift tap in the input box does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftTapAction {
+    /// Toggle the inline English segment ("Shift 夹英文"): the box has something in it.
+    ToggleSegment,
+    /// The box is empty: switch the application's input mode to English (as a Shift tap in the
+    /// application does) and close the box at once, instead of leaving an empty box up.
+    SwitchToEnglish,
+}
+
+/// `tsf`: the box serves a TSF session (not the standalone tray box). `english_segment`: the
+/// inline English segment is on (a tap turns it off and keeps the box).
+pub fn shift_tap_action(
+    tsf: bool,
+    code_empty: bool,
+    draft_empty: bool,
+    english_segment: bool,
+) -> ShiftTapAction {
+    if tsf && code_empty && draft_empty && !english_segment {
+        ShiftTapAction::SwitchToEnglish
+    } else {
+        ShiftTapAction::ToggleSegment
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -540,5 +565,18 @@ mod tests {
                 false
             ));
         }
+    }
+
+    #[test]
+    fn shift_tap_in_an_empty_box_switches_to_english_and_closes() {
+        use ShiftTapAction::*;
+        assert_eq!(shift_tap_action(true, true, true, false), SwitchToEnglish);
+        // Something to keep: the tap toggles the English segment, the box stays.
+        assert_eq!(shift_tap_action(true, false, true, false), ToggleSegment);
+        assert_eq!(shift_tap_action(true, true, false, false), ToggleSegment);
+        // Leaving an English segment that is still empty: back to Chinese in the box.
+        assert_eq!(shift_tap_action(true, true, true, true), ToggleSegment);
+        // The standalone box has no application to switch.
+        assert_eq!(shift_tap_action(false, true, true, false), ToggleSegment);
     }
 }

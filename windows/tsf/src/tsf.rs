@@ -971,6 +971,13 @@ impl TextService {
             ));
         }
     }
+    /// Chinese → English (OPENCLOSE off), for a Shift tap in the empty input box. True when the
+    /// application is in English afterwards.
+    fn switch_to_english(&self) -> bool {
+        let ok = !self.keyboard_open() || self.toggle_keyboard_mode();
+        log(&format!("输入框里 Shift 单击切换到英文：{ok}"));
+        ok
+    }
     fn refresh_mode_button(&self) {
         if let Some((_, _, sink)) = self.mode_button.borrow().as_ref() {
             refresh_sink(sink);

@@ -38,6 +38,28 @@ pub(super) unsafe fn send_tsf_text(receiver: HWND, sender: HWND, text: &str) -> 
             && accepted != 0
     }
 }
+/// Asks the TSF DLL to switch its application to English input (COPYDATA dwData 4), as a Shift
+/// tap there would.
+pub(super) unsafe fn send_tsf_english(receiver: HWND, sender: HWND) -> bool {
+    let packet = COPYDATASTRUCT {
+        dwData: 4,
+        cbData: 0,
+        lpData: null_mut(),
+    };
+    let mut accepted = 0usize;
+    unsafe {
+        SendMessageTimeoutW(
+            receiver,
+            WM_COPYDATA,
+            sender as usize,
+            &packet as *const _ as isize,
+            SMTO_ABORTIFHUNG,
+            1000,
+            &mut accepted,
+        ) != 0
+            && accepted != 0
+    }
+}
 pub(super) unsafe fn notify_tsf_ready(receiver: HWND, sender: HWND) {
     let packet = COPYDATASTRUCT {
         dwData: 1,
