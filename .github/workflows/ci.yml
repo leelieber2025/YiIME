@@ -89,6 +89,16 @@ jobs:
         run: |
           cargo build --release -p input_translation
           cargo build --release -p input_translation_tsf
+      # Headless smoke test of the real input box: scripted keys go through the Win32 key handler
+      # (yiime_core::classify_char + the edit control) and the draft is checked. No tray icon, no
+      # registry writes; the process exits non-zero (and prints to stderr) on a mismatch.
+      - name: Input box smoke test
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'target\release\windows_gui.exe').Path
+          $result = Start-Process $exe -ArgumentList '--self-test' -Wait -PassThru -RedirectStandardError self-test.log
+          Get-Content self-test.log
+          if ($result.ExitCode -ne 0) { throw "self-test failed: $($result.ExitCode)" }
       - name: Register and unregister TSF
         shell: pwsh
         run: |

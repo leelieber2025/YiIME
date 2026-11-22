@@ -58,9 +58,9 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use yiime_core::{
     ApiSettings, ComposeOptions, Composer, Engine, Flag, HISTORY_CAP, HISTORY_FILE, History,
-    HistoryEntry, Hotkey, LEARNED_FILE, Learned, LetterAction, LetterRules, MAX_CODE_LEN,
-    MixedInput, OptionStore, Options, Quotes, Sealer, TranslationStyle, USER_WORDS_FILE,
-    classify_letter, history_label, parse_hotkey, parse_page_size, selection_index, single_line,
+    HistoryEntry, Hotkey, LEARNED_FILE, Learned, LetterRules, MAX_CODE_LEN, MixedInput,
+    OptionStore, Options, Quotes, Sealer, TranslationStyle, USER_WORDS_FILE, history_label,
+    parse_hotkey, parse_page_size, selection_index, single_line,
 };
 
 const DRAFT: i32 = 103;
@@ -129,6 +129,9 @@ const TSF_TITLE: &str = "YiIME 译 · TSF";
 const APP_NAME: &str = "YiIME 译";
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 static TRAY_V4: AtomicBool = AtomicBool::new(false);
+/// `--self-test`: headless smoke test for CI (no tray icon, no background loading, no registry
+/// writes); see [`self_test`].
+static SELF_TEST: AtomicBool = AtomicBool::new(false);
 const EN_CHANGE_CODE: u16 = 0x0300;
 const SETTINGS_PAGE_SIZE: i32 = 223;
 const SETTINGS_ENGINE: i32 = 224;
@@ -1467,7 +1470,8 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
         });
         let standalone = tsf_receiver.is_null();
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
-        if let Some(path) = words_path {
+        let self_test = SELF_TEST.load(Ordering::Relaxed);
+        if let Some(path) = words_path.filter(|_| !self_test) {
             dictionary::load_full_in_background(
                 path,
                 user_words,
@@ -1476,6 +1480,9 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
                 hwnd as usize,
                 WM_FULL_INPUT,
             );
+        }
+        if self_test {
+            return 0;
         }
         add_tray(
             hwnd,
@@ -1489,15 +1496,47 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
     }
     0
 }
+/// Types scripted keys into a hidden input box through the real key handler and checks the draft.
+/// Returns the process exit code (0 = passed).
+unsafe fn self_test(hwnd: HWND) -> i32 {
+    let Some(state) = (unsafe { state_of(hwnd) }) else {
+        return 2;
+    };
+    let mut failures = 0;
+    let mut check = |keys: &str, expected: &str| {
+        unsafe { set_text(state.edit, "") };
+        for ch in keys.chars() {
+            unsafe { handle_char(hwnd, state, ch as u32) };
+        }
+        let draft = unsafe { get_text(state.edit) };
+        if draft != expected {
+            failures += 1;
+            eprintln!("YiIME self-test: {keys:?} gave {draft:?}, expected {expected:?}");
+        }
+    };
+    // Pinyin + space, then Wubi; Esc clears a code; Backspace edits it.
+    check("nihao ", "你好");
+    check("nihao\u{1b}", "");
+    check("nihaox\u{8} ", "你好");
+    check("wqvb ", "你好");
+    check("nihao,", "你好，");
+    check("nihao1", "你好");
+    // Learning is off by default, so nothing is written.
+    failures
+}
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|arg| arg == "--self-test") {
+        SELF_TEST.store(true, Ordering::Relaxed);
+    }
     let tsf_mode = args.iter().any(|arg| arg == "--tsf-hwnd");
     let wants_settings = args.iter().any(|arg| arg == "--settings");
     let wants_history = args.iter().any(|arg| arg == "--history");
     unsafe {
         let instance = GetModuleHandleW(null());
         let class = wide("InputTranslationWindow");
-        if !tsf_mode {
+        let smoke_test = SELF_TEST.load(Ordering::Relaxed);
+        if !tsf_mode && !smoke_test {
             ensure_tip_in_language_list();
             // Keep one tray instance: a second launch (e.g. the Start-menu Settings shortcut)
             // just tells the existing one to open settings.
@@ -1561,6 +1600,11 @@ pub fn run() {
             instance,
             null(),
         );
+        if smoke_test {
+            let code = self_test(hwnd);
+            DestroyWindow(hwnd);
+            std::process::exit(code);
+        }
         let Some(state) = state_of(hwnd) else {
             return;
         };

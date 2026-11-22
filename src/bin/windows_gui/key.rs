@@ -1,4 +1,5 @@
 use super::*;
+use yiime_core::KeyAction;
 
 pub(super) unsafe fn set_code(hwnd: HWND, state: &State, code: String) {
     state.composition.borrow_mut().set_code(
@@ -161,53 +162,64 @@ unsafe fn insert_punctuation(state: &State, ch: char) -> bool {
     }
     true
 }
-/// Character input in the box. True means handled, so the EDIT control does not see it.
+/// Character input in the box. True means handled, so the EDIT control does not see it. The
+/// decision is made by the platform-independent [`yiime_core::classify_char`]; this only carries
+/// it out.
 pub(super) unsafe fn handle_char(hwnd: HWND, state: &State, unit: u32) -> bool {
     let Some(ch) = char::from_u32(unit) else {
         return false;
     };
-    if ch == '\n' {
-        // Ctrl+Enter: commit the Chinese draft without translating. A pending code first puts
-        // its first candidate (or raw letters) into the draft. The box never inserts a newline.
-        unsafe {
-            flush_composition(hwnd, state);
-            submit(hwnd, state, true);
-        }
-        return true;
-    }
-    // Numpad digits do not pick candidates: commit the code (segment by segment), then type the
-    // digit.
-    if state.numpad.replace(false) && ch.is_ascii_digit() {
-        unsafe {
-            flush_composition(hwnd, state);
-        }
-        return false;
-    }
-    // English segment: printable characters and space go to the edit box as typed (no
-    // composition, no full-width punctuation).
-    if state.english.get()
-        && state.composition.borrow().code.is_empty()
-        && yiime_core::is_literal_in_english(ch)
-    {
-        return false;
-    }
+    // The numpad flag belongs to this one character (Ctrl+Enter does not consume it).
+    let numpad = ch != '\n' && state.numpad.replace(false);
     let composing = !state.composition.borrow().code.is_empty();
-    let caps = unsafe { GetKeyState(VK_CAPITAL as i32) } & 1 != 0;
-    match classify_letter(ch, caps, composing) {
-        // Caps Lock or Shift+letter: type the letter as is (as in Microsoft Wubi), committing
-        // the first candidate (or raw code) first if composing.
-        Some(LetterAction::Raw { flush_first }) => {
-            if flush_first {
-                unsafe {
-                    flush_composition(hwnd, state);
-                }
+    let selection = if composing && option(Flag::SemicolonSelect) {
+        let code = state.composition.borrow().code.clone();
+        selection_index(&state.input.borrow(), &code, ch)
+    } else {
+        None
+    };
+    let context = yiime_core::KeyContext {
+        composing,
+        caps_lock: unsafe { GetKeyState(VK_CAPITAL as i32) } & 1 != 0,
+        shift: unsafe { GetKeyState(VK_SHIFT as i32) } < 0,
+        english: state.english.get(),
+        numpad,
+        selection,
+        comma_period_paging: option(Flag::CommaPeriodPaging),
+        bracket_char_pick: option(Flag::BracketCharPick),
+    };
+    unsafe { run_key_action(hwnd, state, ch, yiime_core::classify_char(ch, &context)) }
+}
+/// Carries out one [`KeyAction`]; true means handled.
+unsafe fn run_key_action(hwnd: HWND, state: &State, ch: char, action: KeyAction) -> bool {
+    match action {
+        KeyAction::Pass => false,
+        KeyAction::FlushThenPass => {
+            unsafe { flush_composition(hwnd, state) };
+            false
+        }
+        KeyAction::Ignore => true,
+        KeyAction::SubmitChinese => {
+            // A pending code first puts its first candidate (or raw letters) into the draft. The
+            // box never inserts a newline.
+            unsafe {
+                flush_composition(hwnd, state);
+                submit(hwnd, state, true);
             }
-            return false;
+            true
+        }
+        KeyAction::Submit { chinese } => {
+            unsafe { submit(hwnd, state, chinese) };
+            true
+        }
+        KeyAction::Cancel => {
+            unsafe { cancel_session(hwnd, state) };
+            true
         }
         // Code letter. Fifth-letter, empty-code and unique-four-letter rules live in the core.
         // In plain mode a commit produced here goes out together with the next one (flushing
         // now would end the session and lose the new letter).
-        Some(LetterAction::Compose(letter)) => {
+        KeyAction::Compose(letter) => {
             let rules = LetterRules {
                 push_fifth: option(Flag::PushFifth),
                 auto_commit4: option(Flag::AutoCommit4),
@@ -231,89 +243,60 @@ pub(super) unsafe fn handle_char(hwnd: HWND, state: &State, unit: u32) -> bool {
             unsafe {
                 relayout(hwnd, state);
             }
-            return true;
+            true
         }
-        None => {}
-    }
-    if !composing {
-        return match ch {
-            '\r' => {
-                let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
-                unsafe {
-                    submit(hwnd, state, shift);
-                }
-                true
+        // Other punctuation: commit the first candidate, then type the (full-width) mark, as
+        // common Chinese IMEs do.
+        KeyAction::Punctuation { flush_first } => {
+            if flush_first {
+                unsafe { flush_composition(hwnd, state) };
             }
-            '\u{1b}' => {
-                unsafe {
-                    cancel_session(hwnd, state);
-                }
-                true
-            }
-            '\t' => true,
-            _ if !caps => unsafe { insert_punctuation(state, ch) },
-            _ => false,
-        };
-    }
-    // `;` picks the 2nd candidate and `'` the 3rd (Microsoft Wubi); `'` still separates
-    // syllables when the code may be pinyin.
-    if option(Flag::SemicolonSelect) {
-        let code = state.composition.borrow().code.clone();
-        if let Some(index) = selection_index(&state.input.borrow(), &code, ch)
-            && unsafe { pick(hwnd, state, index) }
-        {
-            return true;
+            unsafe { insert_punctuation(state, ch) }
         }
-    }
-    match ch {
-        '\'' => {
-            let mut code = state.composition.borrow().code.clone();
-            if !code.ends_with('\'') && code.len() < MAX_CODE_LEN {
-                code.push('\'');
-                unsafe {
-                    set_code(hwnd, state, code);
-                }
-            }
-        }
-        ' ' => unsafe { pick_first_or_raw(hwnd, state) },
-        '1'..='9' => unsafe {
-            pick(hwnd, state, ch as usize - '1' as usize);
+        // `;` picks the 2nd candidate and `'` the 3rd (Microsoft Wubi).
+        KeyAction::Select { index, otherwise } => unsafe {
+            pick(hwnd, state, index) || run_key_action(hwnd, state, ch, *otherwise)
         },
-        '\r' => {
-            let raw = state.composition.borrow().code.clone();
-            unsafe {
-                commit_into_draft(hwnd, state, &raw);
-            }
+        KeyAction::Pick(index) => {
+            unsafe { pick(hwnd, state, index) };
+            true
         }
-        '\u{1b}' => unsafe { set_code(hwnd, state, String::new()) },
-        '\u{8}' => {
+        KeyAction::PickFirstOrRaw => {
+            unsafe { pick_first_or_raw(hwnd, state) };
+            true
+        }
+        KeyAction::Separator => {
+            let code = state.composition.borrow().code.clone();
+            if let Some(code) = yiime_core::with_separator(&code, MAX_CODE_LEN) {
+                unsafe { set_code(hwnd, state, code) };
+            }
+            true
+        }
+        KeyAction::CommitRaw => {
+            let raw = state.composition.borrow().code.clone();
+            unsafe { commit_into_draft(hwnd, state, &raw) };
+            true
+        }
+        KeyAction::ClearCode => {
+            unsafe { set_code(hwnd, state, String::new()) };
+            true
+        }
+        KeyAction::Backspace => {
             let mut code = state.composition.borrow().code.clone();
             code.pop();
-            unsafe {
-                set_code(hwnd, state, code);
-            }
+            unsafe { set_code(hwnd, state, code) };
+            true
         }
-        '-' | '=' | ',' | '.'
-            if yiime_core::paging_direction(ch, option(Flag::CommaPeriodPaging)).is_some() =>
-        unsafe {
-            turn_page(hwnd, state, ch == '=' || ch == '.');
-        },
+        KeyAction::Page { forward } => {
+            unsafe { turn_page(hwnd, state, forward) };
+            true
+        }
         // `[` first character, `]` last character of the first candidate; with a
         // single-character candidate they are plain punctuation.
-        '[' | ']'
-            if option(Flag::BracketCharPick)
-                && unsafe { pick_char_of_word(hwnd, state, ch == ']') } => {}
-        _ if (ch as u32) < 0x20 => {}
-        _ => {
-            // Other punctuation: commit the first candidate, then type the (full-width) mark,
-            // as common Chinese IMEs do.
-            unsafe {
-                flush_composition(hwnd, state);
-            }
-            return !caps && unsafe { insert_punctuation(state, ch) };
-        }
+        KeyAction::CharOfWord { last, otherwise } => unsafe {
+            pick_char_of_word(hwnd, state, last) || run_key_action(hwnd, state, ch, *otherwise)
+        },
     }
-    true
 }
 pub(super) unsafe extern "system" fn edit_proc(
     edit: HWND,

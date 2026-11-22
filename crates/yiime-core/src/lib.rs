@@ -21,6 +21,8 @@ mod history;
 mod hotkey;
 mod inline;
 #[cfg(feature = "engine")]
+mod keys;
+#[cfg(feature = "engine")]
 mod learn;
 mod settings;
 mod style;
@@ -45,6 +47,8 @@ pub use hotkey::{DEFAULT_PLAIN_TOGGLE, Hotkey, parse_hotkey};
 pub use inline::{
     SHIFT_TAP_MAX, ShiftTap, is_literal_in_english, is_numpad_digit, is_shift_key, literal_code,
 };
+#[cfg(feature = "engine")]
+pub use keys::{KeyAction, KeyContext, classify_char, with_separator};
 #[cfg(feature = "engine")]
 pub use learn::{
     HALF_LIFE_DAYS, LEARNED_FILE, LEGACY_LEARNED_FILE, Learned, MAX_ENTRIES, PROMOTE_SCORE,
