@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+## [0.2.0-rc.2] - 2026-11-22
+
+候选版本（预发布），修复 0.2.0-rc.1 的问题。升级后请重启电脑（安装程序检测到旧版 DLL 仍在使用时会提示）。
+
 ### 修复
 
 - **导入词库立即生效**：常驻的共享输入框服务在每次开始输入时检查 `user_words.txt` 是否变化，变化就就地重新加载（不重建大词库），导入或用记事本修改用户词库后不用等服务重启；导入提示改为“立即生效（从下一次输入起）”。
@@ -160,7 +164,8 @@ Linux：
 
 - 命令行工具 `yiime`（`query` 查候选、`translate` 测试翻译），提供 tar.gz 与 .deb。
 
-[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.1...HEAD
+[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.2...HEAD
+[0.2.0-rc.2]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.1...v0.2.0-rc.2
 [0.2.0-rc.1]: https://github.com/leelieber2025/YiIME/compare/v0.1.5...v0.2.0-rc.1
 [0.1.5]: https://github.com/leelieber2025/YiIME/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/leelieber2025/YiIME/compare/v0.1.3...v0.1.4
