@@ -145,13 +145,18 @@ fn http_error(error: ureq::Error) -> Fail {
                         explanation.chars().take(300).collect()
                     }
                 });
+            let message = if message.trim().is_empty() {
+                String::new()
+            } else {
+                format!(": {message}")
+            };
             if code == 429 {
                 Fail::new(
                     &category,
-                    format!("HTTP 429（请求太频繁，被限流）: {message}"),
+                    format!("HTTP 429（请求太频繁，被限流）{message}"),
                 )
             } else {
-                Fail::new(&category, format!("HTTP {code}: {message}"))
+                Fail::new(&category, format!("HTTP {code}{message}"))
             }
         }
         ureq::Error::Transport(transport) => {
@@ -171,18 +176,73 @@ fn http_error(error: ureq::Error) -> Fail {
     }
 }
 
+/// Skip free Google this long after a 429 when an LLM can take over.
+const GOOGLE_COOLDOWN: Duration = Duration::from_secs(300);
+static GOOGLE_BLOCKED: Mutex<Option<Instant>> = Mutex::new(None);
+
+fn google_blocked() -> bool {
+    let blocked = GOOGLE_BLOCKED.lock().unwrap_or_else(|p| p.into_inner());
+    blocked.is_some_and(|at| at.elapsed() < GOOGLE_COOLDOWN)
+}
+
+fn set_google_blocked(on: bool) {
+    *GOOGLE_BLOCKED.lock().unwrap_or_else(|p| p.into_inner()) = on.then(Instant::now);
+}
+
+type CacheKey = (Engine, String, String, TranslationStyle, String, String);
+const CACHE_CAP: usize = 128;
+static CACHE: Mutex<Vec<(CacheKey, String)>> = Mutex::new(Vec::new());
+
+fn cache_key(settings: &ApiSettings, source: &str) -> CacheKey {
+    (
+        settings.engine,
+        settings.url.trim().to_owned(),
+        settings.model.trim().to_owned(),
+        settings.style,
+        settings.custom.clone(),
+        source.trim().to_owned(),
+    )
+}
+
 /// Translates with the selected engine; if Google (free or Cloud) fails and an LLM is configured,
-/// falls back to the LLM.
+/// falls back to the LLM. Recent results are cached; free Google is skipped for a while after 429.
 pub fn translate(settings: &ApiSettings, source: &str) -> Outcome {
-    let mut attempts = Vec::new();
-    let first = run(settings, settings.engine, source, &mut attempts);
-    let result = match first {
-        Err(error) if settings.engine != Engine::Llm && settings.validate_llm().is_ok() => {
-            run(settings, Engine::Llm, source, &mut attempts)
-                .map_err(|llm| format!("{error}；改用大模型也失败：{llm}"))
+    let key = cache_key(settings, source);
+    {
+        let cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((_, text)) = cache.iter().find(|(k, _)| *k == key) {
+            return Outcome {
+                result: Ok(text.clone()),
+                attempts: Vec::new(),
+            };
         }
-        other => other,
+    }
+    let mut attempts = Vec::new();
+    let llm_ok = settings.validate_llm().is_ok();
+    let skip_google = settings.engine == Engine::GoogleFree && llm_ok && google_blocked();
+    let result = if skip_google {
+        run(settings, Engine::Llm, source, &mut attempts)
+    } else {
+        let first = run(settings, settings.engine, source, &mut attempts);
+        if settings.engine == Engine::GoogleFree {
+            let limited = attempts.last().and_then(|a| a.failure.as_deref()) == Some("http 429");
+            set_google_blocked(limited);
+        }
+        match first {
+            Err(error) if settings.engine != Engine::Llm && llm_ok => {
+                run(settings, Engine::Llm, source, &mut attempts)
+                    .map_err(|llm| format!("{error}；改用大模型也失败：{llm}"))
+            }
+            other => other,
+        }
     };
+    if let Ok(text) = &result {
+        let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if cache.len() >= CACHE_CAP {
+            cache.remove(0);
+        }
+        cache.push((key, text.clone()));
+    }
     Outcome { result, attempts }
 }
 
@@ -404,17 +464,35 @@ fn llm(
     .map_err(http_error)?;
     *first_byte = Some(started.elapsed().as_millis());
     let response: Value = response.into_json().map_err(|_| "接口返回格式不对")?;
-    let choice = &response["choices"][0];
-    let content = choice["message"]["content"]
-        .as_str()
-        .ok_or_else(|| Fail::new("empty", "接口没有返回译文"))?;
-    if choice["finish_reason"].as_str() == Some("length") && content.trim().is_empty() {
+    let mut choice = response["choices"][0].clone();
+    // Reasoning models may spend the whole max_tokens budget thinking: retry without the cap.
+    if truncated_empty(&choice) && !wants_minimal(endpoint, model) {
+        let retry: Value = send(&minimal)
+            .map_err(http_error)?
+            .into_json()
+            .map_err(|_| "接口返回格式不对")?;
+        choice = retry["choices"][0].clone();
+        if !truncated_empty(&choice) && choice["message"]["content"].is_string() {
+            mark_minimal(endpoint, model);
+        }
+    }
+    if truncated_empty(&choice) {
         return Err(Fail::new(
             "truncated",
             "模型输出被截断（可能是推理模型思考过长），请换用非推理模型",
         ));
     }
+    let content = choice["message"]["content"]
+        .as_str()
+        .ok_or_else(|| Fail::new("empty", "接口没有返回译文"))?;
     Ok(strip_leading_reasoning(content)?)
+}
+
+fn truncated_empty(choice: &Value) -> bool {
+    choice["finish_reason"].as_str() == Some("length")
+        && choice["message"]["content"]
+            .as_str()
+            .is_none_or(|c| c.trim().is_empty())
 }
 
 /// Opens connections to the translation server early (when the input box opens) so DNS/TCP/TLS
