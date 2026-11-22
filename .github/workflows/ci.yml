@@ -149,7 +149,7 @@ jobs:
           cargo deb -p yiime-cli --no-build --output dist/
           sudo dpkg -i dist/*.deb
           yiime query zhongguo --pages 1 | grep -q 中国
-          dpkg -L yiime | grep -q /usr/share/yiime/InputTranslation-words.txt
+          dpkg -L yiime | grep -q /usr/share/yiime/YiIME-words.txt
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ matrix.arch }}
