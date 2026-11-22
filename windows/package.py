@@ -69,10 +69,10 @@ info = (
 version = subprocess.check_output(["bash", str(root / "tools/version.sh")], text=True).strip()
 licenses = [data_files[index] for index in (0, 2, 3, 5, 6, 8, 9, 10, 11, 12)]
 for name, files in {
-    f"YiIME-{version}-portable.zip": [exe, root / "windows/使用说明.txt", dist / "BUILDINFO.txt", *licenses],
+    f"YiIME-{version}-portable.zip": [exe, root / "windows/使用说明.txt", root / "SECURITY.md", dist / "BUILDINFO.txt", *licenses],
     f"YiIME-{version}-tsf-test.zip": [exe, dll, root / "windows/Install-YiIME.ps1",
                                       root / "windows/Uninstall-YiIME.ps1",
-                                      root / "windows/TSF-使用说明.txt", dist / "BUILDINFO.txt", *licenses],
+                                      root / "windows/TSF-使用说明.txt", root / "SECURITY.md", dist / "BUILDINFO.txt", *licenses],
 }.items():
     with ZipFile(dist / name, "w", ZIP_DEFLATED) as archive:
         for path in files:

@@ -88,6 +88,7 @@ Source: "{#Repo}\dist\{#Exe}"; DestDir: "{app}\{#VersionDir}"; Flags: onlyifdoes
 Source: "{#Repo}\data\frost\YiIME-words.txt"; DestDir: "{app}\{#VersionDir}"; Flags: ignoreversion
 Source: "{#Repo}\windows\installer\Add-YiIMETip.ps1"; DestDir: "{app}\{#VersionDir}"; Flags: ignoreversion
 Source: "{#Repo}\windows\TSF-使用说明.txt"; DestDir: "{app}\{#VersionDir}"; Flags: ignoreversion
+Source: "{#Repo}\SECURITY.md"; DestDir: "{app}\{#VersionDir}"; Flags: ignoreversion
 Source: "{#Repo}\dist\BUILDINFO.txt"; DestDir: "{app}\{#VersionDir}"; Flags: ignoreversion
 ; Licenses and attribution (same set as the ZIP).
 Source: "{#Repo}\data\README.md"; DestDir: "{app}\{#VersionDir}\data"; Flags: ignoreversion

@@ -1654,6 +1654,30 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
     }
     0
 }
+/// What leaves the machine and what is stored locally, shown once per user on the first start of
+/// the tray/settings program (details in SECURITY.md).
+const PRIVACY_NOTICE: &str = "YiIME 译 的隐私说明（只显示一次）：
+
+• 翻译：按 Enter 时，草稿里的中文会发送到你在设置里选择的翻译服务（默认 Azure 翻译；未填 Azure 密钥时改用 Google 免费翻译接口）。Google Cloud、DeepL、大模型需要你自己填写密钥。打字、选字本身不联网。
+• 备用服务：默认关闭。只有勾选“失败时允许改用其他翻译服务”后，失败时才会把同一段文字发给另一个服务。
+• 输入记忆：默认开启，在本机保存翻译过的中文和译文（最多 500 条，Windows DPAPI 加密，%APPDATA%\\YiIME\\history.dat），可在设置中关闭并清除。
+• 其他本机文件：API 密钥（DPAPI 加密）、自学习记录 learned.dat（默认关，加密）、用户词库 user_words.txt（明文），以及只含诊断事件、不含输入内容的 %TEMP%\\YiIME-tsf.log、YiIME-translate.log。
+
+完整说明见安装目录或项目主页的 SECURITY.md。";
+fn show_privacy_notice_once(hwnd: HWND) {
+    if SELF_TEST.load(Ordering::Relaxed) || OPTIONS.0.get_u32("PrivacyNoticeShown") == Some(1) {
+        return;
+    }
+    unsafe {
+        MessageBoxW(
+            hwnd,
+            wide(PRIVACY_NOTICE).as_ptr(),
+            wide(APP_NAME).as_ptr(),
+            MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST,
+        );
+    }
+    OPTIONS.0.set_u32("PrivacyNoticeShown", 1);
+}
 /// Types scripted keys into a hidden input box through the real key handler and checks the draft.
 /// Returns the process exit code (0 = passed).
 unsafe fn self_test(hwnd: HWND) -> i32 {
@@ -1773,6 +1797,9 @@ pub fn run() {
                 .find(|pair| pair[0] == name)
                 .map(|pair| pair[1].as_str())
         };
+        if !state.tsf_service {
+            show_privacy_notice_once(hwnd);
+        }
         let receiver = state.tsf_receiver.get();
         if !receiver.is_null() && IsWindow(receiver) == 0 {
             // The application that asked for this service is already gone: just stay resident.
