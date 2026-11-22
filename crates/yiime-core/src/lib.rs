@@ -25,6 +25,7 @@ mod inline;
 mod keys;
 #[cfg(feature = "engine")]
 mod learn;
+mod service;
 mod settings;
 mod shuangpin;
 mod style;
@@ -62,6 +63,11 @@ pub use keys::{
 pub use learn::{
     HALF_LIFE_DAYS, LEARNED_FILE, LEGACY_LEARNED_FILE, Learned, MAX_ENTRIES, PROMOTE_SCORE,
     write_atomically,
+};
+pub use service::{
+    Activation, BACKOFF_RESET, FIRST_BACKOFF, HIGH_INTEGRITY, MAX_BACKOFF, MEDIUM_INTEGRITY,
+    ProcessSecurity, REQUEST_TIMEOUT_MS, ServiceHealth, WATCHDOG_GRACE, WATCHDOG_LIMIT, Watchdog,
+    may_share_service, needs_private_editor, service_window_title,
 };
 pub use settings::{
     AZURE_KEY_FILE, ApiSettings, DEFAULT_HISTORY_KEY, DEFAULT_URL, Engine, Flag, GOOGLE_KEY_FILE,

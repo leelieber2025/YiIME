@@ -52,7 +52,7 @@ use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows_sys::Win32::System::Threading::{
     GetCurrentThreadId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
-    QueryFullProcessImageNameW,
+    PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, VK_CAPITAL, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
@@ -541,12 +541,16 @@ fn process_image(pid: u32) -> Option<std::path::PathBuf> {
         ok.then(|| std::path::PathBuf::from(String::from_utf16_lossy(&buffer[..len as usize])))
     }
 }
-/// A running TSF-mode input box (the shared editor service) started from `exe`: its window and
-/// process id. Windows of other executables (another version, or anything imitating the title)
-/// are ignored.
-fn find_editor_service(exe: &std::path::Path) -> Option<(HWND, u32)> {
+/// A running shared input-box service started from `exe` that this application may use: its
+/// window and process id. Windows of other executables (another version, or anything imitating
+/// the title) and services of another user, session or integrity level, or elevated ones, are
+/// ignored (see yiime_core::may_share_service).
+fn find_editor_service(
+    exe: &std::path::Path,
+    host: &yiime_core::ProcessSecurity,
+) -> Option<(HWND, u32)> {
     let class = wide("InputTranslationWindow");
-    let title = wide("YiIME 译 · TSF");
+    let title = wide(&yiime_core::service_window_title(host.integrity, false));
     let expected = exe.to_string_lossy().to_lowercase();
     let mut window: HWND = null_mut();
     loop {
@@ -559,9 +563,33 @@ fn find_editor_service(exe: &std::path::Path) -> Option<(HWND, u32)> {
             && pid != std::process::id()
             && process_image(pid)
                 .is_some_and(|image| image.to_string_lossy().to_lowercase() == expected)
+            && yiime_core::may_share_service(
+                host,
+                crate::process_security::process_security(pid).as_ref(),
+            )
         {
             return Some((window, pid));
         }
+    }
+}
+/// Ends a hung editor service: only process `pid` running `exe` (the same check as
+/// [`find_editor_service`]), never anything else.
+fn terminate_service(pid: u32, exe: &std::path::Path) -> bool {
+    let expected = exe.to_string_lossy().to_lowercase();
+    if pid == 0
+        || pid == std::process::id()
+        || process_image(pid).is_none_or(|image| image.to_string_lossy().to_lowercase() != expected)
+    {
+        return false;
+    }
+    unsafe {
+        let process = OpenProcess(PROCESS_TERMINATE, 0, pid);
+        if process.is_null() {
+            return false;
+        }
+        let ok = TerminateProcess(process, 1) != 0;
+        CloseHandle(process);
+        ok
     }
 }
 /// Asks the tray instance to open settings (WM_APP+5) or history (WM_APP+6), starting the EXE with
@@ -638,6 +666,11 @@ struct TextService {
     pending_keys: RefCell<String>,
     first_key: Cell<Option<char>>,
     flush_attempts: Cell<u8>,
+    /// Timeouts of the shared service and restart backoff (see yiime_core::ServiceHealth).
+    health: RefCell<yiime_core::ServiceHealth>,
+    /// This application is elevated / high integrity (or its token is unreadable): it uses a
+    /// private input box, never the shared service. Computed on first use.
+    private: Cell<Option<bool>>,
     scope_cache: RefCell<ScopeCache>,
     manager_sink_cookie: Cell<Option<u32>>,
     edit_sink: RefCell<Option<(ITfContext, u32)>>,
@@ -670,6 +703,8 @@ impl TextService {
             pending_keys: RefCell::new(String::new()),
             first_key: Cell::new(None),
             flush_attempts: Cell::new(0),
+            health: RefCell::new(yiime_core::ServiceHealth::default()),
+            private: Cell::new(None),
             scope_cache: RefCell::new(None),
             manager_sink_cookie: Cell::new(None),
             edit_sink: RefCell::new(None),
@@ -1004,6 +1039,19 @@ impl TextService {
             Self::unadvise_mode(advices);
         }
     }
+    /// Whether this application needs a private input box (elevated or high integrity).
+    fn private_editor(&self) -> bool {
+        if let Some(private) = self.private.get() {
+            return private;
+        }
+        let private =
+            yiime_core::needs_private_editor(crate::process_security::process_security(0).as_ref());
+        if private {
+            log("提升权限的程序：使用独立输入框，不连接共享服务");
+        }
+        self.private.set(Some(private));
+        private
+    }
     fn open_editor(&self, context: ITfContext, first_key: u8) -> bool {
         let target = unsafe { GetForegroundWindow() } as usize;
         // Keys buffered for the previous session do not carry over.
@@ -1020,15 +1068,51 @@ impl TextService {
             || window_pid(window) != self.editor_pid.get()
         {
             window = null_mut();
+            let host = crate::process_security::process_security(0);
             if self.editor.borrow().is_none()
-                && let Some((found, pid)) = find_editor_service(&editor)
+                && !self.private_editor()
+                && let Some(host) = host.as_ref()
+                && let Some((found, pid)) = find_editor_service(&editor, host)
             {
                 self.editor_pid.set(pid);
                 self.editor_window.set(found);
                 window = found;
             }
         }
+        // A service that timed out earlier is restarted now (with backoff); while backing off the
+        // input box is not opened and keys go to the application.
+        let running = (!window.is_null()).then(|| window_pid(window));
+        let decision = self
+            .health
+            .borrow_mut()
+            .before_activation(running, std::time::Instant::now());
+        match decision {
+            yiime_core::Activation::Use => {}
+            yiime_core::Activation::Wait => {
+                log("输入框服务无响应，等待后再重启");
+                return false;
+            }
+            yiime_core::Activation::Restart { kill } => {
+                let owned = self
+                    .editor
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|child| child.id() == kill);
+                let killed = if owned {
+                    self.editor
+                        .borrow_mut()
+                        .as_mut()
+                        .is_some_and(|child| child.kill().is_ok())
+                } else {
+                    terminate_service(kill, &editor)
+                };
+                log(&format!("输入框服务无响应，已结束并重启：{killed}"));
+                self.reset_editor();
+                window = null_mut();
+            }
+        }
         if !window.is_null() {
+            let pid = window_pid(window);
             self.allow_editor_foreground();
             *self.context.borrow_mut() = Some(context.clone());
             self.first_key.set(
@@ -1050,18 +1134,26 @@ impl TextService {
                     .map_or(null_mut(), |rect| rect.as_mut_ptr() as _),
             };
             let mut result = 0usize;
-            let accepted = unsafe {
+            let answered = unsafe {
                 SendMessageTimeoutW(
                     window,
                     WM_COPYDATA,
                     self.receiver.get() as usize,
                     &packet as *const _ as isize,
                     SMTO_ABORTIFHUNG,
-                    100,
+                    yiime_core::REQUEST_TIMEOUT_MS,
                     &mut result,
                 ) != 0
-                    && result != 0
             };
+            if !answered {
+                // Hung or busy: do not block the application; restart it on the next activation.
+                self.health.borrow_mut().timed_out(pid);
+                log("输入框服务请求超时");
+                self.reset_editor();
+                return false;
+            }
+            self.health.borrow_mut().responded(pid);
+            let accepted = result != 0;
             if accepted
                 && unsafe { PostMessageW(window, WM_APP + 2, target, first_key as isize) } != 0
             {
@@ -1101,6 +1193,10 @@ impl TextService {
             .stderr(std::process::Stdio::null());
         if first_key == RECALL {
             command.arg("--recall");
+        }
+        if self.private_editor() {
+            // Serves only this application and exits with it.
+            command.arg("--private");
         }
         if let Some(rect) = caret {
             command.args([
@@ -1175,6 +1271,12 @@ impl TextService {
         if hwnd.is_null() {
             return true;
         }
+        let pid = window_pid(hwnd);
+        if self.health.borrow().is_unhealthy(pid) {
+            // Timed out before: let the flush timer give the keys back instead of waiting again.
+            self.flush_attempts.set(u8::MAX);
+            return false;
+        }
         let keys = std::mem::take(&mut *self.pending_keys.borrow_mut());
         if keys.is_empty() {
             return true;
@@ -1186,18 +1288,25 @@ impl TextService {
             lpData: units.as_mut_ptr() as _,
         };
         let mut result = 0usize;
-        let sent = unsafe {
+        let answered = unsafe {
             SendMessageTimeoutW(
                 hwnd,
                 WM_COPYDATA,
                 self.receiver.get() as usize,
                 &packet as *const _ as isize,
                 SMTO_ABORTIFHUNG,
-                100,
+                yiime_core::REQUEST_TIMEOUT_MS,
                 &mut result,
             ) != 0
-                && result != 0
         };
+        if answered {
+            self.health.borrow_mut().responded(pid);
+        } else {
+            self.health.borrow_mut().timed_out(pid);
+            self.flush_attempts.set(u8::MAX);
+            log("输入框服务请求超时（按键）");
+        }
+        let sent = answered && result != 0;
         if !sent {
             self.pending_keys.borrow_mut().insert_str(0, &keys);
         } else {

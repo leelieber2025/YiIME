@@ -15,7 +15,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use tray::{add_tray, tray_data, tray_menu, update_tray_tip};
@@ -120,6 +120,8 @@ const TRAY_TIMER: usize = 7;
 /// well under 0.1 s thanks to the precompiled dictionary index).
 const IDLE_TIMER: usize = 8;
 const IDLE_EXIT_MS: u32 = 30 * 60 * 1000;
+/// Keeps the watchdog heartbeat going while the message loop is idle.
+const HEARTBEAT_TIMER: usize = 9;
 /// Window class of the TSF DLL's message-only receiver windows.
 const TSF_RECEIVER_CLASS: &str = "InputTranslationTsfReceiver";
 /// Registry key shared with the TSF DLL.
@@ -142,13 +144,67 @@ const WM_FULL_INPUT: u32 = WM_APP + 7;
 /// Tray (portable) and TSF editor instances use different titles so each can find its single
 /// instance.
 const TRAY_TITLE: &str = "YiIME 译 · 托盘";
-const TSF_TITLE: &str = "YiIME 译 · TSF";
 const APP_NAME: &str = "YiIME 译";
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 static TRAY_V4: AtomicBool = AtomicBool::new(false);
 /// `--self-test`: headless smoke test for CI (no tray icon, no background loading, no registry
 /// writes); see [`self_test`].
 static SELF_TEST: AtomicBool = AtomicBool::new(false);
+/// Last message-loop beat in milliseconds since [`watch_start`] (0 = none yet).
+static HEARTBEAT: AtomicU64 = AtomicU64::new(0);
+fn watch_start() -> std::time::Instant {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    *START.get_or_init(std::time::Instant::now)
+}
+fn watch_now_ms() -> u64 {
+    watch_start().elapsed().as_millis() as u64
+}
+fn heartbeat() {
+    HEARTBEAT.store(watch_now_ms().max(1), Ordering::Relaxed);
+}
+/// Diagnostic log of the service (events only, never typed text).
+fn service_log(message: &str) {
+    use std::io::Write;
+    let path = std::env::temp_dir().join("YiIME-service.log");
+    if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 512 * 1024) {
+        let _ = std::fs::rename(&path, path.with_extension("log.old"));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|time| time.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(file, "{now} pid={} {message}", std::process::id());
+    }
+}
+/// Exit code of a service ended by its watchdog.
+const WATCHDOG_EXIT: i32 = 3;
+/// The shared TSF service ends itself when its message loop stops beating (see
+/// yiime_core::Watchdog), so the TSF DLL starts a fresh one instead of waiting on a hung window.
+fn start_watchdog(hwnd: HWND, watchdog: yiime_core::Watchdog) {
+    watch_start();
+    unsafe {
+        SetTimer(hwnd, HEARTBEAT_TIMER, 1000, None);
+    }
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let now = watch_now_ms();
+            let last = HEARTBEAT.load(Ordering::Relaxed);
+            if watchdog.stalled(last, now) {
+                service_log(&format!(
+                    "消息循环 {} ms 无响应，退出以便输入法重新启动",
+                    now.saturating_sub(last.max(watchdog.grace_ms))
+                ));
+                std::process::exit(WATCHDOG_EXIT);
+            }
+        }
+    });
+}
 const EN_CHANGE_CODE: u16 = 0x0300;
 const SETTINGS_PAGE_SIZE: i32 = 223;
 const SETTINGS_ENGINE: i32 = 224;
@@ -236,6 +292,9 @@ struct State {
     tsf_receiver: Cell<HWND>,
     /// Started by the TSF DLL (`--tsf-hwnd`): serves TSF sessions instead of the tray.
     tsf_service: bool,
+    /// Started by an elevated / high-integrity application (`--private`): serves only that
+    /// application's receiver and exits when its session or host ends.
+    private: bool,
     /// Receivers whose host process is being watched (see [`watch_tsf_owner`]).
     watched_receivers: RefCell<HashSet<usize>>,
     finished: Cell<bool>,
@@ -1372,7 +1431,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             // A session from another application's receiver starts with its caret packet
             // (dwData 3); everything else must come from the current session's receiver.
             if w as HWND != state.tsf_receiver.get() {
-                if packet.dwData != 3 || !is_tsf_receiver(w as HWND) {
+                if state.private || packet.dwData != 3 || !is_tsf_receiver(w as HWND) {
                     return 0;
                 }
                 switch_receiver(hwnd, state, w as HWND);
@@ -1444,8 +1503,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 unsafe {
                     clear_box(hwnd, state);
                     hide_box(hwnd, state);
+                    if state.private {
+                        DestroyWindow(hwnd);
+                    }
                 }
             }
+            0
+        }
+        WM_TIMER if w == HEARTBEAT_TIMER => {
+            heartbeat();
             0
         }
         WM_TIMER if w == IDLE_TIMER => {
@@ -1613,6 +1679,7 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
             suppress_deactivate: Cell::new(false),
             tsf_receiver: Cell::new(tsf_receiver),
             tsf_service: !tsf_receiver.is_null(),
+            private: !tsf_receiver.is_null() && std::env::args().any(|arg| arg == "--private"),
             watched_receivers: RefCell::new(HashSet::new()),
             finished: Cell::new(false),
             swallow_char: Cell::new(false),
@@ -1708,6 +1775,20 @@ unsafe fn self_test(hwnd: HWND) -> i32 {
 }
 pub fn run() {
     let args: Vec<String> = std::env::args().collect();
+    // Test of the watchdog: a main thread that hangs for 10 s must end the process with
+    // WATCHDOG_EXIT after about 2 s.
+    if args.iter().any(|arg| arg == "--watchdog-test") {
+        start_watchdog(
+            null_mut(),
+            yiime_core::Watchdog {
+                limit_ms: 2000,
+                grace_ms: 0,
+            },
+        );
+        heartbeat();
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        std::process::exit(0);
+    }
     if args.iter().any(|arg| arg == "--self-test") {
         SELF_TEST.store(true, Ordering::Relaxed);
     } else {
@@ -1773,7 +1854,18 @@ pub fn run() {
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
             class.as_ptr(),
-            wide(if tsf_mode { TSF_TITLE } else { TRAY_TITLE }).as_ptr(),
+            wide(&if tsf_mode {
+                // One shared service per integrity level; a private box has its own title so no
+                // other application's DLL finds it.
+                yiime_core::service_window_title(
+                    crate::process_security::process_security(0)
+                        .map_or(yiime_core::MEDIUM_INTEGRITY, |own| own.integrity),
+                    args.iter().any(|arg| arg == "--private"),
+                )
+            } else {
+                TRAY_TITLE.to_owned()
+            })
+            .as_ptr(),
             WS_POPUP | WS_BORDER,
             0,
             0,
@@ -1802,10 +1894,15 @@ pub fn run() {
         }
         let receiver = state.tsf_receiver.get();
         if !receiver.is_null() && IsWindow(receiver) == 0 {
-            // The application that asked for this service is already gone: just stay resident.
+            // The application that asked for this service is already gone: just stay resident
+            // (a private box has nobody else to serve and exits).
             state.tsf_receiver.set(null_mut());
             state.finished.set(true);
-            SetTimer(hwnd, IDLE_TIMER, IDLE_EXIT_MS, None);
+            if state.private {
+                DestroyWindow(hwnd);
+            } else {
+                SetTimer(hwnd, IDLE_TIMER, IDLE_EXIT_MS, None);
+            }
         } else if !receiver.is_null() {
             watch_receiver(hwnd, state, receiver);
             let initial: String = argument("--initial")
@@ -1826,8 +1923,12 @@ pub fn run() {
         } else if wants_settings || state.settings.borrow().validate().is_err() {
             open_settings(hwnd);
         }
+        if state.tsf_service && !SELF_TEST.load(Ordering::Relaxed) {
+            start_watchdog(hwnd, yiime_core::Watchdog::default());
+        }
         let mut msg = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+            heartbeat();
             let settings = state_of(hwnd).map_or(null_mut(), |state| state.settings_window.get());
             if !settings.is_null() && IsDialogMessageW(settings, &msg) != 0 {
                 continue;

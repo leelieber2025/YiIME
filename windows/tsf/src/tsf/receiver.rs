@@ -112,6 +112,12 @@ unsafe fn receiver_proc_impl(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> 
             && unsafe { (&*pointer).editor_open.get() && (&*pointer).editor_window.get().is_null() }
         {
             unsafe {
+                // A shared service that never answers is restarted on the next activation.
+                let service = &*pointer;
+                service
+                    .health
+                    .borrow_mut()
+                    .timed_out(service.editor_pid.get());
                 OutputDebugStringW(wide("YiIME: 编辑器就绪超时，已归还缓存按键").as_ptr());
                 {
                     let mut editor = (&*pointer).editor.borrow_mut();

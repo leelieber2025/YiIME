@@ -6,6 +6,10 @@ fn main() {
 }
 
 #[cfg(windows)]
+#[path = "../../windows/process_security.rs"]
+mod process_security;
+
+#[cfg(windows)]
 #[path = "windows_gui/dictionary.rs"]
 mod dictionary;
 
