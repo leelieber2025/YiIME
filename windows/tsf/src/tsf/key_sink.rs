@@ -5,6 +5,11 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         com_guard("OnSetFocus", || {
             self.tested_key.borrow_mut().take();
             self.shift_down.set(None);
+            if !foreground.as_bool() {
+                // This application's thread lost the keyboard (also when the input box itself
+                // takes it; the box then ignores the notice because it has the foreground).
+                self.notify_focus_moved();
+            }
             if foreground.as_bool() {
                 self.sync_plain_mode();
             }

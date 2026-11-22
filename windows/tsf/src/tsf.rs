@@ -542,6 +542,20 @@ fn process_image(pid: u32) -> Option<std::path::PathBuf> {
         ok.then(|| std::path::PathBuf::from(String::from_utf16_lossy(&buffer[..len as usize])))
     }
 }
+impl TextService {
+    /// Tells the shared input box that the focus in this application moved (another text field,
+    /// the page, another window), so an empty box is hidden at once instead of lingering
+    /// (WM_APP + 8, wParam = receiver; the box ignores it when it has content or the keyboard).
+    fn notify_focus_moved(&self) {
+        let editor_window = self.editor_window.get();
+        let receiver = self.receiver.get();
+        if !editor_window.is_null() && !receiver.is_null() {
+            unsafe {
+                let _ = PostMessageW(editor_window, WM_APP + 8, receiver as usize, 0);
+            }
+        }
+    }
+}
 /// A running shared input-box service started from `exe` that this application may use: its
 /// window and process id. Windows of other executables (another version, or anything imitating
 /// the title) and services of another user, session or integrity level, or elevated ones, are
@@ -1528,6 +1542,7 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
         _previous: Ref<ITfDocumentMgr>,
     ) -> Result<()> {
         com_guard("OnSetFocus", || {
+            self.notify_focus_moved();
             self.scope_cache.borrow_mut().take();
             self.tested_key.borrow_mut().take();
             self.sync_plain_mode();

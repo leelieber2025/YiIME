@@ -236,6 +236,36 @@ impl WatchedHosts {
     }
 }
 
+/// What the shared input box looks like right now, for [`hide_empty_box`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BoxView {
+    pub visible: bool,
+    /// No code, no draft, no status line.
+    pub empty: bool,
+    /// The box is the foreground window (typing goes into it).
+    pub foreground: bool,
+    /// A translation or commit is in flight.
+    pub busy: bool,
+    /// Time since the box was shown.
+    pub shown_for_ms: u64,
+}
+
+/// Time an empty, unfocused box may stay up after being shown (bringing it to the foreground can
+/// take a moment).
+pub const EMPTY_BOX_GRACE_MS: u64 = 500;
+
+/// Whether to hide the box now. An empty box that does not have the keyboard is useless and only
+/// covers the page: it goes away at once when the host reports that its focus moved (another
+/// text field, the page, another window), and otherwise after [`EMPTY_BOX_GRACE_MS`]. A box with
+/// content, a busy box or one the user is typing in stays.
+pub fn hide_empty_box(view: BoxView, host_focus_moved: bool) -> bool {
+    view.visible
+        && view.empty
+        && !view.busy
+        && !view.foreground
+        && (host_focus_moved || view.shown_for_ms >= EMPTY_BOX_GRACE_MS)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -460,5 +490,55 @@ mod tests {
         assert!(!hosts.session_started(2, Some(HostOwner { pid: 0, thread: 0 })));
         assert!(hosts.is_empty());
         assert!(!hosts.host_exited(1, 5));
+    }
+
+    #[test]
+    fn empty_unfocused_boxes_are_hidden() {
+        let empty = BoxView {
+            visible: true,
+            empty: true,
+            foreground: false,
+            busy: false,
+            shown_for_ms: 0,
+        };
+        // Focus moved in the host (e.g. from a text field to the page): hide at once.
+        assert!(hide_empty_box(empty, true));
+        // Without a focus notice (lost or never sent): after the grace period.
+        assert!(!hide_empty_box(empty, false));
+        assert!(hide_empty_box(
+            BoxView {
+                shown_for_ms: EMPTY_BOX_GRACE_MS,
+                ..empty
+            },
+            false
+        ));
+        // Kept: content, a translation in flight, the user typing in it, or already hidden.
+        for keep in [
+            BoxView {
+                empty: false,
+                ..empty
+            },
+            BoxView {
+                busy: true,
+                ..empty
+            },
+            BoxView {
+                foreground: true,
+                ..empty
+            },
+            BoxView {
+                visible: false,
+                ..empty
+            },
+        ] {
+            assert!(!hide_empty_box(keep, true));
+            assert!(!hide_empty_box(
+                BoxView {
+                    shown_for_ms: 60_000,
+                    ..keep
+                },
+                false
+            ));
+        }
     }
 }

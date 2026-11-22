@@ -122,6 +122,8 @@ const IDLE_TIMER: usize = 8;
 const IDLE_EXIT_MS: u32 = 30 * 60 * 1000;
 /// Keeps the watchdog heartbeat going while the message loop is idle.
 const HEARTBEAT_TIMER: usize = 9;
+/// While the TSF box is shown: hides it when it is empty and does not have the keyboard.
+const EMPTY_BOX_TIMER: usize = 10;
 /// Window class of the TSF DLL's message-only receiver windows.
 /// Receivers of DLLs speaking another protocol version have another class and are refused.
 const TSF_RECEIVER_CLASS: &str = yiime_core::TSF_RECEIVER_CLASS;
@@ -142,6 +144,9 @@ const WM_OPEN_SETTINGS: u32 = WM_APP + 5;
 const WM_OPEN_HISTORY: u32 = WM_APP + 6;
 /// The dictionary with the large lexicon finished loading in the background.
 const WM_FULL_INPUT: u32 = WM_APP + 7;
+/// From the TSF DLL (wParam = receiver): the focus in that application moved (another text field,
+/// the page, another window).
+const WM_TSF_FOCUS_MOVED: u32 = WM_APP + 8;
 /// Tray (portable) and TSF editor instances use different titles so each can find its single
 /// instance.
 const TRAY_TITLE: &str = "YiIME 译 · 托盘";
@@ -299,6 +304,8 @@ struct State {
     /// Receivers whose host process is being watched (see [`watch_tsf_owner`]), keyed by handle
     /// and owner so reused window handles are watched again.
     watched_receivers: RefCell<WatchedHosts>,
+    /// When the box was last shown (for the empty-box rule).
+    shown_at: Cell<Option<std::time::Instant>>,
     /// user_words.txt as last loaded; checked when a session or a code starts.
     user_words: RefCell<UserWordsReloader>,
     finished: Cell<bool>,
@@ -991,6 +998,10 @@ fn translate_log(attempt: &yiime_core::Attempt) {
     }
 }
 unsafe fn show_box(hwnd: HWND, state: &State) {
+    state.shown_at.set(Some(std::time::Instant::now()));
+    if state.tsf_service {
+        unsafe { SetTimer(hwnd, EMPTY_BOX_TIMER, 250, None) };
+    }
     unsafe {
         relayout(hwnd, state);
         ShowWindow(hwnd, SW_SHOW);
@@ -1039,6 +1050,7 @@ unsafe fn hide_box(hwnd: HWND, state: &State) {
     }
     state.suppress_deactivate.set(true);
     unsafe {
+        KillTimer(hwnd, EMPTY_BOX_TIMER);
         ShowWindow(hwnd, SW_HIDE);
         if state.tsf_service {
             SetTimer(hwnd, IDLE_TIMER, IDLE_EXIT_MS, None);
@@ -1168,6 +1180,27 @@ unsafe fn cancel_session(hwnd: HWND, state: &State) {
             bring_to_front(target);
         }
         hide_box(hwnd, state);
+    }
+}
+/// TSF box: hides it (ending the session) when it is empty and does not have the keyboard, see
+/// [`yiime_core::hide_empty_box`]. `focus_moved`: the host just reported a focus change.
+unsafe fn hide_if_empty(hwnd: HWND, state: &State, focus_moved: bool) {
+    let foreground = unsafe { GetForegroundWindow() };
+    let settings = state.settings_window.get();
+    let view = yiime_core::BoxView {
+        visible: unsafe { IsWindowVisible(hwnd) } != 0,
+        empty: state.composition.borrow().code.is_empty()
+            && unsafe { GetWindowTextLengthW(state.edit) } == 0
+            && state.status.borrow().is_none(),
+        foreground: foreground == hwnd || (!settings.is_null() && foreground == settings),
+        busy: state.pending.get(),
+        shown_for_ms: state
+            .shown_at
+            .get()
+            .map_or(u64::MAX, |at| at.elapsed().as_millis() as u64),
+    };
+    if yiime_core::hide_empty_box(view, focus_moved) {
+        unsafe { deactivate(hwnd, state) };
     }
 }
 /// The box lost focus (click elsewhere): hide it and end the TSF session, keeping the draft for
@@ -1554,6 +1587,22 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             }
             0
         }
+        WM_TIMER if w == EMPTY_BOX_TIMER => {
+            if let Some(state) = state {
+                unsafe { hide_if_empty(hwnd, state, false) };
+            }
+            0
+        }
+        WM_TSF_FOCUS_MOVED => {
+            if let Some(state) = state
+                && state.tsf_service
+                && w != 0
+                && w as HWND == state.tsf_receiver.get()
+            {
+                unsafe { hide_if_empty(hwnd, state, true) };
+            }
+            0
+        }
         WM_TIMER if w == HEARTBEAT_TIMER => {
             heartbeat();
             0
@@ -1728,6 +1777,7 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
             private: !tsf_receiver.is_null() && std::env::args().any(|arg| arg == "--private"),
             watched_receivers: RefCell::new(WatchedHosts::default()),
             user_words: RefCell::new(user_words_reloader),
+            shown_at: Cell::new(None),
             finished: Cell::new(false),
             swallow_char: Cell::new(false),
             last_plain: Cell::new(plain_mode()),
