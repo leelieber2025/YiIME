@@ -66,8 +66,8 @@ fn main() -> ExitCode {
             "--tsv" => tsv = true,
             "--no-words" => words = Some(None),
             "--words" => {
-                let Some(path) = rest.next() else {
-                    return fail("--words 需要文件路径");
+                let Some(path) = option_value(rest.next()) else {
+                    return fail("缺少 --words 的文件路径（missing path for --words）");
                 };
                 words = Some(Some(PathBuf::from(path)));
             }
@@ -148,6 +148,13 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Value of an option that takes a path: missing or another option (`-…`) is an error.
+fn option_value(value: Option<&String>) -> Option<&str> {
+    value
+        .map(String::as_str)
+        .filter(|value| !value.is_empty() && !value.starts_with('-'))
+}
+
 /// Free Google Translate (same engine as default in Windows version), multiplexed connections
 /// between segments, print timing.
 fn translate(texts: &[String]) -> ExitCode {
@@ -174,5 +181,20 @@ fn translate(texts: &[String]) -> ExitCode {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::option_value;
+
+    #[test]
+    fn option_value_rejects_missing_and_flags() {
+        let path = "words.txt".to_owned();
+        let flag = "--tsv".to_owned();
+        assert_eq!(option_value(Some(&path)), Some("words.txt"));
+        assert_eq!(option_value(Some(&flag)), None);
+        assert_eq!(option_value(Some(&String::new())), None);
+        assert_eq!(option_value(None), None);
     }
 }
