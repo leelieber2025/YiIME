@@ -1688,9 +1688,11 @@ mod app {
         };
         valid_rect(&rect).then_some(rect)
     }
-    /// Translation timing log: %TEMP%\YiIME-translate.log (engine, model, host, chars, first byte and total time; no keys or text). Over 512 KB
-    /// rotated to .old.
-    fn translate_log(message: &str) {
+    /// Translation timing log: %TEMP%\YiIME-translate.log. Only `Attempt::log_line` is written
+    /// (engine, model, host, char count, timing, error category / HTTP status); never text,
+    /// keys or provider responses. Rotated to .old over 512 KB.
+    fn translate_log(attempt: &yiime_core::Attempt) {
+        let message = attempt.log_line();
         use std::io::Write;
         let path = std::env::temp_dir().join("YiIME-translate.log");
         if std::fs::metadata(&path).is_ok_and(|meta| meta.len() > 512 * 1024) {
@@ -1887,7 +1889,7 @@ mod app {
         std::thread::spawn(move || {
             let outcome = yiime_core::translate(&settings, &draft);
             for attempt in &outcome.attempts {
-                translate_log(&attempt.log_line());
+                translate_log(attempt);
             }
             let result = outcome.result;
             let response = Box::new(TranslationResult {

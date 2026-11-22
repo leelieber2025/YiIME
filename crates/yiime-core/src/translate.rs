@@ -3,7 +3,7 @@ use crate::style::{TranslationStyle, system_prompt};
 use serde_json::{Value, json};
 use std::env;
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -32,7 +32,36 @@ pub struct Attempt {
     pub first_byte_ms: Option<u128>,
     pub total_ms: u128,
     pub chars: usize,
-    pub error: Option<String>,
+    /// Failure category only (e.g. `http 429`, `timeout`); never provider error text.
+    pub failure: Option<String>,
+}
+
+/// A failed request: `message` is shown to the user, `category` is the only part that is logged.
+#[derive(Debug)]
+struct Fail {
+    category: String,
+    message: String,
+}
+
+impl Fail {
+    fn new(category: &str, message: impl Into<String>) -> Self {
+        Self {
+            category: category.to_owned(),
+            message: message.into(),
+        }
+    }
+}
+
+impl From<&str> for Fail {
+    fn from(message: &str) -> Self {
+        Fail::new("bad response", message)
+    }
+}
+
+impl From<String> for Fail {
+    fn from(message: String) -> Self {
+        Fail::new("bad response", message)
+    }
 }
 
 /// The result and process of a translation (maybe Google failed first, then the large model).
@@ -55,9 +84,9 @@ impl Attempt {
             .first_byte_ms
             .map(|ms| format!(" first_byte={ms}ms"))
             .unwrap_or_default();
-        let status = match &self.error {
+        let status = match &self.failure {
             None => "ok".to_owned(),
-            Some(error) => format!("error={}", error.chars().take(160).collect::<String>()),
+            Some(category) => format!("error={category}"),
         };
         format!(
             "engine={}{model} host={} chars={}{first} total={}ms {status}",
@@ -101,9 +130,10 @@ fn host_of(endpoint: &str) -> String {
         .unwrap_or_default()
 }
 
-fn http_error(error: ureq::Error) -> String {
+fn http_error(error: ureq::Error) -> Fail {
     match error {
         ureq::Error::Status(code, response) => {
+            let category = format!("http {code}");
             let explanation = response.into_string().unwrap_or_default();
             let message = serde_json::from_str::<Value>(&explanation)
                 .ok()
@@ -117,17 +147,18 @@ fn http_error(error: ureq::Error) -> String {
                     }
                 });
             if code == 429 {
-                format!("HTTP 429（请求太频繁，被限流）: {message}")
+                Fail::new(&category, format!("HTTP 429（请求太频繁，被限流）: {message}"))
             } else {
-                format!("HTTP {code}: {message}")
+                Fail::new(&category, format!("HTTP {code}: {message}"))
             }
         }
         ureq::Error::Transport(transport) => {
+            // Transport errors may include the request URL (and its query); show only the kind.
             let text = transport.to_string();
             if text.contains("timed out") || text.contains("Timeout") {
-                "请求超时".to_owned()
+                Fail::new("timeout", "请求超时")
             } else {
-                text
+                Fail::new("network", format!("网络错误：{}", transport.kind()))
             }
         }
     }
@@ -189,9 +220,9 @@ fn run(
         first_byte_ms: first_byte,
         total_ms: started.elapsed().as_millis(),
         chars: source.chars().count(),
-        error: result.as_ref().err().cloned(),
+        failure: result.as_ref().err().map(|fail| fail.category.clone()),
     });
-    result
+    result.map_err(|fail| fail.message)
 }
 
 /// Free Google interface: `[[["dst","src",…],…],…]`, put together the translations.
@@ -199,7 +230,7 @@ fn google_free(
     source: &str,
     first_byte: &mut Option<u128>,
     started: Instant,
-) -> Result<String, String> {
+) -> Result<String, Fail> {
     let response = agent(false)
         .get(GOOGLE_FREE_URL)
         .timeout(GOOGLE_FREE_TIMEOUT)
@@ -211,8 +242,8 @@ fn google_free(
         .call()
         .map_err(http_error)?;
     *first_byte = Some(started.elapsed().as_millis());
-    let json: Value = response.into_json().map_err(|error| error.to_string())?;
-    parse_google_free(&json)
+    let json: Value = response.into_json().map_err(|_| "Google 翻译返回格式不对")?;
+    Ok(parse_google_free(&json)?)
 }
 
 fn parse_google_free(json: &Value) -> Result<String, String> {
@@ -236,9 +267,9 @@ fn google_cloud(
     key: &str,
     first_byte: &mut Option<u128>,
     started: Instant,
-) -> Result<String, String> {
+) -> Result<String, Fail> {
     if key.is_empty() {
-        return Err("缺少 Google Cloud 翻译的 API 密钥".into());
+        return Err(Fail::new("config", "缺少 Google Cloud 翻译的 API 密钥"));
     }
     let response = agent(false)
         .post(GOOGLE_CLOUD_URL)
@@ -247,17 +278,31 @@ fn google_cloud(
         .send_json(json!({"q": source, "source": "zh-CN", "target": "en", "format": "text"}))
         .map_err(http_error)?;
     *first_byte = Some(started.elapsed().as_millis());
-    let json: Value = response.into_json().map_err(|error| error.to_string())?;
+    let json: Value = response
+        .into_json()
+        .map_err(|_| "Google Cloud 返回格式不对")?;
     json["data"]["translations"][0]["translatedText"]
         .as_str()
         .map(|text| text.trim().to_owned())
         .filter(|text| !text.is_empty())
-        .ok_or_else(|| "Google Cloud 没有返回译文".to_owned())
+        .ok_or_else(|| Fail::new("empty", "Google Cloud 没有返回译文"))
 }
 
-/// When the model does not accept temperature / max_tokens (some inference models will report 400),
-/// remember it and never send it again.
-static MINIMAL_BODY: AtomicBool = AtomicBool::new(false);
+/// (endpoint, model) pairs that rejected temperature / max_tokens (some reasoning models answer
+/// 400); only those pairs get the reduced request, other models keep the full one.
+static MINIMAL_BODY: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
+
+fn wants_minimal(endpoint: &str, model: &str) -> bool {
+    let set = MINIMAL_BODY.lock().unwrap_or_else(|poison| poison.into_inner());
+    set.as_ref()
+        .is_some_and(|set| set.contains(&(endpoint.to_owned(), model.to_owned())))
+}
+
+fn mark_minimal(endpoint: &str, model: &str) {
+    let mut set = MINIMAL_BODY.lock().unwrap_or_else(|poison| poison.into_inner());
+    set.get_or_insert_with(HashSet::new)
+        .insert((endpoint.to_owned(), model.to_owned()));
+}
 
 pub fn translate_openai_with(
     source: &str,
@@ -277,6 +322,7 @@ pub fn translate_openai_with(
         &mut None,
         Instant::now(),
     )
+    .map_err(|fail| fail.message)
 }
 
 #[allow(clippy::too_many_arguments, clippy::result_large_err)]
@@ -289,9 +335,9 @@ fn llm(
     custom: &str,
     first_byte: &mut Option<u128>,
     started: Instant,
-) -> Result<String, String> {
+) -> Result<String, Fail> {
     if endpoint.is_empty() || model.is_empty() || key.is_empty() {
-        return Err("请填写 API 地址、模型和密钥".into());
+        return Err(Fail::new("config", "请填写 API 地址、模型和密钥"));
     }
     let messages = json!([
         {"role": "system", "content": system_prompt(style, custom)},
@@ -316,7 +362,7 @@ fn llm(
             .set("Authorization", &format!("Bearer {key}"))
             .send_json(body.clone())
     };
-    let response = if MINIMAL_BODY.load(Ordering::Relaxed) {
+    let response = if wants_minimal(endpoint, model) {
         send(&minimal)
     } else {
         match send(&full) {
@@ -327,14 +373,14 @@ fn llm(
                     || lower.contains("max_tokens")
                     || lower.contains("unsupported")
                 {
-                    MINIMAL_BODY.store(true, Ordering::Relaxed);
+                    mark_minimal(endpoint, model);
                     send(&minimal)
                 } else {
                     let message = serde_json::from_str::<Value>(&text)
                         .ok()
                         .and_then(|json| json["error"]["message"].as_str().map(str::to_owned))
                         .unwrap_or_else(|| text.chars().take(300).collect());
-                    return Err(format!("HTTP 400: {message}"));
+                    return Err(Fail::new("http 400", format!("HTTP 400: {message}")));
                 }
             }
             other => other,
@@ -342,15 +388,18 @@ fn llm(
     }
     .map_err(http_error)?;
     *first_byte = Some(started.elapsed().as_millis());
-    let response: Value = response.into_json().map_err(|error| error.to_string())?;
+    let response: Value = response.into_json().map_err(|_| "接口返回格式不对")?;
     let choice = &response["choices"][0];
     let content = choice["message"]["content"]
         .as_str()
-        .ok_or_else(|| "接口没有返回译文".to_owned())?;
+        .ok_or_else(|| Fail::new("empty", "接口没有返回译文"))?;
     if choice["finish_reason"].as_str() == Some("length") && content.trim().is_empty() {
-        return Err("模型输出被截断（可能是推理模型思考过长），请换用非推理模型".into());
+        return Err(Fail::new(
+            "truncated",
+            "模型输出被截断（可能是推理模型思考过长），请换用非推理模型",
+        ));
     }
-    strip_leading_reasoning(content)
+    Ok(strip_leading_reasoning(content)?)
 }
 
 /// Establish a connection to the translation server in advance (called when the floating box is
@@ -551,7 +600,7 @@ mod tests {
             first_byte_ms: Some(820),
             total_ms: 905,
             chars: 12,
-            error: None,
+            failure: None,
         };
         assert_eq!(
             attempt.log_line(),
@@ -566,5 +615,103 @@ mod tests {
         assert_eq!(defaults.engine, Engine::GoogleFree);
         assert!(defaults.validate().is_ok());
         assert!(defaults.validate_llm().is_err());
+    }
+
+    /// Local fake OpenAI endpoint: model `picky` rejects temperature, `broken` fails with a 500
+    /// whose body echoes the request; others answer `full` or `minimal` by request shape.
+    fn fake_llm(requests: usize) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for _ in 0..requests {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut data = Vec::new();
+                let mut chunk = [0; 4096];
+                let body = loop {
+                    let size = stream.read(&mut chunk).unwrap();
+                    assert_ne!(size, 0);
+                    data.extend_from_slice(&chunk[..size]);
+                    let text = String::from_utf8_lossy(&data).to_string();
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                let lower = line.to_ascii_lowercase();
+                                lower
+                                    .strip_prefix("content-length:")
+                                    .map(|n| n.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= length {
+                            break body.to_owned();
+                        }
+                    }
+                };
+                let json: Value = serde_json::from_str(&body).unwrap();
+                let full = json.get("temperature").is_some();
+                let (status, reply) = match json["model"].as_str().unwrap() {
+                    "picky" if full => (
+                        "400 Bad Request",
+                        json!({"error": {"message": "Unsupported parameter: temperature"}}),
+                    ),
+                    "broken" => (
+                        "500 Internal Server Error",
+                        json!({"error": {"message": format!("echo: {body}")}}),
+                    ),
+                    _ => (
+                        "200 OK",
+                        json!({"choices": [{"message": {
+                            "content": if full { "full" } else { "minimal" }
+                        }}]}),
+                    ),
+                };
+                let reply = reply.to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .unwrap();
+            }
+        });
+        (url, server)
+    }
+
+    fn ask(url: &str, model: &str) -> Result<String, String> {
+        translate_openai_with("你好", url, model, "k", TranslationStyle::default(), "")
+    }
+
+    #[test]
+    fn reduced_request_is_remembered_per_model() {
+        // picky: full (400) + minimal; picky again: minimal; other: full; picky: minimal.
+        let (url, server) = fake_llm(5);
+        assert_eq!(ask(&url, "picky").as_deref(), Ok("minimal"));
+        assert_eq!(ask(&url, "picky").as_deref(), Ok("minimal"));
+        assert_eq!(ask(&url, "other").as_deref(), Ok("full"));
+        assert_eq!(ask(&url, "picky").as_deref(), Ok("minimal"));
+        server.join().unwrap();
+        assert!(wants_minimal(&url, "picky"));
+        assert!(!wants_minimal(&url, "other"));
+        assert!(!wants_minimal("https://elsewhere.example/v1", "picky"));
+    }
+
+    #[test]
+    fn log_line_never_contains_provider_text() {
+        let (url, server) = fake_llm(1);
+        let settings = ApiSettings {
+            engine: Engine::Llm,
+            url: url.clone(),
+            model: "broken".into(),
+            key: "secret-key".into(),
+            ..ApiSettings::default()
+        };
+        let outcome = translate(&settings, "秘密原文");
+        server.join().unwrap();
+        assert!(outcome.result.is_err());
+        let line = outcome.attempts[0].log_line();
+        assert!(line.ends_with("error=http 500"), "{line}");
+        assert!(line.contains("chars=4"));
+        assert!(!line.contains("秘密") && !line.contains("echo") && !line.contains("secret"));
     }
 }
