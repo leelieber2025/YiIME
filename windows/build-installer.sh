@@ -4,7 +4,7 @@
 # environment variable (ISCC.exe is found in PATH by default).
 set -euo pipefail
 cd "$(dirname "$0")/.."
-version="${1:-0.1.0}"
+version="${1:-0.1.1}"
 for file in dist/input_translation_tsf.dll dist/InputTranslation-Portable.exe dist/BUILDINFO.txt; do
     [ -f "$file" ] || { echo "缺少 $file，请先运行 windows/build.sh" >&2; exit 1; }
 done

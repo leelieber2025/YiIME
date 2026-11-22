@@ -4,7 +4,7 @@
 # back the text and assert.
 set -uo pipefail
 cd "$(dirname "$0")/../.."
-version="${1:-0.1.0}"
+version="${1:-0.1.1}"
 out="${E2E_OUT:-dist/macos-e2e}"
 mkdir -p "$out"
 results="$out/results.txt"

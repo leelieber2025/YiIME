@@ -11,8 +11,8 @@
 106 ICON "mode_yi_dark.ico"
 
 1 VERSIONINFO
-FILEVERSION 0,1,0,0
-PRODUCTVERSION 0,1,0,0
+FILEVERSION 0,1,1,0
+PRODUCTVERSION 0,1,1,0
 FILEOS 0x40004
 FILETYPE 0x2
 BEGIN
@@ -22,12 +22,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "YiIME"
       VALUE "FileDescription", "YiIME TSF input method"
-      VALUE "FileVersion", "0.1.0"
+      VALUE "FileVersion", "0.1.1"
       VALUE "InternalName", "input_translation_tsf.dll"
       VALUE "LegalCopyright", "GPL-3.0"
       VALUE "OriginalFilename", "input_translation_tsf.dll"
       VALUE "ProductName", "YiIME"
-      VALUE "ProductVersion", "0.1.0"
+      VALUE "ProductVersion", "0.1.1"
     END
   END
   BLOCK "VarFileInfo"

@@ -3,7 +3,7 @@
 # --release -p yiime-cli first).
 set -euo pipefail
 cd "$(dirname "$0")/.."
-version="${1:-0.1.0}"
+version="${1:-0.1.1}"
 arch="${2:-$(uname -m)}"
 name="yiime-$version-linux-$arch"
 stage="dist/$name"

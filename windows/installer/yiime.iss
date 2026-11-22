@@ -26,7 +26,7 @@
 ; in /DAppVersion=… /DVersionDir=<DLL first 12 digits>-<EXE first 12 digits>
 
 #ifndef AppVersion
-  #define AppVersion "0.1.0"
+  #define AppVersion "0.1.1"
 #endif
 #ifndef VersionDir
   #error 请用 windows/build-installer.sh 构建（需要 /DVersionDir=...）
@@ -42,7 +42,7 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 AppPublisher=YiIME
-VersionInfoVersion=0.1.0.0
+VersionInfoVersion=0.1.1.0
 VersionInfoDescription={#AppName} 安装程序
 DefaultDirName={autopf}\InputTranslation
 DisableDirPage=yes

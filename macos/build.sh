@@ -3,7 +3,7 @@
 # installation package dist/YiIME-<version>-macos.pkg (installed to /Library/Input Methods).
 set -euo pipefail
 cd "$(dirname "$0")/.."
-version="${1:-0.1.0}"
+version="${1:-0.1.1}"
 out=dist/macos
 rm -rf "$out" && mkdir -p "$out"
 export MACOSX_DEPLOYMENT_TARGET=11.0
