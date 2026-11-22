@@ -100,7 +100,7 @@ jobs:
           ./target/release/yiime query zhongguo --pages 1 | tee /tmp/query.txt
           grep -q 中国 /tmp/query.txt
       - name: Package tar.gz
-        run: bash tools/package-linux.sh 0.1.0 ${{ matrix.arch }}
+        run: bash tools/package-linux.sh "$(grep -m1 "^version" crates/yiime-cli/Cargo.toml | cut -d\" -f2)" ${{ matrix.arch }}
       - name: Package .deb
         run: |
           cargo install cargo-deb --version 2.9.3 --locked
