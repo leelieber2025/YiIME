@@ -2,7 +2,7 @@
 //! initials, optional fuzzy pinyin, and, when the whole code is not a word, a leading-syllables
 //! word with the rest left in the code for the next pick. Behaviour follows Microsoft Pinyin.
 
-use super::{Arc, BTreeSet, HashSet, MixedInput, folded_initials};
+use super::{Arc, BTreeSet, HashSet, MixedInput, folded_initials, partition};
 
 /// Valid syllables, taken from the pinyin dictionary (without vowel-less interjections such as
 /// m/n/ng/hm).
@@ -231,16 +231,18 @@ impl MixedInput {
                         Piece::Prefix(want) => have.starts_with(want),
                     })
             };
-            let start = index
-                .rime
-                .partition_point(|entry| entry.0.to_ascii_lowercase() < key);
-            for (initials, text, weight, syllables) in index.rime[start..]
-                .iter()
-                .take_while(|entry| entry.0.eq_ignore_ascii_case(&key))
-            {
-                let _ = initials;
-                if matches(syllables) {
-                    found.push((text.clone(), *weight));
+            let table = &self.table;
+            let count = table.abbreviation_count();
+            let start = partition(count, |i| {
+                folded_initials(table.abbreviation(i).syllables).lt(key.bytes())
+            });
+            for i in start..count {
+                let entry = table.abbreviation(i);
+                if !folded_initials(entry.syllables).eq(key.bytes()) {
+                    break;
+                }
+                if matches(entry.syllables) {
+                    found.push((Arc::from(entry.text), entry.weight));
                 }
             }
             if let Some(words) = &self.frequency {

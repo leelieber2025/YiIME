@@ -24,6 +24,8 @@ mod inline;
 mod learn;
 mod settings;
 mod style;
+#[cfg(feature = "engine")]
+mod table;
 mod text;
 #[cfg(feature = "translate")]
 mod translate;

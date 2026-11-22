@@ -1,5 +1,11 @@
+pub(crate) use crate::table::folded_initials;
+use crate::table::{RawTable, Side, Table, encode, merge_extra, parse_dictionary};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
+
+/// Bundled dictionaries precompiled by `build.rs` (see `table.rs`).
+#[cfg(feature = "bundled")]
+static BUNDLED_INDEX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bundled.idx"));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -26,25 +32,16 @@ pub struct Candidate {
     pub rest: String,
 }
 
-#[derive(Clone)]
-struct Entry {
-    /// Large-lexicon words sit in both the pinyin and the Wubi table; they share one copy.
-    text: Arc<str>,
-    weight: u64,
-    /// Pinyin syllables separated by spaces (`xi an`), used to match `'` separators; empty for
-    /// Wubi.
-    syllables: Box<str>,
-}
-
 pub struct MixedInput {
-    wubi: BTreeMap<String, Vec<Entry>>,
-    pinyin: BTreeMap<String, Vec<Entry>>,
-    /// Character → (shortest, longest Wubi code), used to annotate pinyin candidates. Word codes
-    /// are derived from character full codes by the standard rules and checked against the Wubi
-    /// table, so no extra index is kept.
-    wubi_codes: HashMap<char, (Box<str>, Box<str>)>,
+    /// Wubi and pinyin tables, initials order and per-character Wubi codes (used to annotate
+    /// pinyin candidates; word codes are derived from character full codes by the standard rules
+    /// and checked against the Wubi table). Precompiled at build time for the bundled
+    /// dictionaries.
+    table: Table,
+    /// User words by code, ranked first under their code.
+    user: BTreeMap<String, Vec<Arc<str>>>,
     frequency: Option<FrequencyWords>,
-    /// Pinyin-initials index, built on first use so startup stays fast.
+    /// Large-lexicon initials index, built on first use so startup stays fast.
     abbreviations: OnceLock<Abbreviations>,
     /// Valid syllables, built on first use.
     syllable_table: OnceLock<spell::SyllableTable>,
@@ -53,18 +50,28 @@ pub struct MixedInput {
 #[path = "spell.rs"]
 mod spell;
 
-/// Pinyin-initials index. Keys are the first letter of each syllable (zh/ch/sh folded to z/c/s),
-/// sorted bytewise so a prefix query is a binary-searched range. Retroflex initials are kept
-/// separately as uppercase Z/C/S to filter queries that spell out zh/ch/sh.
+/// Large-lexicon pinyin-initials index. Keys are the first letter of each syllable (zh/ch/sh
+/// folded to z/c/s), sorted bytewise so a prefix query is a binary-searched range; retroflex
+/// initials are re-checked from the syllables to filter queries that spell out zh/ch/sh. The Rime
+/// words have the same index precompiled in the table.
 struct Abbreviations {
-    /// Multi-syllable Rime pinyin words, sorted by folded key.
-    rime: Vec<RimeAbbreviation>,
     /// Large-lexicon line numbers sorted by folded key, most frequent first within a key.
     frost: Vec<u32>,
 }
 
-/// (initials with Z/C/S for zh/ch/sh, word, frequency, syllables).
-type RimeAbbreviation = (Box<str>, Arc<str>, u64, Box<str>);
+/// First index in `0..count` for which `before` is false (`before` must be monotonic).
+fn partition(count: usize, before: impl Fn(usize) -> bool) -> usize {
+    let (mut low, mut high) = (0, count);
+    while low < high {
+        let mid = (low + high) / 2;
+        if before(mid) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    low
+}
 
 /// First letter of each syllable; zh/ch/sh become Z/C/S.
 fn syllable_initials(syllables: &str) -> String {
@@ -83,13 +90,6 @@ fn syllable_initials(syllables: &str) -> String {
             )
         })
         .collect()
-}
-
-/// Folded initials (zh/ch/sh → z/c/s) without allocating.
-fn folded_initials(syllables: &str) -> impl Iterator<Item = u8> + '_ {
-    syllables
-        .split(' ')
-        .filter_map(|syllable| syllable.bytes().next())
 }
 
 /// Parses initials input. zh/ch/sh may be one initial or two letters (`zh` → 字号), so a code has
@@ -237,50 +237,42 @@ fn pinyin_key(pinyin: &str) -> std::iter::Filter<std::str::Bytes<'_>, fn(&u8) ->
 impl MixedInput {
     /// Rime Wubi and pinyin dictionaries, one `word<TAB>code<TAB>frequency` per line.
     pub fn from_rime(wubi: &str, pinyin: &str) -> Self {
-        let wubi = parse_dictionary(wubi, false);
-        let wubi_codes = code_index(&wubi);
+        Self::from_tables(
+            &parse_dictionary(wubi, false),
+            &parse_dictionary(pinyin, true),
+        )
+    }
+
+    fn from_tables(wubi: &RawTable, pinyin: &RawTable) -> Self {
+        Self::with_table(Table::from_owned(encode(wubi, pinyin)))
+    }
+
+    fn with_table(table: Table) -> Self {
         Self {
-            wubi,
-            pinyin: parse_dictionary(pinyin, true),
-            wubi_codes,
+            table,
+            user: BTreeMap::new(),
             frequency: None,
             abbreviations: OnceLock::new(),
             syllable_table: OnceLock::new(),
         }
     }
 
+    /// Size in bytes of the dictionary index (precompiled for [`Self::bundled`]).
+    pub fn index_bytes(&self) -> usize {
+        self.table.len()
+    }
+
     /// Dictionaries compiled into the binary: Wubi 86, pinyin and supplementary words. The large
     /// lexicon and user words are loaded at runtime.
     #[cfg(feature = "bundled")]
+    ///
+    /// Nothing is parsed here: `build.rs` precompiled them into an index that is used in place.
     pub fn bundled() -> Self {
-        Self::from_rime(
-            include_str!("../../../data/wubi/wubi86.dict.yaml"),
-            include_str!("../../../data/pinyin/pinyin_simp.dict.yaml"),
-        )
-        .with_extra_wubi(include_str!(
-            "../../../data/wubi_extra/wubi86_extra.dict.yaml"
-        ))
+        Self::with_table(Table::from_static(BUNDLED_INDEX))
     }
 
     fn abbreviation_index(&self) -> &Abbreviations {
         self.abbreviations.get_or_init(|| {
-            let mut rime: Vec<RimeAbbreviation> = self
-                .pinyin
-                .values()
-                .flatten()
-                .filter(|entry| entry.syllables.contains(' '))
-                .map(|entry| {
-                    (
-                        syllable_initials(&entry.syllables).into_boxed_str(),
-                        entry.text.clone(),
-                        entry.weight,
-                        entry.syllables.clone(),
-                    )
-                })
-                .collect();
-            rime.sort_by_cached_key(|(initials, _, weight, _)| {
-                (initials.to_ascii_lowercase(), std::cmp::Reverse(*weight))
-            });
             let frost = self
                 .frequency
                 .as_ref()
@@ -298,7 +290,7 @@ impl MixedInput {
                     order
                 })
                 .unwrap_or_default();
-            Abbreviations { rime, frost }
+            Abbreviations { frost }
         })
     }
 
@@ -312,9 +304,8 @@ impl MixedInput {
     fn syllables(&self) -> &spell::SyllableTable {
         self.syllable_table.get_or_init(|| {
             spell::SyllableTable::new(
-                self.pinyin
-                    .values()
-                    .flatten()
+                self.table
+                    .all(Side::Pinyin)
                     .flat_map(|entry| entry.syllables.split(' ')),
             )
         })
@@ -323,11 +314,15 @@ impl MixedInput {
     /// Words for a pinyin key from the Rime dictionary and the large lexicon, sorted by frequency.
     fn homophones(&self, key: &str) -> Vec<(Arc<str>, u64, Box<str>)> {
         let mut homophones: Vec<(Arc<str>, u64, Box<str>)> = self
-            .pinyin
-            .get(key)
-            .into_iter()
-            .flatten()
-            .map(|entry| (entry.text.clone(), entry.weight, entry.syllables.clone()))
+            .table
+            .get(Side::Pinyin, key)
+            .map(|entry| {
+                (
+                    Arc::from(entry.text),
+                    entry.weight,
+                    Box::from(entry.syllables),
+                )
+            })
             .collect();
         if let Some(words) = &self.frequency {
             homophones.extend(
@@ -348,16 +343,19 @@ impl MixedInput {
         }
         let index = self.abbreviation_index();
         let mut found: Vec<(Arc<str>, u64)> = Vec::new();
+        let table = &self.table;
+        let count = table.abbreviation_count();
         for (key, need) in abbreviation_parses(code) {
-            let start = index
-                .rime
-                .partition_point(|(initials, _, _, _)| initials.to_ascii_lowercase() < key);
-            for (initials, text, weight, _) in index.rime[start..]
-                .iter()
-                .take_while(|(initials, _, _, _)| initials.eq_ignore_ascii_case(&key))
-            {
-                if initials_match(initials, &need) {
-                    found.push((text.clone(), *weight));
+            let start = partition(count, |i| {
+                folded_initials(table.abbreviation(i).syllables).lt(key.bytes())
+            });
+            for i in start..count {
+                let entry = table.abbreviation(i);
+                if !folded_initials(entry.syllables).eq(key.bytes()) {
+                    break;
+                }
+                if initials_match(&syllable_initials(entry.syllables), &need) {
+                    found.push((Arc::from(entry.text), entry.weight));
                 }
             }
             if let Some(words) = &self.frequency {
@@ -387,18 +385,66 @@ impl MixedInput {
 
     /// Merges supplementary Wubi words (skipping words already under the same code), then re-sorts
     /// by frequency; the original dictionary has higher frequencies and stays first.
-    pub fn with_extra_wubi(mut self, extra: &str) -> Self {
-        for (code, entries) in parse_dictionary(extra, false) {
-            let slot = self.wubi.entry(code).or_default();
-            for entry in entries {
-                if !slot.iter().any(|existing| existing.text == entry.text) {
-                    slot.push(entry);
-                }
-            }
-            slot.sort_by_key(|entry| std::cmp::Reverse(entry.weight));
+    pub fn with_extra_wubi(self, extra: &str) -> Self {
+        let mut wubi = self.table.decode(Side::Wubi);
+        merge_extra(&mut wubi, parse_dictionary(extra, false));
+        let pinyin = self.table.decode(Side::Pinyin);
+        Self {
+            table: Table::from_owned(encode(&wubi, &pinyin)),
+            user: self.user,
+            frequency: self.frequency,
+            abbreviations: OnceLock::new(),
+            syllable_table: OnceLock::new(),
         }
-        self.wubi_codes = code_index(&self.wubi);
-        self
+    }
+
+    /// Candidates under one full Wubi code: user words first, then the dictionary by frequency.
+    fn wubi_slot(&self, code: &str) -> Vec<(Arc<str>, u64)> {
+        let user = self.user.get(code);
+        let mut slot: Vec<(Arc<str>, u64)> = user
+            .into_iter()
+            .flatten()
+            .map(|text| (text.clone(), u64::MAX))
+            .collect();
+        slot.extend(
+            self.table
+                .get(Side::Wubi, code)
+                .filter(|entry| user.is_none_or(|words| !words.iter().any(|w| &**w == entry.text)))
+                .map(|entry| (Arc::from(entry.text), entry.weight)),
+        );
+        slot
+    }
+
+    /// Wubi entries of every code that starts with `prefix` and passes `keep`, in code order.
+    fn wubi_with_prefix(&self, prefix: &str, keep: impl Fn(&str) -> bool) -> Vec<(Arc<str>, u64)> {
+        let mut codes: BTreeSet<&str> = BTreeSet::new();
+        let table = &self.table;
+        for i in table.lower_bound(Side::Wubi, prefix)..table.key_count(Side::Wubi) {
+            let key = table.key(Side::Wubi, i);
+            if !key.starts_with(prefix) {
+                break;
+            }
+            if keep(key) {
+                codes.insert(key);
+            }
+        }
+        for key in self
+            .user
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix),
+                std::ops::Bound::Unbounded,
+            ))
+            .map(|(key, _)| key.as_str())
+            .take_while(|key| key.starts_with(prefix))
+        {
+            if keep(key) {
+                codes.insert(key);
+            }
+        }
+        codes
+            .into_iter()
+            .flat_map(|code| self.wubi_slot(code))
+            .collect()
     }
 
     /// Attaches the large lexicon (from rime-frost, `word<TAB>pinyin<TAB>frequency<TAB>Wubi code`
@@ -413,24 +459,18 @@ impl MixedInput {
     /// Wildcard `z` matches any letter; only Wubi codes of the same length, sorted by frequency.
     fn wildcard(&self, code: &str, limit: usize) -> Vec<Arc<str>> {
         let prefix: String = code.chars().take_while(|ch| *ch != 'z').collect();
-        let mut found: Vec<&Entry> = self
-            .wubi
-            .range(prefix.clone()..)
-            .take_while(|(key, _)| key.starts_with(&prefix))
-            .filter(|(key, _)| {
-                key.len() == code.len()
-                    && key
-                        .bytes()
-                        .zip(code.bytes())
-                        .all(|(have, want)| want == b'z' || have == want)
-            })
-            .flat_map(|(_, entries)| entries.iter())
-            .collect();
-        found.sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.text.cmp(&b.text)));
+        let mut found = self.wubi_with_prefix(&prefix, |key| {
+            key.len() == code.len()
+                && key
+                    .bytes()
+                    .zip(code.bytes())
+                    .all(|(have, want)| want == b'z' || have == want)
+        });
+        found.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         found
             .into_iter()
             .take(limit)
-            .map(|entry| entry.text.clone())
+            .map(|(text, _)| text)
             .collect()
     }
 
@@ -446,29 +486,17 @@ impl MixedInput {
             if text.starts_with('#') || !code.bytes().all(|b| b.is_ascii_lowercase()) {
                 continue;
             }
-            let slot = self.wubi.entry(code).or_default();
-            slot.retain(|entry| &*entry.text != text);
-            slot.insert(
-                0,
-                Entry {
-                    text: text.into(),
-                    weight: u64::MAX,
-                    syllables: "".into(),
-                },
-            );
+            let slot = self.user.entry(code).or_default();
+            slot.retain(|word| &**word != text);
+            slot.insert(0, text.into());
         }
         self
     }
 
     /// Number of distinct candidates for a full Wubi code, including the large lexicon.
     pub fn wubi_count(&self, code: &str) -> usize {
-        let mut texts: HashSet<&str> = self
-            .wubi
-            .get(code)
-            .into_iter()
-            .flatten()
-            .map(|entry| &*entry.text)
-            .collect();
+        let slot = self.wubi_slot(code);
+        let mut texts: HashSet<&str> = slot.iter().map(|(text, _)| &**text).collect();
         if let Some(words) = &self.frequency {
             texts.extend(words.code(code).map(|line| line.text));
         }
@@ -477,10 +505,9 @@ impl MixedInput {
 
     /// Whether some pinyin starts with `code`, i.e. typing on may still give pinyin.
     pub fn pinyin_continues(&self, code: &str) -> bool {
-        self.pinyin
-            .range(code.to_owned()..)
-            .next()
-            .is_some_and(|(key, _)| key.starts_with(code))
+        let next = self.table.lower_bound(Side::Pinyin, code);
+        (next < self.table.key_count(Side::Pinyin)
+            && self.table.key(Side::Pinyin, next).starts_with(code))
             || self
                 .frequency
                 .as_ref()
@@ -504,14 +531,14 @@ impl MixedInput {
     pub fn wubi_hint(&self, text: &str) -> Option<String> {
         let chars: Vec<char> = text.chars().collect();
         if let [single] = chars[..] {
-            let (short, full) = self.wubi_codes.get(&single)?;
+            let (short, full) = self.table.codes_of(single)?;
             return Some(if short == full {
                 full.to_string()
             } else {
                 format!("{short}/{full}")
             });
         }
-        let full = |ch: &char| self.wubi_codes.get(ch).map(|codes| &*codes.1);
+        let full = |ch: &char| self.table.codes_of(*ch).map(|codes| codes.1);
         let take =
             |ch: &char, n: usize| full(ch).map(|code| code.chars().take(n).collect::<String>());
         let code = match chars.len() {
@@ -526,9 +553,9 @@ impl MixedInput {
             }
         };
         let known = self
-            .wubi
-            .get(&code)
-            .is_some_and(|slot| slot.iter().any(|entry| &*entry.text == text))
+            .wubi_slot(&code)
+            .iter()
+            .any(|(word, _)| &**word == text)
             || self
                 .frequency
                 .as_ref()
@@ -599,11 +626,9 @@ impl MixedInput {
             }
         }
         let mut wubi: Vec<Arc<str>> = self
-            .wubi
-            .get(&code)
+            .wubi_slot(&code)
             .into_iter()
-            .flatten()
-            .map(|entry| entry.text.clone())
+            .map(|(text, _)| text)
             .collect();
         if let Some(words) = &self.frequency {
             wubi.extend(words.code(&code).map(|line| Arc::from(line.text)));
@@ -682,48 +707,17 @@ impl MixedInput {
         if code.contains('z') && code.len() <= 4 {
             push(self.wildcard(&code, limit), Source::Wildcard, true);
         }
-        if code.len() < 4 && !self.pinyin.contains_key(&code) {
-            let mut prefixes = self
-                .wubi
-                .range(code.clone()..)
-                .take_while(|(key, _)| key.starts_with(&code))
-                .filter(|(key, _)| *key != &code)
-                .flat_map(|(_, values)| values.iter().cloned())
-                .collect::<Vec<_>>();
-            prefixes.sort_by(|a, b| b.weight.cmp(&a.weight).then_with(|| a.text.cmp(&b.text)));
+        if code.len() < 4 && !self.table.contains_key(Side::Pinyin, &code) {
+            let mut prefixes = self.wubi_with_prefix(&code, |key| key != code);
+            prefixes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             push(
-                prefixes.into_iter().map(|entry| entry.text).collect(),
+                prefixes.into_iter().map(|(text, _)| text).collect(),
                 Source::Wubi,
                 false,
             );
         }
         result
     }
-}
-
-/// Character → (shortest, longest Wubi code); among equal lengths the first in dictionary order
-/// wins, so results are stable.
-fn code_index(wubi: &BTreeMap<String, Vec<Entry>>) -> HashMap<char, (Box<str>, Box<str>)> {
-    let mut index: HashMap<char, (Box<str>, Box<str>)> = HashMap::new();
-    for (code, entries) in wubi {
-        for entry in entries {
-            let mut chars = entry.text.chars();
-            let (Some(ch), None) = (chars.next(), chars.next()) else {
-                continue;
-            };
-            let code: &str = code;
-            let slot = index
-                .entry(ch)
-                .or_insert_with(|| (code.into(), code.into()));
-            if (code.len(), code) < (slot.0.len(), &*slot.0) {
-                slot.0 = code.into();
-            }
-            if (code.len(), std::cmp::Reverse(code)) > (slot.1.len(), std::cmp::Reverse(&*slot.1)) {
-                slot.1 = code.into();
-            }
-        }
-    }
-    index
 }
 
 /// Separator positions in the code with separators removed: `xi'an` → [2].
@@ -740,48 +734,6 @@ fn boundaries(code: &str, separator: char) -> Vec<usize> {
         }
     }
     result.retain(|offset| *offset < letters);
-    result
-}
-
-fn parse_dictionary(contents: &str, pinyin: bool) -> BTreeMap<String, Vec<Entry>> {
-    let mut result: BTreeMap<String, Vec<Entry>> = BTreeMap::new();
-    let mut body = false;
-    for line in contents.lines() {
-        if line == "..." {
-            body = true;
-            continue;
-        }
-        if !body || line.starts_with('#') {
-            continue;
-        }
-        let mut fields = line.split('\t');
-        let (Some(text), Some(code)) = (fields.next(), fields.next()) else {
-            continue;
-        };
-        let weight = fields
-            .next()
-            .and_then(|value| value.parse::<f64>().ok())
-            .unwrap_or(0.0);
-        // Negative, NaN or overflowing frequencies count as 0; the entry is kept.
-        let weight = if weight.is_finite() && weight >= 0.0 {
-            weight as u64
-        } else {
-            0
-        };
-        let key = if pinyin {
-            code.replace(' ', "")
-        } else {
-            code.to_owned()
-        };
-        result.entry(key).or_default().push(Entry {
-            text: text.into(),
-            weight,
-            syllables: if pinyin { code.into() } else { "".into() },
-        });
-    }
-    for entries in result.values_mut() {
-        entries.sort_by_key(|entry| std::cmp::Reverse(entry.weight));
-    }
     result
 }
 
@@ -829,10 +781,30 @@ mod tests {
             .filter(|line| !line.starts_with('#') && line.split('\t').count() >= 2)
             .count();
         let input = MixedInput::from_rime(source, "");
-        assert_eq!(
-            input.wubi.values().map(Vec::len).sum::<usize>(),
-            valid_lines
-        );
+        assert_eq!(input.table.all(Side::Wubi).count(), valid_lines);
+    }
+
+    #[test]
+    fn bundled_index_matches_dictionary_sources() {
+        // The index precompiled by build.rs is byte-identical to one built from the sources at
+        // run time, and both answer like the parsed dictionaries did.
+        let built = MixedInput::from_rime(
+            include_str!("../../../data/wubi/wubi86.dict.yaml"),
+            include_str!("../../../data/pinyin/pinyin_simp.dict.yaml"),
+        )
+        .with_extra_wubi(include_str!(
+            "../../../data/wubi_extra/wubi86_extra.dict.yaml"
+        ));
+        let bundled = MixedInput::bundled();
+        assert!(built.table.as_bytes() == bundled.table.as_bytes());
+        for code in ["wqvb", "zhongguo", "bjdx", "aaz", "g", "fanyi"] {
+            assert_eq!(
+                built.candidates(code, 30),
+                bundled.candidates(code, 30),
+                "{code}"
+            );
+        }
+        assert_eq!(bundled.wubi_hint("的").as_deref(), Some("r/rqyy"));
     }
 
     #[test]
