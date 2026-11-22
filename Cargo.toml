@@ -1,10 +1,13 @@
 [package]
 name = "input_translation"
-version = "0.1.1"
+version.workspace = true
 license = "GPL-3.0-only"
 edition = "2024"
 rust-version = "1.88"
 default-run = "input_translation"
+
+[workspace.package]
+version = "0.1.2"
 
 [workspace]
 members = ["crates/yiime-core", "crates/yiime-cli", "crates/yiime-ffi", "windows/tsf"]

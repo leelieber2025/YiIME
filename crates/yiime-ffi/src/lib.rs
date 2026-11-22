@@ -1,9 +1,7 @@
-//! YiIME translated C interface: macOS input method (Swift/InputMethodKit) through which to use the
-//! platform-independent core.
+//! C interface to the YiIME core, used by the macOS input method (Swift/InputMethodKit).
 //!
-//! A [`Ime`] is an input session: encoding group words, Chinese draft, grouping words and clicking
-//! Shift to clip English in the middle. All strings are passed as UTF-8 C strings; returned strings
-//! must be freed with [`yiime_string_free`].
+//! An [`Ime`] is one input session: code composition, the Chinese draft, and Shift-tap inline
+//! English. Strings are UTF-8 C strings; returned strings must be freed with [`yiime_string_free`].
 
 use serde_json::json;
 use std::ffi::{CStr, CString, c_char};
@@ -29,7 +27,6 @@ const RULES: LetterRules = LetterRules {
     auto_commit4: true,
 };
 
-/// One input session.
 #[derive(Default)]
 pub struct Ime {
     composer: Composer,
@@ -48,7 +45,7 @@ impl Ime {
     pub fn english(&self) -> bool {
         self.english
     }
-    /// If there is coding or drafting: the keystrokes are handled by the input method.
+    /// Whether a code or draft is in progress, i.e. keys belong to the input method.
     pub fn active(&self) -> bool {
         self.composer.is_composing() || !self.draft.text().is_empty()
     }
@@ -60,8 +57,7 @@ impl Ime {
         self.draft.insert(&pick.text);
         self.set_code(pick.rest);
     }
-    /// When there are coding candidates, the first choice is put, otherwise the original letter is
-    /// put.
+    /// Commits the first candidate if there is one, otherwise the raw letters.
     fn flush_first(&mut self) {
         if !self.composer.is_composing() {
             return;
@@ -75,9 +71,8 @@ impl Ime {
             }
         }
     }
-    /// Process a character (letter, space, number, punctuation, backspace `\u{8}`, Esc `\u{1b}`).
-    /// Returns whether it has been processed; when not processed (no session) the host enters the
-    /// input as is.
+    /// Handles one character (letter, space, digit, punctuation, backspace `\u{8}`, Esc `\u{1b}`).
+    /// Returns false when there is no session, so the host types it as is.
     pub fn key(&mut self, ch: char) -> bool {
         if ch == '\u{1b}' {
             if self.composer.is_composing() {
@@ -154,8 +149,8 @@ impl Ime {
             _ => false,
         }
     }
-    /// Click Shift: switch between clipping English paragraphs. When switching to English, the
-    /// unselected codes are put into the draft as letters.
+    /// Shift tap: toggles the inline English segment; entering English puts the pending code into
+    /// the draft as letters.
     pub fn shift_tap(&mut self) {
         if !self.english {
             if let Some(letters) = literal_code(&self.composer.code) {
@@ -165,23 +160,22 @@ impl Ime {
         }
         self.english = !self.english;
     }
-    /// Press Enter during grouping: the code is put into the draft alphabetically (same as
-    /// Microsoft Pinyin).
+    /// Enter while composing: the code goes into the draft as letters (as in Microsoft Pinyin).
     pub fn commit_code(&mut self) {
         if let Some(letters) = literal_code(&self.composer.code) {
             self.draft.insert(&letters);
         }
         self.set_code(String::new());
     }
-    /// End the session and return to the Chinese to be displayed on the screen (unselected
-    /// encodings will be placed as preferred).
+    /// Ends the session and returns the Chinese text to commit (a pending code commits its first
+    /// candidate).
     pub fn take_text(&mut self) -> String {
         self.flush_first();
         let text = self.draft.text().to_owned();
         *self = Ime::default();
         text
     }
-    /// Current status (JSON): code, draft, english, candidates (text, hint), page.
+    /// Current state as JSON: code, draft, english, candidates (text, hint), page.
     pub fn state_json(&self) -> String {
         let candidates: Vec<_> = self
             .composer
@@ -200,8 +194,8 @@ impl Ime {
     }
 }
 
-/// Translation: Google is free by default; configure a large model when `url`, `model`, and `key`
-/// are not empty (automatically used when Google fails).
+/// Free Google by default; with `url`, `model` and `key` set, the LLM is the fallback when Google
+/// fails.
 pub fn translate_text(source: &str, url: &str, model: &str, key: &str) -> Result<String, String> {
     let mut settings = ApiSettings {
         engine: Engine::GoogleFree,
@@ -237,7 +231,7 @@ pub extern "C" fn yiime_new() -> *mut Ime {
     Box::into_raw(Box::default())
 }
 
-/// Preload thesaurus (can be called in a background thread).
+/// Preloads dictionaries (safe from a background thread).
 #[unsafe(no_mangle)]
 pub extern "C" fn yiime_preload() {
     let _ = input();
@@ -307,8 +301,8 @@ pub unsafe extern "C" fn yiime_take_text(ime: *mut Ime) -> *mut c_char {
     }
 }
 
-/// Synchronous translation (please call it in the background thread). Return JSON:
-/// `{"ok":true,"text":…}` or `{"ok":false,"error":…}`.
+/// Blocking translation (call from a background thread). Returns `{"ok":true,"text":…}` or
+/// `{"ok":false,"error":…}`.
 ///
 /// # Safety
 /// The argument is a null pointer or a valid C string.

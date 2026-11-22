@@ -1,9 +1,8 @@
 fn main() {
     println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
-    // After declaring rerun-if-*, Cargo will no longer rerun this script due to changes in files in
-    // the package; embed-resource will not report icons referenced by .rc. If not listed, the DLL
-    // will always carry old resources after changing ime.rc / *.ico (v6–v9 DLLs only have the old
-    // blue “five” brand icon and no 101–106 mode icon, this is why).
+    // Once any rerun-if-* is declared, Cargo stops watching the package files, and embed-resource
+    // does not report the icons ime.rc references, so list them here or icon changes are not
+    // rebuilt.
     println!("cargo:rerun-if-changed=ime.rc");
     for entry in std::fs::read_dir(".").into_iter().flatten().flatten() {
         let path = entry.path();
@@ -15,8 +14,18 @@ fn main() {
         }
     }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
-        embed_resource::compile_for_cdylib("ime.rc", embed_resource::NONE)
+        embed_resource::compile_for_cdylib("ime.rc", version_macros())
             .manifest_required()
             .expect("TSF 图标资源编译失败");
     }
+}
+
+/// VERSIONINFO comes from the Cargo package version.
+fn version_macros() -> [String; 3] {
+    let part = |name: &str| std::env::var(name).unwrap();
+    [
+        format!("YIIME_VERSION_MAJOR={}", part("CARGO_PKG_VERSION_MAJOR")),
+        format!("YIIME_VERSION_MINOR={}", part("CARGO_PKG_VERSION_MINOR")),
+        format!("YIIME_VERSION_PATCH={}", part("CARGO_PKG_VERSION_PATCH")),
+    ]
 }

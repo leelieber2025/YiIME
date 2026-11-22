@@ -3,7 +3,7 @@
 # installation package dist/YiIME-<version>-macos.pkg (installed to /Library/Input Methods).
 set -euo pipefail
 cd "$(dirname "$0")/.."
-version="${1:-0.1.1}"
+version="$(tools/version.sh)"
 out=dist/macos
 rm -rf "$out" && mkdir -p "$out"
 export MACOSX_DEPLOYMENT_TARGET=11.0
@@ -21,7 +21,7 @@ done
 app="$out/root/YiIME.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 lipo -create "$out/YiIME-arm64" "$out/YiIME-x86_64" -output "$app/Contents/MacOS/YiIME"
-sed "s/0\.1\.0/$version/g" macos/YiIME/Info.plist > "$app/Contents/Info.plist"
+sed "s/@VERSION@/$version/g" macos/YiIME/Info.plist > "$app/Contents/Info.plist"
 cp macos/YiIME/icon.tiff "$app/Contents/Resources/"
 for lang in en zh-Hans; do
     mkdir -p "$app/Contents/Resources/$lang.lproj"

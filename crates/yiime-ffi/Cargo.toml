@@ -1,6 +1,6 @@
 [package]
 name = "yiime-ffi"
-version = "0.1.1"
+version.workspace = true
 license = "GPL-3.0-only"
 edition = "2024"
 rust-version = "1.85"

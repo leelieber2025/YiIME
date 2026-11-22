@@ -5,10 +5,9 @@ fn main() {
     eprintln!("此界面仅支持 Windows");
 }
 
-/// The floating input box following the cursor: This program writes Chinese drafts using
-/// Wubi/Pinyin combinations. Enter calls the translation API and directly submits the English back
-/// to the original application; the settings are placed in a separate window opened by the tray
-/// menu.
+/// Floating input box at the text cursor: compose a Chinese draft with Wubi/pinyin, press Enter to
+/// translate and send the English back to the original application. Settings open in a separate
+/// window from the tray menu.
 #[cfg(windows)]
 mod app {
     use std::cell::{Cell, RefCell};
@@ -83,7 +82,7 @@ mod app {
     const HISTORY_CLOSE: i32 = 305;
     const HISTORY_STATUS: i32 = 306;
     const TRAY_HISTORY: usize = 4;
-    /// Set the switch in the window: (control ID, text, corresponding option).
+    /// Settings-window switches: (control ID, label, option).
     const OPTION_BOXES: [(i32, &str, Flag); 10] = [
         (210, "中文标点（Ctrl+. 切换）", Flag::PunctEnglish),
         (211, "繁体输出（Ctrl+Shift+F）", Flag::Traditional),
@@ -96,8 +95,7 @@ mod app {
         (218, "， 。 也翻页（组字时）", Flag::CommaPeriodPaging),
         (219, "引号括号自动配对", Flag::AutoPair),
     ];
-    /// When there is one more row of switches, the controls below the settings window will move
-    /// down as a whole.
+    /// Each extra row of switches moves the controls below it down.
     const OPTION_SHIFT: i32 = (OPTION_BOXES.len() as i32 + 1) / 2 * 26 - 3 * 26;
     const ID_OK: i32 = 1;
     const ID_CANCEL: i32 = 2;
@@ -105,54 +103,45 @@ mod app {
     const TRAY_EXIT: usize = 2;
     const TRAY_PLAIN: usize = 3;
     const TRAY_TRANSLATE: usize = 5;
-    /// The tray instance regularly checks the mode (input method shortcut keys/taskbar buttons will
-    /// also change) and refreshes the tray prompt.
+    /// The tray instance polls the mode (also changed by IME shortcuts and the taskbar button) to
+    /// refresh its tooltip.
     const TRAY_TIMER: usize = 7;
-    /// State shared with TSF DLL: PlainMode (DWORD) and PlainToggleKey (String) under
-    /// HKCU\\Software\\InputTranslation.
+    /// Registry key shared with the TSF DLL.
     const STATE_KEY: &str = "Software\\InputTranslation";
     const WM_TRANSLATED: u32 = WM_APP + 1;
     const WM_TSF_ACTIVATE: u32 = WM_APP + 2;
     const WM_TSF_EXIT: u32 = WM_APP + 3;
     const WM_TRAY: u32 = WM_APP + 4;
-    /// Have an already running tray instance open the settings window (`--settings` or sent on
-    /// repeated startup).
+    /// Asks the running tray instance to open settings (`--settings`, or a second launch).
     const WM_OPEN_SETTINGS: u32 = WM_APP + 5;
-    /// Have the already running tray instance open the "Input Memory" window (`--history`).
+    /// Asks the running tray instance to open input history (`--history`).
     const WM_OPEN_HISTORY: u32 = WM_APP + 6;
-    /// Tray (portable) instances and TSF editor instances are distinguished by different window
-    /// titles to facilitate single instance search.
+    /// Tray (portable) and TSF editor instances use different titles so each can find its single
+    /// instance.
     const TRAY_TITLE: &str = "YiIME 译 · 托盘";
     const TSF_TITLE: &str = "YiIME 译 · TSF";
     const APP_NAME: &str = "YiIME 译";
     const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
     static TRAY_V4: AtomicBool = AtomicBool::new(false);
     const EN_CHANGE_CODE: u16 = 0x0300;
-    /// The number of candidate entries per page corresponds to the numeric keys 1 to 9. The default
-    /// value and range of the number of candidates per page (can be changed in settings, saved in
-    /// HKCU\\Software\\InputTranslation\\PageSize).
     const SETTINGS_PAGE_SIZE: i32 = 223;
     const SETTINGS_ENGINE: i32 = 224;
     const SETTINGS_GOOGLE_KEY: i32 = 225;
-    /// The "Translation Engine" line at the top of the settings window: the rest of the controls
-    /// are moved down this far overall.
+    /// Height of the Translation Engine row at the top of the settings window; the other controls
+    /// move down by this much.
     const ENGINE_SHIFT: i32 = 56;
-    /// The maximum number of candidates retrieved by a query (maximum 10 pages). Take up to ten
-    /// pages of candidates.
+    /// Longest custom LLM instruction kept from the settings window, in characters.
     const MAX_CUSTOM_LEN: usize = 500;
     const PAD: i32 = 6;
     const EDIT_H: i32 = 26;
     const LINE_H: i32 = 24;
     const GAP: i32 = 14;
     const MIN_W: i32 = 340;
-    /// The candidate bar is the widest (9 candidates with bracketed coding hints can also be
-    /// accommodated).
+    /// Widest candidate bar (fits 9 candidates with Wubi hints).
     const MAX_W: i32 = 1000;
-    /// The draft will automatically wrap if it exceeds this width, and will only increase in height
-    /// thereafter.
+    /// Drafts wrap beyond this width and then grow only in height.
     const DRAFT_MAX_W: i32 = 480;
-    /// The maximum number of lines displayed in the draft area, any more will scroll within the
-    /// box.
+    /// Draft lines shown before it scrolls inside the box.
     const DRAFT_MAX_LINES: i32 = 8;
     const HINT: &str = "Enter 翻译上屏 · Shift+Enter 中文上屏 · Shift 夹英文 · Esc 取消";
     const ENGLISH_HINT: &str = "[英] 字母原样输入 · 单击 Shift 回中文 · Enter 翻译上屏";
@@ -165,14 +154,12 @@ mod app {
     const HIGHLIGHT: u32 = 0x00FB_E9D6;
     const SEPARATOR: u32 = 0x00E0_E0E0;
 
-    /// The group word status maintained by this program in the floating box. The composition state
-    /// is in the core (yiime_core::Composer); here only the click area of ​​the candidate bar is
-    /// added.
+    /// Input-box state: composition lives in the core (`yiime_core::Composer`); this adds the
+    /// candidate click areas.
     #[derive(Default)]
     struct Composition {
         engine: Composer,
-        /// The horizontal range (client area coordinates) of each candidate on the current page in
-        /// the candidate row, used for mouse click.
+        /// Horizontal extent (client coordinates) of each candidate on this page, for mouse clicks.
         hits: Vec<(i32, i32)>,
         row_top: i32,
     }
@@ -193,47 +180,42 @@ mod app {
         edit: HWND,
         font: HFONT,
         small_font: HFONT,
-        /// The current height of the draft area (increases with the content when there are multiple
-        /// lines).
+        /// Current draft height (grows with multi-line content).
         draft_h: Cell<i32>,
         composition: RefCell<Composition>,
-        /// Status line at the bottom of the floating box: (text, error or not).
+        /// Status line: (text, is error).
         status: RefCell<Option<(String, bool)>>,
         settings: RefCell<ApiSettings>,
         settings_window: Cell<HWND>,
-        /// Targets the screen rectangle where the text cursor is applied, and the float box is
-        /// displayed against it.
+        /// Screen rectangle of the target's text cursor; the box is placed against it.
         anchor: Cell<RECT>,
-        /// The cursor rectangle sent by the TSF DLL before activation.
+        /// Cursor rectangle sent by the TSF DLL before activation.
         pending_anchor: Cell<Option<RECT>>,
         target: Cell<HWND>,
-        /// Each call/cancel/commit is incremented and used to discard expired translation results.
+        /// Bumped on every activation, cancel and commit; stale translation results are dropped.
         generation: Cell<u64>,
         pending: Cell<bool>,
         suppress_deactivate: Cell<bool>,
         tsf_receiver: HWND,
         finished: Cell<bool>,
-        /// Press the "Normal Mode" shortcut key in the draft box: swallow the WM_CHAR subsequently
-        /// generated by it.
+        /// The plain-mode shortcut was pressed in the box: swallow the WM_CHAR it produces.
         swallow_char: Cell<bool>,
-        /// The tray prompts for the last displayed mode.
+        /// Mode last shown in the tray tooltip.
         last_plain: Cell<bool>,
-        /// Self-learning records are saved in %APPDATA%\\InputTranslation\\learned.txt.
+        /// Learned picks, saved in %APPDATA%\\InputTranslation\\learned.txt.
         learned: RefCell<Learned>,
-        /// The open/closed alternating state of Chinese quotation marks.
         quotes: Cell<Quotes>,
-        /// This time, the draft was retrieved using the "Input Memory" shortcut key: it is
-        /// processed in translation mode (normal mode will not automatically appear on the screen).
+        /// The draft was recalled with the history shortcut: handle it in translation mode (plain
+        /// mode would commit it immediately).
         recall_session: Cell<bool>,
-        /// Which input memory does the current draft come from (0 = latest).
+        /// History entry the draft came from (0 = newest).
         history_pos: Cell<Option<usize>>,
         taskbar_created: u32,
-        /// Click Shift in the middle of composing words to enter the English paragraph: letters,
-        /// spaces, and punctuation are entered into the draft as they are (click Shift again to
-        /// return to Chinese).
+        /// Inline English segment (Shift tap while composing): letters, spaces and punctuation go
+        /// into the draft as typed until Shift is tapped again.
         english: Cell<bool>,
         shift_tap: Cell<yiime_core::ShiftTap>,
-        /// The keypad number just pressed: subsequent WM_CHAR numbers are not candidates.
+        /// A numpad digit was just pressed: its WM_CHAR does not pick a candidate.
         numpad: Cell<bool>,
     }
 
@@ -266,16 +248,15 @@ mod app {
             PostMessageW(editor as HWND, WM_TSF_EXIT, 0, 0);
         });
     }
-    /// The identification of the input method in the language list: language 0804 + TIP CLSID +
-    /// profile GUID.
+    /// The IME in the language list: language 0804 + TIP CLSID + profile GUID.
     const TIP_ID: &str =
         "0804:{A72091C2-7459-4C47-85F4-4626AE42A6C8}{54A39D73-0625-4560-B878-94660908C69D}";
-    /// The language list has been marked once for the current user; it will no longer be imposed
-    /// when the user deletes the input method later. The installation script will clear it.
+    /// Marks that the IME was added to this user's language list once, so it is not re-added after
+    /// the user removes it. The installer clears it.
     const TIP_MARKER: &str = "ime-list-added";
-    /// As the current user (non-administrator), add the input method to its Chinese input method
-    /// list. Set-WinUserLanguageList in the administrator installation script sometimes does not
-    /// affect the user session, so make sure again when the tray is started.
+    /// Adds the IME to the current (non-admin) user's Chinese input list. Set-WinUserLanguageList
+    /// in the elevated installer sometimes misses the user session, so the tray makes sure on
+    /// start.
     fn ensure_tip_in_language_list() {
         let Some(dir) = settings_dir() else {
             return;
@@ -284,7 +265,7 @@ mod app {
         if marker.exists() {
             return;
         }
-        // input.dll!InstallLayoutOrTip: A no-op if it already exists.
+        // input.dll!InstallLayoutOrTip is a no-op if already present.
         let added = unsafe {
             let library = LoadLibraryW(wide("input.dll").as_ptr());
             if library.is_null() {
@@ -303,8 +284,8 @@ mod app {
             let _ = std::fs::write(&marker, b"1");
         }
     }
-    /// Read the large vocabulary library in the same directory as the EXE (installation version) or
-    /// data\\frost (portable decompression version); return None if not.
+    /// Reads the large lexicon next to the EXE (installed) or in data\\frost (portable); None if
+    /// absent.
     fn frequency_words() -> Option<String> {
         let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
         [
@@ -316,7 +297,7 @@ mod app {
         .into_iter()
         .find_map(|path| std::fs::read_to_string(path).ok())
     }
-    /// Storage for settings switches: HKCU\\Software\\InputTranslation (shared with TSF DLL).
+    /// Settings switches in HKCU\\Software\\InputTranslation (shared with the TSF DLL).
     struct Registry;
     impl OptionStore for Registry {
         fn get_u32(&self, name: &str) -> Option<u32> {
@@ -390,24 +371,21 @@ mod app {
     fn set_option(flag: Flag, on: bool) -> bool {
         OPTIONS.set_flag(flag, on)
     }
-    /// Whether the normal Wubi mode (no translation, word selection directly on the screen) is
-    /// enabled.
     fn plain_mode() -> bool {
         option(Flag::PlainMode)
     }
     fn set_plain_mode(on: bool) -> bool {
         set_option(Flag::PlainMode, on)
     }
-    /// Switch the shortcut text for normal mode; when not set or invalid, the default
-    /// Ctrl+Shift+Space is used.
+    /// Shortcut for toggling plain mode; Ctrl+Shift+Space when unset or invalid.
     fn plain_toggle_text() -> String {
         OPTIONS.plain_toggle_key()
     }
     fn history_key_text() -> String {
         OPTIONS.history_key()
     }
-    /// Refresh the settings that can be used (read the registry every time, changes to TSF or
-    /// settings window will take effect immediately).
+    /// Current options, read from the registry each time so changes from TSF or the settings window
+    /// apply at once.
     fn compose_options() -> ComposeOptions {
         ComposeOptions {
             page_size: OPTIONS.page_size(),
@@ -419,12 +397,10 @@ mod app {
     fn history_path() -> Option<PathBuf> {
         settings_dir().map(|dir| dir.join(HISTORY_FILE))
     }
-    /// Input memory (files are encrypted by the current user using Windows DPAPI and only exist on
-    /// this machine).
+    /// Input history, encrypted per user with DPAPI and kept on this machine only.
     fn history() -> Option<History<'static>> {
         history_path().map(|path| History::new(path, &Dpapi))
     }
-    /// Read input memory (newest first).
     fn load_history() -> Vec<HistoryEntry> {
         history().map(|history| history.load()).unwrap_or_default()
     }
@@ -442,8 +418,8 @@ mod app {
             time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute
         )
     }
-    /// Make a note of the translation that appears on the screen (nothing is saved when the switch
-    /// is turned off); only the latest Chinese version of the same sentence is retained.
+    /// Records a committed translation (not when history is off); a repeated sentence keeps only
+    /// its newest entry.
     fn remember_translation(chinese: &str, english: &str) {
         if !option(Flag::HistoryEnabled) || chinese.trim().is_empty() {
             return;
@@ -452,8 +428,8 @@ mod app {
             history.remember(chinese, english, local_time());
         }
     }
-    /// Put input memory No. `index` into the draft (replace the current draft), and the status line
-    /// displays the time and translation.
+    /// Loads history entry `index` into the draft (replacing it); the status line shows its time
+    /// and translation.
     unsafe fn show_history(hwnd: HWND, state: &State, index: usize) -> bool {
         let entries = load_history();
         let Some(entry) = entries.get(index) else {
@@ -482,7 +458,7 @@ mod app {
         }
         true
     }
-    /// Enter the memory shortcut key to recall: load the latest Chinese draft.
+    /// History shortcut: load the newest entry as the draft.
     unsafe fn recall_latest(hwnd: HWND, state: &State) {
         state.recall_session.set(true);
         let shown = option(Flag::HistoryEnabled) && unsafe { show_history(hwnd, state, 0) };
@@ -503,7 +479,6 @@ mod app {
             }
         }
     }
-    /// Write to clipboard (Unicode text).
     unsafe fn set_clipboard(owner: HWND, text: &str) -> bool {
         use windows_sys::Win32::Foundation::GlobalFree;
         use windows_sys::Win32::System::DataExchange::{
@@ -525,7 +500,7 @@ mod app {
                 if !target.is_null() {
                     std::ptr::copy_nonoverlapping(units.as_ptr(), target, units.len());
                     GlobalUnlock(memory);
-                    // CF_UNICODETEXT = 13; after success, the memory is owned by the system.
+                    // CF_UNICODETEXT = 13; on success the system owns the memory.
                     ok = !SetClipboardData(13, memory).is_null();
                 }
                 if !ok {
@@ -542,7 +517,7 @@ mod app {
     fn user_words_path() -> Option<PathBuf> {
         settings_dir().map(|dir| dir.join(USER_WORDS_FILE))
     }
-    /// Remember to select once (not remember when self-learning is turned off).
+    /// Records a pick (unless learning is off).
     fn remember_pick(state: &State, code: &str, word: &str) {
         if option(Flag::Learn) {
             state.learned.borrow_mut().record(code, word);
@@ -557,10 +532,9 @@ mod app {
             HINT
         }
     }
-    /// Click Shift: Chinese ↔ English segment. When switching to English, the unselected code will
-    /// be entered into the draft as letters (the same agreement as Microsoft Pinyin, Sogou, and
-    /// Rime); when switching back to Chinese, the normal Wubi mode will hand the draft to the
-    /// original application.
+    /// Shift tap: Chinese ↔ English segment. Entering English puts the unpicked code into the draft
+    /// as letters (as in Microsoft Pinyin, Sogou and Rime); returning to Chinese in plain mode
+    /// hands the draft to the application.
     unsafe fn toggle_inline_english(hwnd: HWND, state: &State) {
         let english = !state.english.get();
         if english {
@@ -594,11 +568,9 @@ mod app {
             )
         }
     }
-    /// Ordinary Wubi mode: After the word grouping is completed (words are selected, letters or
-    /// punctuation points are displayed on the screen), the draft is immediately handed over to the
-    /// original application without translation; when the coding is deleted/cancelled and the draft
-    /// is empty, it is directly stored. Does nothing when translation is in progress or mode is
-    /// off.
+    /// Plain Wubi mode: once a composition finishes (a pick, or letters/punctuation committed),
+    /// hand the draft to the application without translating; if the code is cleared and the draft
+    /// is empty, just close. Does nothing while translating or outside plain mode.
     unsafe fn flush_plain(hwnd: HWND, state: &State) {
         if !plain_mode()
             || state.english.get()
@@ -618,7 +590,7 @@ mod app {
             }
         }
     }
-    /// Whether the key is a "normal mode" switching shortcut key.
+    /// Whether the key is the plain-mode shortcut.
     fn is_plain_toggle(vk: u16) -> bool {
         let Some(Hotkey {
             ctrl,
@@ -644,7 +616,7 @@ mod app {
     fn settings_dir() -> Option<PathBuf> {
         std::env::var_os("APPDATA").map(|path| PathBuf::from(path).join("InputTranslation"))
     }
-    /// Encryption per current user (DPAPI): API keys and input memory.
+    /// Per-user DPAPI encryption for API keys and history.
     struct Dpapi;
     impl Sealer for Dpapi {
         fn seal(&self, data: &[u8]) -> Option<Vec<u8>> {
@@ -891,8 +863,7 @@ mod app {
             TextOutW(hdc, x, y, units.as_ptr(), units.len() as i32);
         }
     }
-    /// Place it first under the cursor; if it cannot fit below, flip it over to the top of the
-    /// cursor; always limit it to the working area of ​​the monitor.
+    /// Below the cursor, or above it if it does not fit; always inside the monitor's work area.
     unsafe fn place(anchor: RECT, width: i32, height: i32) -> (i32, i32) {
         let work = unsafe { work_area(anchor) };
         let mut y = anchor.bottom + 4;
@@ -903,7 +874,7 @@ mod app {
         let x = anchor.left.min(work.right - width).max(work.left);
         (x, y)
     }
-    /// The working area of ​​the monitor where the cursor is located.
+    /// Work area of the monitor containing the cursor.
     unsafe fn work_area(anchor: RECT) -> RECT {
         let point = POINT {
             x: anchor.left,
@@ -924,8 +895,7 @@ mod app {
             }
         }
     }
-    /// Recalculate the size and position of the floating box according to draft, group words and
-    /// candidate content.
+    /// Resizes and repositions the box for the draft, code and candidates.
     unsafe fn relayout(hwnd: HWND, state: &State) {
         let draft = unsafe { get_text(state.edit) };
         let status = state.status.borrow().clone();
@@ -974,15 +944,15 @@ mod app {
             let line = status.map_or(hint(state).to_owned(), |(text, _)| text);
             width = width.max(unsafe { text_width(hdc, &line) } + 2 * PAD);
         }
-        // When a candidate has a Wubi prompt, one line may exceed MAX_W: widen to the width of the
-        // monitor's working area to avoid the 8th and 9th candidates from being truncated.
+        // Wubi hints can make the row wider than MAX_W: allow up to the work-area width so the 8th
+        // and 9th candidates are not cut off.
         let max_w = unsafe {
             let work = work_area(state.anchor.get());
             (work.right - work.left - 16).max(MAX_W)
         };
         let width = width.clamp(MIN_W, max_w) + 2;
-        // Multi-line draft: wrap the lines according to the width of the edit box to calculate the
-        // height (leaving aside the padding of the edit control).
+        // Multi-line draft: wrap at the edit-box width to compute its height (excluding the edit
+        // control's padding).
         let edit_w = width - 2 - 2 * PAD;
         let draft_h = unsafe {
             SelectObject(hdc, state.font as _);
@@ -1022,8 +992,7 @@ mod app {
         unsafe {
             SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
             MoveWindow(state.edit, PAD, PAD, edit_w, draft_h, 1);
-            // The cursor remains visible at all times (scrolls to the insertion point when the
-            // draft exceeds the maximum number of lines).
+            // Keep the caret visible (scroll to it when the draft exceeds the maximum lines).
             SendMessageW(state.edit, EM_SCROLLCARET, 0, 0);
             InvalidateRect(hwnd, null(), 1);
         }
@@ -1135,17 +1104,15 @@ mod app {
             SendMessageW(state.edit, EM_REPLACESEL, 1, wide(text).as_ptr() as isize);
         }
     }
-    /// Write the selected candidates or original letters into the draft, and end this word
-    /// grouping.
+    /// Writes the picked candidate or raw letters into the draft and ends this composition.
     unsafe fn commit_into_draft(hwnd: HWND, state: &State, text: &str) {
         unsafe {
             set_code(hwnd, state, String::new());
             insert_text(state, text);
         }
     }
-    /// Select the `index` candidate on the current page; return false if there is no such
-    /// candidate. Candidates for the first segment of Pinyin (such as "中" in zhonggou) only use the
-    /// first few syllables, leaving the remaining codes for continued selection.
+    /// Picks candidate `index` on this page; false if there is none. A leading-syllable candidate
+    /// (中 in zhonggou) leaves the remaining code for the next pick.
     unsafe fn pick(hwnd: HWND, state: &State, index: usize) -> bool {
         let pick = state.composition.borrow().candidate_at(index);
         match pick {
@@ -1164,8 +1131,8 @@ mod app {
             None => false,
         }
     }
-    /// `[` `]` Determine the word by word: the first/last word of the preferred word on the current
-    /// page on the screen (the previous candidate will leave the remaining syllables).
+    /// `[` `]`: commit the first/last character of the first candidate (a partial candidate leaves
+    /// the remaining syllables).
     unsafe fn pick_char_of_word(hwnd: HWND, state: &State, last: bool) -> bool {
         let pick = state.composition.borrow().candidate_at(0);
         let Some(pick) = pick else {
@@ -1184,8 +1151,8 @@ mod app {
         }
         true
     }
-    /// Space: Select the first candidate (the previous candidate will leave the remaining
-    /// syllables); if there are no candidates, the original letter will be displayed.
+    /// Space: pick the first candidate (a partial candidate leaves the remaining syllables), or
+    /// commit the raw letters if there is none.
     unsafe fn pick_first_or_raw(hwnd: HWND, state: &State) {
         if unsafe { !pick(hwnd, state, 0) } {
             let raw = state.composition.borrow().code.clone();
@@ -1194,8 +1161,8 @@ mod app {
             }
         }
     }
-    /// Punctuation, Shift+letters, Ctrl+Enter: put all the codes on the screen (select the
-    /// preferred one paragraph by paragraph until the codes are used up).
+    /// Punctuation, Shift+letter, Ctrl+Enter: commit the whole code, picking the first candidate
+    /// segment by segment until it is used up.
     unsafe fn flush_composition(hwnd: HWND, state: &State) {
         for _ in 0..MAX_CODE_LEN {
             if state.composition.borrow().code.is_empty() {
@@ -1212,8 +1179,7 @@ mod app {
             relayout(hwnd, state);
         }
     }
-    /// The character before the cursor is used to determine the half-width punctuation in numbers
-    /// such as `3.5` and `10:30`.
+    /// Character before the caret, to keep `.` `:` half-width after digits (`3.5`, `10:30`).
     unsafe fn char_before_caret(edit: HWND) -> Option<u16> {
         let mut start = 0u32;
         unsafe {
@@ -1224,8 +1190,7 @@ mod app {
             .checked_sub(1)
             .and_then(|index| text.get(index).copied())
     }
-    /// One character after the cursor (to determine whether to skip the closing punctuation point
-    /// during automatic pairing).
+    /// Character after the caret, to skip over a closing mark when auto-closing.
     unsafe fn char_after_caret(edit: HWND) -> Option<u16> {
         let mut end = 0u32;
         unsafe {
@@ -1234,7 +1199,7 @@ mod app {
         let text: Vec<u16> = unsafe { get_text(edit) }.encode_utf16().collect();
         text.get(end as usize).copied()
     }
-    /// Move the cursor left and right `delta` UTF-16 units (unchecked).
+    /// Moves the caret by `delta` UTF-16 units (unchecked).
     unsafe fn move_caret(edit: HWND, delta: isize) {
         let mut end = 0u32;
         unsafe {
@@ -1261,9 +1226,8 @@ mod app {
             return false;
         };
         if option(Flag::AutoPair) {
-            // Automatic pairing: input the opening punctuation point together with the closing
-            // punctuation point, and the cursor stops in the middle; only skip the closing
-            // punctuation point after the cursor.
+            // Auto-close: insert the opening and closing marks with the caret between them; a
+            // closing mark right after the caret is skipped over.
             if yiime_core::is_closing(text)
                 && unsafe { char_after_caret(state.edit) } == text.encode_utf16().next()
             {
@@ -1285,34 +1249,30 @@ mod app {
         }
         true
     }
-    /// Character input in the draft box. Returning true indicates that it has been processed and
-    /// will no longer be handed over to the EDIT control.
+    /// Character input in the box. True means handled, so the EDIT control does not see it.
     unsafe fn handle_char(hwnd: HWND, state: &State, unit: u32) -> bool {
         let Some(ch) = char::from_u32(unit) else {
             return false;
         };
         if ch == '\n' {
-            // Ctrl+Enter: No translation or API call, Chinese draft will be displayed directly on
-            // the screen. If there are still unselected codes, first put the preferred candidate
-            // (the original letter if there is no candidate) into the draft, and then put the
-            // entire paragraph on the screen. The draft box itself does not insert line breaks.
+            // Ctrl+Enter: commit the Chinese draft without translating. A pending code first puts
+            // its first candidate (or raw letters) into the draft. The box never inserts a newline.
             unsafe {
                 flush_composition(hwnd, state);
                 submit(hwnd, state, true);
             }
             return true;
         }
-        // Small keyboard numbers: When composing words, do not select candidates. First put the
-        // code on the screen (select paragraph by paragraph), and then enter the numbers as they
-        // are.
+        // Numpad digits do not pick candidates: commit the code (segment by segment), then type the
+        // digit.
         if state.numpad.replace(false) && ch.is_ascii_digit() {
             unsafe {
                 flush_composition(hwnd, state);
             }
             return false;
         }
-        // English paragraph: Visible characters and spaces are left to the edit box as they are (no
-        // word grouping, no full-width punctuation conversion).
+        // English segment: printable characters and space go to the edit box as typed (no
+        // composition, no full-width punctuation).
         if state.english.get()
             && state.composition.borrow().code.is_empty()
             && yiime_core::is_literal_in_english(ch)
@@ -1322,10 +1282,8 @@ mod app {
         let composing = !state.composition.borrow().code.is_empty();
         let caps = unsafe { GetKeyState(VK_CAPITAL as i32) } & 1 != 0;
         match classify_letter(ch, caps, composing) {
-            // Caps Lock is on or Shift+letters (uppercase): Enter letters as they are without
-            // encoding (consistent with Microsoft Wubi). When composing words, first display the
-            // preferred candidate on the screen (the original code if there is no candidate), and
-            // then put the letter.
+            // Caps Lock or Shift+letter: type the letter as is (as in Microsoft Wubi), committing
+            // the first candidate (or raw code) first if composing.
             Some(LetterAction::Raw { flush_first }) => {
                 if flush_first {
                     unsafe {
@@ -1334,10 +1292,9 @@ mod app {
                 }
                 return false;
             }
-            // Coded letters: The rules for five-code top words/empty code clearing and four-code
-            // unique automatic screen display are in the core. The popped word in normal mode will
-            // appear on the screen together with the next word (upping the screen at this time will
-            // end the session and discard the new letters).
+            // Code letter. Fifth-letter, empty-code and unique-four-letter rules live in the core.
+            // In plain mode a commit produced here goes out together with the next one (flushing
+            // now would end the session and lose the new letter).
             Some(LetterAction::Compose(letter)) => {
                 let rules = LetterRules {
                     push_fifth: option(Flag::PushFifth),
@@ -1386,9 +1343,8 @@ mod app {
                 _ => false,
             };
         }
-        // The semicolon is selected as the second candidate, and the single quotation mark is
-        // selected as the third candidate (Microsoft Wubi); the single quotation mark is still used
-        // as a syllable separator when it may be pinyin.
+        // `;` picks the 2nd candidate and `'` the 3rd (Microsoft Wubi); `'` still separates
+        // syllables when the code may be pinyin.
         if option(Flag::SemicolonSelect) {
             let code = state.composition.borrow().code.clone();
             if let Some(index) = selection_index(&state.input, &code, ch)
@@ -1430,16 +1386,15 @@ mod app {
             unsafe {
                 turn_page(hwnd, state, ch == '=' || ch == '.');
             },
-            // Determine the word by word: [take the first word of the preferred word,] take the
-            // last word; enter punctuation as usual when single-word candidates are selected.
+            // `[` first character, `]` last character of the first candidate; with a
+            // single-character candidate they are plain punctuation.
             '[' | ']'
                 if option(Flag::BracketCharPick)
                     && unsafe { pick_char_of_word(hwnd, state, ch == ']') } => {}
             _ if (ch as u32) < 0x20 => {}
             _ => {
-                // Other punctuation marks: First select the first choice on the screen, and then
-                // enter the (full-width) punctuation marks, which is consistent with common Chinese
-                // input methods.
+                // Other punctuation: commit the first candidate, then type the (full-width) mark,
+                // as common Chinese IMEs do.
                 unsafe {
                     flush_composition(hwnd, state);
                 }
@@ -1463,8 +1418,7 @@ mod app {
         let Some(state) = (unsafe { state_of(hwnd) }) else {
             return call_previous();
         };
-        // Click Shift (press and then release without pressing another key) to switch the English
-        // paragraph.
+        // Shift tap (pressed and released alone) toggles the English segment.
         if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
             state.numpad.set(yiime_core::is_numpad_digit(w as u32));
             let held = |vk: u16| unsafe { GetKeyState(vk as i32) } < 0;
@@ -1510,7 +1464,7 @@ mod app {
                         || (w == b'F' as usize && unsafe { GetKeyState(VK_SHIFT as i32) } < 0)) =>
             {
                 // Ctrl+.: Chinese/English punctuation; Ctrl+Shift+F: Simplified/Traditional output
-                // (same shortcut keys as Microsoft Wubi).
+                // (Microsoft Wubi shortcuts).
                 let (option_key, on_text, off_text) = if w == 0xBE {
                     (Flag::PunctEnglish, "英文标点", "中文标点")
                 } else {
@@ -1530,8 +1484,8 @@ mod app {
                 }
                 return 0;
             }
-            // Ctrl+Shift+Number: Delete the learning record of this candidate under the current
-            // encoding (Microsoft Pinyin convention).
+            // Ctrl+Shift+digit: forget the learned pick of that candidate under the current code
+            // (Microsoft Pinyin convention).
             WM_KEYDOWN
                 if (0x31..=0x39).contains(&w)
                     && unsafe { GetKeyState(VK_CONTROL as i32) } < 0
@@ -1557,12 +1511,11 @@ mod app {
                 return 0;
             }
             WM_KEYDOWN | WM_SYSKEYDOWN if is_plain_toggle(w as u16) => {
-                // You can also switch between normal/translation mode in the floating box; the
-                // grouped words and drafts are retained, and the prompt line is updated
-                // accordingly.
+                // The mode can also be toggled inside the box; the code and draft stay and the hint
+                // line updates.
                 set_plain_mode(!plain_mode());
-                // Only Ctrl combinations (without Alt) will subsequently produce a WM_CHAR (space
-                // or control character).
+                // Only Ctrl combinations (without Alt) produce a following WM_CHAR (space or
+                // control character).
                 state.swallow_char.set(unsafe {
                     GetKeyState(VK_CONTROL as i32) < 0 && GetKeyState(VK_MENU as i32) >= 0
                 });
@@ -1572,8 +1525,8 @@ mod app {
                 }
                 return 0;
             }
-            // When there are no group words, the draft is empty, or it is still the original text
-            // of a certain memory: ↑/PgUp to see the earlier memory, ↓/PgDn to see the newer one.
+            // With no code and an empty draft (or a recalled entry unchanged): ↑/PgUp shows older
+            // history, ↓/PgDn newer.
             WM_KEYDOWN
                 if state.composition.borrow().code.is_empty()
                     && [VK_UP, VK_DOWN, VK_PRIOR, VK_NEXT].contains(&(w as u16))
@@ -1623,8 +1576,8 @@ mod app {
         }
         call_previous()
     }
-    /// Text cursor screen rectangle of the target window: Check the system cursor first, and use
-    /// the mouse position if it cannot be found.
+    /// Screen rectangle of the target's text cursor: the system caret first, else the mouse
+    /// position.
     unsafe fn caret_of(target: HWND) -> RECT {
         let thread = if target.is_null() {
             0
@@ -1714,17 +1667,17 @@ mod app {
         unsafe {
             relayout(hwnd, state);
             ShowWindow(hwnd, SW_SHOW);
-            // When reusing the editor, the system often rejects the ordinary SetForegroundWindow,
-            // and the box will be displayed but the keyboard cannot be reached; if it cannot be
-            // reached, hook the foreground thread input queue and try again.
+            // When the editor is reused, Windows often refuses a plain SetForegroundWindow and the
+            // box shows without keyboard focus; in that case attach to the foreground thread's
+            // input queue and retry.
             bring_to_front(hwnd);
             SetFocus(state.edit);
             let end = GetWindowTextLengthW(state.edit) as usize;
             SendMessageW(state.edit, EM_SETSEL, end, end as isize);
         }
     }
-    /// Start an input: record the target window and cursor position, and display a floating box at
-    /// the cursor. The draft you left last time you clicked elsewhere will be retained.
+    /// Starts an input: remember the target window and cursor and show the box there. A draft left
+    /// by clicking away is kept.
     unsafe fn activate(
         hwnd: HWND,
         state: &State,
@@ -1743,8 +1696,8 @@ mod app {
             .anchor
             .set(anchor.unwrap_or_else(|| unsafe { caret_of(target) }));
         *state.status.borrow_mut() = None;
-        // Establish a connection to the translation server in advance during typing (without key
-        // and original text; no repetition within 30 seconds).
+        // Warm up the connection to the translation server while typing (no key or text; at most
+        // once per 30 s).
         if !plain_mode() {
             let settings = state.settings.borrow().clone();
             std::thread::spawn(move || yiime_core::prewarm(&settings));
@@ -1771,8 +1724,8 @@ mod app {
             set_code(hwnd, state, String::new());
         }
     }
-    /// Switch the target window to the foreground; when a normal call is rejected by the foreground
-    /// lock, temporarily mount the input queue of the current foreground thread and try again.
+    /// Brings the target to the foreground; if the foreground lock refuses, temporarily attach to
+    /// the foreground thread's input queue and retry.
     unsafe fn bring_to_front(target: HWND) -> bool {
         unsafe {
             if SetForegroundWindow(target) != 0 && GetForegroundWindow() == target {
@@ -1789,8 +1742,7 @@ mod app {
             GetForegroundWindow() == target
         }
     }
-    /// Program icon (resource ID 1, taken from windows/tsf/ime.ico); if missing, the system default
-    /// icon will be returned.
+    /// Program icon (resource 1, from windows/tsf/ime.ico); the system default if missing.
     unsafe fn app_icon(size: i32) -> HICON {
         unsafe {
             let icon = LoadImageW(
@@ -1808,7 +1760,7 @@ mod app {
             }
         }
     }
-    /// Tells the TSF DLL that this input has ended (no text will be inserted).
+    /// Tells the TSF DLL this input ended without inserting text.
     unsafe fn finish_tsf(hwnd: HWND, state: &State) -> bool {
         if state.tsf_receiver.is_null() || state.finished.get() {
             return true;
@@ -1819,8 +1771,8 @@ mod app {
         }
         ok
     }
-    /// Esc (without grouping): Abandon the draft and close the floating box. TSF will not be folded
-    /// without confirmation to prevent the input method from getting stuck in "editing".
+    /// Esc (not composing): discard the draft and close the box. TSF is told explicitly so the IME
+    /// is not left stuck in an edit.
     unsafe fn cancel_session(hwnd: HWND, state: &State) {
         if unsafe { !finish_tsf(hwnd, state) } {
             unsafe {
@@ -1841,8 +1793,8 @@ mod app {
             hide_box(hwnd, state);
         }
     }
-    /// Floating box loses focus (click elsewhere): Collapse and end the TSF session, but keep the
-    /// draft for next time.
+    /// The box lost focus (click elsewhere): hide it and end the TSF session, keeping the draft for
+    /// next time.
     unsafe fn deactivate(hwnd: HWND, state: &State) {
         state.generation.set(state.generation.get() + 1);
         state.pending.set(false);
@@ -1853,8 +1805,7 @@ mod app {
             finish_tsf(hwnd, state);
         }
     }
-    /// Enter: display the Chinese draft on the screen after translation; Shift+Enter: directly
-    /// display the Chinese draft on the screen.
+    /// Enter: translate and commit; Shift+Enter: commit the Chinese draft.
     unsafe fn submit(hwnd: HWND, state: &State, chinese: bool) {
         if state.pending.get() {
             return;
@@ -1903,8 +1854,8 @@ mod app {
             }
         });
     }
-    /// Switch back to the original application and submit the text (via the DLL's editing session
-    /// in TSF mode, or SendInput in portable mode).
+    /// Switches back to the application and commits the text (through the DLL's edit session under
+    /// TSF, SendInput when portable).
     unsafe fn commit_to_target(hwnd: HWND, state: &State, text: &str) {
         let target = state.target.get();
         if target.is_null() || unsafe { IsWindow(target) } == 0 {
@@ -1918,9 +1869,8 @@ mod app {
             return;
         }
         let line = single_line(text);
-        // You must switch back to the original application when the floating box is still the
-        // foreground window; hiding it first will lose the foreground permissions, and
-        // SetForegroundWindow will be rejected by the system.
+        // Switch back while the box is still foreground: hiding it first loses the foreground right
+        // and SetForegroundWindow is refused.
         let switched = unsafe { bring_to_front(target) };
         unsafe {
             hide_box(hwnd, state);
@@ -1937,8 +1887,8 @@ mod app {
                 Err("输入法没有接受提交")
             }
         } else if unsafe { send_unicode(&line) } {
-            // SendInput may be silently intercepted by UIPI (such as administrator privileges
-            // window), which cannot be detected here.
+            // UIPI may silently block SendInput (e.g. to an elevated window); that cannot be
+            // detected here.
             Ok(())
         } else {
             Err("提交未完成，请检查原应用中的文字")
@@ -2003,8 +1953,8 @@ mod app {
         }
         unsafe {
             Shell_NotifyIconW(NIM_ADD, &data);
-            // Version 4: Right-click to send WM_CONTEXTMENU, left-click to send NIN_SELECT, the
-            // message number is in the lower 16 bits of lParam.
+            // Version 4: right-click sends WM_CONTEXTMENU, left-click NIN_SELECT, with the message
+            // in the low 16 bits of lParam.
             data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
             TRAY_V4.store(
                 Shell_NotifyIconW(NIM_SETVERSION, &data) != 0,
@@ -2020,7 +1970,7 @@ mod app {
             } else {
                 MF_UNCHECKED
             };
-            // Both modes have shortcut keys for switching (the same key switches between the two).
+            // The same shortcut toggles both ways.
             let toggle = plain_toggle_text();
             let translate_checked = if plain_mode() {
                 MF_UNCHECKED
@@ -2081,8 +2031,7 @@ mod app {
         }
     }
     thread_local! {
-        /// Input memory window and its corresponding entry in the list (tray process
-        /// single-threaded).
+        /// History window and the entries behind its list (the tray process is single-threaded).
         static HISTORY_WINDOW: Cell<HWND> = const { Cell::new(null_mut()) };
         static HISTORY_VIEW: RefCell<Vec<HistoryEntry>> = const { RefCell::new(Vec::new()) };
     }
@@ -2119,8 +2068,8 @@ mod app {
         }
         HISTORY_VIEW.with(|view| *view.borrow_mut() = entries);
     }
-    /// Tray menu "Input memory...": Lists recent translations, you can copy the Chinese/translated
-    /// text, or set it as a draft for next retrieval.
+    /// Tray menu "输入记忆…": lists recent translations; copy the Chinese or English, or queue one as
+    /// the next recall.
     unsafe fn open_history() {
         let existing = HISTORY_WINDOW.with(Cell::get);
         if !existing.is_null() {
@@ -2261,8 +2210,7 @@ mod app {
             _ => unsafe { DefWindowProcW(hwnd, msg, w, l) },
         }
     }
-    /// "Use again": Move this article to the front (load it next time you press the retrieve
-    /// shortcut key), and copy the Chinese text.
+    /// "再用一次": move the entry to the front (the next recall loads it) and copy its Chinese.
     unsafe fn reuse_history(window: HWND, entry: Option<HistoryEntry>) {
         let Some(entry) = entry else {
             return;
@@ -2291,7 +2239,7 @@ mod app {
             );
         }
     }
-    /// Open (or bring forward) the settings window.
+    /// Opens the settings window (or brings it forward).
     unsafe fn open_settings(owner: HWND) {
         let Some(state) = (unsafe { state_of(owner) }) else {
             return;
@@ -2503,7 +2451,7 @@ mod app {
                         24,
                         *id,
                     );
-                    // "Chinese Punctuation" check = PunctEnglish off.
+                    // "中文标点" checked = PunctEnglish off.
                     let on = option(*option_key) != (*option_key == Flag::PunctEnglish);
                     SendMessageW(checkbox, BM_SETCHECK, on as usize, 0);
                 }
@@ -2580,8 +2528,8 @@ mod app {
                     28,
                     ID_CANCEL,
                 );
-                // Insert a "Translation Engine" line at the top: the existing controls are moved
-                // down as a whole, and the new controls are placed at the front of the tab order.
+                // Insert the Translation Engine row at the top: move the existing controls down and
+                // put the new ones first in tab order.
                 let mut child = GetWindow(hwnd, GW_CHILD);
                 while !child.is_null() {
                     let mut rect: RECT = std::mem::zeroed();
@@ -2673,8 +2621,8 @@ mod app {
                         let plain =
                             SendMessageW(GetDlgItem(hwnd, SETTINGS_PLAIN), BM_GETCHECK, 0, 0) == 1; // BST_CHECKED
                         let hotkey = field(SETTINGS_HOTKEY);
-                        // Number of candidates per page: must be a number. When it exceeds 1–9, it
-                        // is clamped into the range and written back to the input box.
+                        // Page size must be a number; values outside 1–9 are clamped and written
+                        // back to the field.
                         let page = match parse_page_size(&field(SETTINGS_PAGE_SIZE)) {
                             Ok(page) => page,
                             Err(error) => {
@@ -2690,8 +2638,8 @@ mod app {
                         let history_on =
                             SendMessageW(GetDlgItem(hwnd, SETTINGS_HISTORY), BM_GETCHECK, 0, 0)
                                 == 1;
-                        // Turn off the input memory: confirm first, then delete the saved memory;
-                        // cancel without saving the settings.
+                        // Turning history off: confirm, then delete saved history; on cancel the
+                        // settings are not saved.
                         let history_has_data = history_path().is_some_and(|path| path.exists());
                         if !history_on
                             && history_has_data
@@ -2704,10 +2652,9 @@ mod app {
                         {
                             return 0;
                         }
-                        // Ordinary Wubi mode does not call the translation API, so you do not need
-                        // to fill in the API settings. When choosing Google, the large model is an
-                        // optional backup; filling in the key requires that the entire set is
-                        // valid.
+                        // Plain Wubi mode never translates, so API settings are not required. With
+                        // Google selected the LLM is an optional fallback, but once a key is
+                        // entered the whole LLM configuration must be valid.
                         let api_check = if plain && settings.key.is_empty() {
                             Ok(())
                         } else if settings.engine != Engine::Llm && !settings.key.trim().is_empty()
@@ -2780,9 +2727,8 @@ mod app {
                         }
                     }
                     SETTINGS_USER_WORDS => {
-                        // Use Notepad to open the user dictionary (if it does not exist, create an
-                        // empty file with description first); it will take effect after re-calling
-                        // the input box.
+                        // Open user words in Notepad (creating the file with a short header if
+                        // missing); changes apply the next time the box opens.
                         if let Some(path) = user_words_path() {
                             if !path.exists() {
                                 let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
@@ -2906,8 +2852,7 @@ mod app {
                 0
             }
             WM_TSF_ACTIVATE => {
-                // lParam = 1: The "input memory" shortcut key of the input method, calls up the box
-                // and loads the latest Chinese draft.
+                // lParam = 1: the IME's history shortcut; open the box and load the newest entry.
                 if let Some(state) = state
                     && !state.tsf_receiver.is_null()
                     && l == 1
@@ -2954,8 +2899,8 @@ mod app {
                 }
                 let packet = &*(l as *const COPYDATASTRUCT);
                 match packet.dwData {
-                    // Keystrokes cached during startup or activation (lowercase letters), merged
-                    // into the current group.
+                    // Keystrokes buffered during startup or activation (letters), merged into the
+                    // current code.
                     2 if !packet.lpData.is_null()
                         && packet.cbData.is_multiple_of(2)
                         && packet.cbData <= 8192 =>
@@ -2968,14 +2913,13 @@ mod app {
                             return 0;
                         };
                         if IsWindowVisible(hwnd) == 0 {
-                            // Session ended: Rejected, TSF will return the letters to the host.
+                            // Session already ended: refuse, and TSF gives the letters back to the
+                            // host.
                             return 0;
                         }
-                        // Lowercase letters are encoded; uppercase letters (Shift or Caps Lock)
-                        // enter draft as is, consistent with typing directly into the box. Press
-                        // one by one to type directly in the box (including top characters and four
-                        // codes will automatically appear on the screen); unprocessed letters will
-                        // be placed in the draft as they are.
+                        // Fed through the same handler as typing in the box, so lowercase letters
+                        // compose (with fifth-letter and unique-code commits) and uppercase letters
+                        // go into the draft as is; anything unhandled is inserted as typed.
                         for ch in keys.chars().filter(char::is_ascii_alphabetic) {
                             if !handle_char(hwnd, state, ch as u32) {
                                 insert_text(state, &ch.to_string());
@@ -2983,15 +2927,15 @@ mod app {
                         }
                         flush_plain(hwnd, state);
                         if GetForegroundWindow() != hwnd {
-                            // The floating box is not brought to the foreground (the letters fall
-                            // into the original application) and the keyboard focus is regained.
+                            // The box did not get the foreground (letters would land in the
+                            // application): take the keyboard focus back.
                             bring_to_front(hwnd);
                             SetFocus(state.edit);
                         }
                         1
                     }
-                    // Targets the screen rectangle where the text cursor should be applied (4
-                    // i32s), upon which a WM_TSF_ACTIVATE is received.
+                    // Screen rectangle of the target's text cursor (4 i32s), followed by
+                    // WM_TSF_ACTIVATE.
                     3 => {
                         let rect = (packet.cbData as usize == size_of::<RECT>()
                             && !packet.lpData.is_null())
@@ -3037,12 +2981,12 @@ mod app {
             }
             WM_TRAY => {
                 match (l & 0xffff) as u32 {
-                    // Version 4: Right click WM_CONTEXTMENU, left click NIN_SELECT, keyboard
+                    // Version 4: right-click WM_CONTEXTMENU, left-click NIN_SELECT, keyboard
                     // NIN_KEYSELECT.
                     WM_CONTEXTMENU | NIN_SELECT | NIN_KEYSELECT
                         if TRAY_V4.load(Ordering::Relaxed) =>
                     unsafe { tray_menu(hwnd) },
-                    // Old version callback (when setting version fails): Right-click and lift.
+                    // Pre-version-4 callback (if setting the version failed): right button up.
                     WM_RBUTTONUP if !TRAY_V4.load(Ordering::Relaxed) => unsafe { tray_menu(hwnd) },
                     WM_LBUTTONDBLCLK => unsafe { open_settings(hwnd) },
                     _ => {}
@@ -3097,21 +3041,20 @@ mod app {
         let tsf_receiver = handle("--tsf-hwnd");
         let target = handle("--target-hwnd");
         let input = MixedInput::bundled();
-        // The large lexicon (rime-frost derivative, GPL-3.0) is distributed with the package as a
-        // separate file, read at runtime, and not compiled into the EXE.
+        // The large lexicon (derived from rime-frost, GPL-3.0) ships as a separate file read at
+        // runtime, not compiled into the EXE.
         let input = match frequency_words() {
             Some(words) => input.with_frequency_words(words),
             None => input,
         };
-        // User vocabulary: %APPDATA%\\InputTranslation\\user_words.txt, one "word code" per line, ranked first in
-        // this code.
+        // User words: %APPDATA%\\InputTranslation\\user_words.txt, `word code` per line, ranked
+        // first under that code.
         let input = match user_words_path().and_then(|path| std::fs::read_to_string(path).ok()) {
             Some(words) => input.with_user_words(&words),
             None => input,
         };
-        // The Jianpin index (about 5MB, 0.1–0.2 seconds) is built in the background thread, which
-        // does not slow down the pop-up of the floating box; it is not required for the tray
-        // instance.
+        // Build the initials index (about 5 MB, 0.1–0.2 s) in the background so the box opens
+        // without delay; the tray instance does not need it.
         let input = std::sync::Arc::new(input);
         if !tsf_receiver.is_null() {
             let warm = input.clone();
@@ -3135,8 +3078,8 @@ mod app {
                 null(),
             );
             SendMessageW(edit, WM_SETFONT, font as usize, 1);
-            // The letters are composed by this program itself, and the system input method is
-            // turned off to avoid conflicts between the two sets of composed characters.
+            // This program composes letters itself; turn off the system IME for the edit box so two
+            // compositions do not conflict.
             ImmAssociateContextEx(edit, null_mut(), 0);
             let previous = SetWindowLongPtrW(edit, GWLP_WNDPROC, edit_proc as *const () as isize);
             SetWindowLongPtrW(edit, GWLP_USERDATA, previous);
@@ -3173,8 +3116,8 @@ mod app {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
             add_tray(
                 hwnd,
-                // Only the first launch without parameters displays the bubble prompt
-                // (--settings/--history does not bother).
+                // Show the balloon only on a first launch without arguments (not for
+                // --settings/--history).
                 (standalone && std::env::args().count() == 1).then_some(
                     "用 Win+空格 切换到“YiIME 译（五笔）”后直接打字即可。单击或右键托盘图标可打开菜单。",
                 ),
@@ -3193,8 +3136,8 @@ mod app {
             let class = wide("InputTranslationWindow");
             if !tsf_mode {
                 ensure_tip_in_language_list();
-                // Only one tray instance is retained: restarting (with the "Settings" shortcut in
-                // the Start menu) only allows the existing instance to open settings.
+                // Keep one tray instance: a second launch (e.g. the Start-menu Settings shortcut)
+                // just tells the existing one to open settings.
                 let existing = FindWindowW(class.as_ptr(), wide(TRAY_TITLE).as_ptr());
                 if !existing.is_null() {
                     let mut pid = 0;

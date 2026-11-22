@@ -1,5 +1,5 @@
-// Test assistance: register, enable, select input sources, or list registered input sources. Usage:
-// tis register <app path> | tis select <input source ID> | tis list | tis current
+// CI helper: register, enable or select input sources, or list them. Usage: tis register <app path>
+// | tis select <input source ID> | tis list | tis current
 import Carbon
 import Foundation
 
@@ -16,6 +16,11 @@ func property(_ source: TISInputSource, _ key: CFString) -> String {
     return "\(value)"
 }
 
+func enabled(_ source: TISInputSource) -> Bool {
+    guard let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceIsEnabled) else { return false }
+    return (Unmanaged<AnyObject>.fromOpaque(raw).takeUnretainedValue() as? NSNumber)?.boolValue == true
+}
+
 let args = CommandLine.arguments
 switch args.count > 1 ? args[1] : "" {
 case "register":
@@ -25,10 +30,13 @@ case "register":
 case "select":
     let found = sources(args[2])
     guard let source = found.first else { print("没有找到 \(args[2])"); exit(1) }
-    let enable = TISEnableInputSource(source)
-    let select = TISSelectInputSource(source)
-    print("enable=\(enable) select=\(select) enabled=\(property(source, kTISPropertyInputSourceIsEnabled)) selected=\(property(source, kTISPropertyInputSourceIsSelected))")
-    exit(enable == noErr && select == noErr ? 0 : 1)
+    let enableStatus = TISEnableInputSource(source)
+    let selectStatus = TISSelectInputSource(source)
+    let isEnabled = sources(args[2]).first.map(enabled) ?? false
+    let current = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
+    let selected = property(current, kTISPropertyInputSourceID) == args[2]
+    print("enumerated=true enabled=\(isEnabled) enableStatus=\(enableStatus) selected=\(selected) selectStatus=\(selectStatus) current=\(property(current, kTISPropertyInputSourceID)) visibleInSettings=unknown")
+    exit(enableStatus == noErr && selectStatus == noErr && isEnabled && selected ? 0 : 1)
 case "current":
     let source = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
     print(property(source, kTISPropertyInputSourceID))

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Package Linux command line: dist/yiime-<version>-linux-<architecture>.tar.gz (cargo build
-# --release -p yiime-cli first).
+# Packages the Linux CLI as dist/yiime-<version>-linux-<arch>.tar.gz (run cargo build --release -p
+# yiime-cli first).
 set -euo pipefail
 cd "$(dirname "$0")/.."
-version="${1:-0.1.1}"
-arch="${2:-$(uname -m)}"
+version="$(tools/version.sh)"
+arch="${1:-$(uname -m)}"
 name="yiime-$version-linux-$arch"
 stage="dist/$name"
 rm -rf "$stage" && mkdir -p "$stage/data"

@@ -1,6 +1,6 @@
 #![cfg(feature = "bundled")]
-//! Click Shift in the middle of grouping words to entrain English: simulate an input in the
-//! floating box (the same processing sequence as the Windows floating box).
+//! Shift tap mid-composition switches to inline English: simulates the Windows input box's key
+//! handling.
 
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -11,7 +11,7 @@ fn input() -> &'static MixedInput {
     INPUT.get_or_init(MixedInput::bundled)
 }
 
-/// Minimal model of floating box: word group + draft + English paragraph switch.
+/// Minimal input box: composer + draft + English-segment switch.
 #[derive(Default)]
 struct Session {
     composer: Composer,
@@ -88,8 +88,7 @@ fn shift_tap_inserts_english_inside_one_chinese_sentence() {
     session.shift_tap();
     session.type_text("henhao ");
     assert_eq!(session.draft.text(), "我iPhone 15很好");
-    // The spaces and punctuation in the English paragraph are entered as they are; backspace is
-    // deleted across paragraphs.
+    // Spaces and punctuation are typed as is in English; backspace deletes across segments.
     session.shift_tap();
     session.type_text(" OK,");
     session.type_text("\u{8}");
@@ -103,8 +102,8 @@ fn shift_tap_inserts_english_inside_one_chinese_sentence() {
 
 #[test]
 fn pending_code_is_committed_as_letters_when_switching() {
-    // Consistent with Microsoft Pinyin/Sogou/Rime: the codes that have not been selected are
-    // displayed on the screen as letters, and then enter English.
+    // As in Microsoft Pinyin/Sogou/Rime: the unpicked code is committed as letters before English
+    // starts.
     let mut session = Session::default();
     session.type_text("q ");
     session.type_text("zhong");
@@ -114,7 +113,7 @@ fn pending_code_is_committed_as_letters_when_switching() {
     assert!(session.english);
     session.type_text("Shift");
     assert_eq!(session.draft.text(), "我zhongShift");
-    // After returning to Chinese, continue to form words normally.
+    // Back in Chinese, composition works as usual.
     session.shift_tap();
     session.type_text("wm ");
     assert_eq!(session.draft.text(), "我zhongShift仙");

@@ -1,5 +1,5 @@
-//! `yiime query <code>…`: Print candidates using the same core engine as Windows floating boxes,
-//! demonstrating that the core can run headless. The full CLI is step 2.
+//! `yiime query <code>…`: print candidates from the same core engine as the Windows input box.
+//! `yiime translate <text>…`: free Google Translate with per-request timing.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -8,7 +8,8 @@ use yiime_core::{ComposeOptions, Composer, Learned, MixedInput, PAGE_SIZE, PAGE_
 const USAGE: &str = "用法：yiime translate <中文>…（免费 Google 翻译，打印每次请求的计时）
       yiime query <编码>… [--page-size N] [--pages N] [--traditional] [--fuzzy] [--words 文件 | --no-words] [--tsv]
   大词库默认查找顺序：--words、环境变量 YIIME_WORDS、程序旁的 InputTranslation-words.txt、
-  上级目录中的 data/frost/InputTranslation-words.txt 或 share/yiime/InputTranslation-words.txt。";
+  上级目录中的 data/frost/InputTranslation-words.txt 或 share/yiime/InputTranslation-words.txt。
+  --words 的路径不能以 - 开头（写成 ./-文件名）。";
 
 const WORDS_FILE: &str = "InputTranslation-words.txt";
 
@@ -155,8 +156,7 @@ fn option_value(value: Option<&String>) -> Option<&str> {
         .filter(|value| !value.is_empty() && !value.starts_with('-'))
 }
 
-/// Free Google Translate (same engine as default in Windows version), multiplexed connections
-/// between segments, print timing.
+/// Free Google Translate (the Windows default) over one reused connection, printing timings.
 fn translate(texts: &[String]) -> ExitCode {
     if texts.is_empty() {
         eprintln!("{USAGE}");

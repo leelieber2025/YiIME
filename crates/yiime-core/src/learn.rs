@@ -1,7 +1,6 @@
-//! Self-study: record the candidates selected under each encoding, and rank the most selected
-//! candidates first next time (only the candidates with complete matching will be adjusted).
-//! "Encoding <TAB> candidates" for each line of the file can be appended one line at a time. No
-//! additional lines will be added after it exceeds 4MB.
+//! Learning: counts which candidate is picked for each code and ranks the most picked first next
+//! time (exact matches only). The file holds one `code<TAB>word` per pick and is append-only;
+//! nothing more is appended past 4 MB.
 
 use crate::dict::Candidate;
 use std::collections::HashMap;
@@ -17,8 +16,8 @@ pub struct Learned {
 }
 
 impl Learned {
-    /// Read the record file (empty if it does not exist); subsequent selections are appended to the
-    /// same file. `None` means only stored in memory.
+    /// Reads the record file (empty if missing); later picks are appended to it. `None` keeps
+    /// records in memory only.
     pub fn load(path: Option<PathBuf>) -> Self {
         let mut learned = Self {
             counts: HashMap::new(),
@@ -52,8 +51,8 @@ impl Learned {
             .copied()
             .unwrap_or(0)
     }
-    /// Remember to select once; if it contains TAB/line feed or the encoding is empty, it will not
-    /// be remembered. Return whether to remember it.
+    /// Records one pick; returns false (not recorded) if the code is empty or has a TAB, or the
+    /// word has a TAB or newline.
     pub fn record(&mut self, code: &str, word: &str) -> bool {
         if code.is_empty() || code.contains('\t') || word.contains(['\t', '\n']) {
             return false;
@@ -75,9 +74,9 @@ impl Learned {
         }
         true
     }
-    /// Delete all learning records of the next candidate for a certain code (convention of
-    /// Microsoft Pinyin Ctrl+Shift+Number, Rime Ctrl+Delete). Record files are rewritten
-    /// synchronously; return whether there are original records.
+    /// Deletes all records of `word` under `code` (Ctrl+Shift+digit in Microsoft Pinyin,
+    /// Ctrl+Delete in Rime). The file is rewritten immediately; returns whether anything was
+    /// recorded.
     pub fn forget(&mut self, code: &str, word: &str) -> bool {
         let removed = self
             .counts
@@ -99,9 +98,8 @@ impl Learned {
         }
         removed
     }
-    /// Rearrange according to the number of selections: complete matches are in front (the ones
-    /// with the most times are in front, stable sorting), and prefix candidates are still in the
-    /// back.
+    /// Ranks exact matches by pick count (stable, most picked first); prefix candidates stay
+    /// behind.
     pub fn reorder(&self, code: &str, candidates: &mut [Candidate]) {
         if let Some(counts) = self.counts.get(code) {
             candidates.sort_by_key(|candidate| {
@@ -137,8 +135,7 @@ mod tests {
         let texts: Vec<_> = list.iter().map(|c| c.text.as_str()).collect();
         assert_eq!(texts[0], "乙");
         assert_eq!(texts[1], "甲");
-        // Delete learning records: memory and files are synchronized, and other records are
-        // retained.
+        // Forgetting updates memory and file and keeps other records.
         let mut learned = Learned::load(Some(path.clone()));
         assert!(learned.record("aaaa", "甲"));
         assert!(learned.forget("aaaa", "乙"));

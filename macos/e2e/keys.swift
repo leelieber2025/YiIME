@@ -1,4 +1,4 @@
-// Testing aid: Use CGEvent to simulate keystrokes (via the current input method). Usage: keys type
+// CI helper: simulate keystrokes with CGEvent (through the current input method). Usage: keys type
 // <ASCII text> | keys shift-tap | keys shift-return | keys return | keys save
 import CoreGraphics
 import Foundation

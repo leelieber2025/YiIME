@@ -1,6 +1,6 @@
 [package]
 name = "yiime-cli"
-version = "0.1.1"
+version.workspace = true
 license = "GPL-3.0-only"
 edition = "2024"
 rust-version = "1.85"
@@ -13,8 +13,8 @@ path = "src/main.rs"
 [dependencies]
 yiime-core = { path = "../yiime-core", default-features = false, features = ["bundled", "translate"] }
 
-# Debian package (cargo deb -p yiime-cli): command line + Baishuang lexicon and each lexicon
-# license.
+# Debian package (cargo deb -p yiime-cli): the CLI, the rime-frost lexicon and the dictionary
+# licenses.
 [package.metadata.deb]
 name = "yiime"
 maintainer = "YiIME <https://github.com/leelieber2025/YiIME>"

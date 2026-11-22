@@ -1,18 +1,20 @@
 1 ICON "ime.ico"
-// Input mode indication (taskbar "Chinese/English"): dark fonts on light-colored taskbars, white
-// fonts on dark-colored taskbars.
+// Taskbar mode icons: dark glyph for light taskbars, white glyph for dark taskbars.
 101 ICON "mode_zh_light.ico"
 102 ICON "mode_en_light.ico"
 103 ICON "mode_zh_dark.ico"
 104 ICON "mode_en_dark.ico"
-// Translation mode (Chinese + Translation) displays "Translation"; ordinary Wubi mode displays "中"
-// (101/103).
+// Translation mode shows 译; plain Wubi mode shows 中 (101/103).
 105 ICON "mode_yi_light.ico"
 106 ICON "mode_yi_dark.ico"
 
+// Version string built from the numeric macros (windres drops quotes in -D values).
+#define YIIME_STR(x) #x
+#define YIIME_XSTR(x) YIIME_STR(x)
+#define YIIME_VERSION YIIME_XSTR(YIIME_VERSION_MAJOR.YIIME_VERSION_MINOR.YIIME_VERSION_PATCH)
 1 VERSIONINFO
-FILEVERSION 0,1,1,0
-PRODUCTVERSION 0,1,1,0
+FILEVERSION YIIME_VERSION_MAJOR,YIIME_VERSION_MINOR,YIIME_VERSION_PATCH,0
+PRODUCTVERSION YIIME_VERSION_MAJOR,YIIME_VERSION_MINOR,YIIME_VERSION_PATCH,0
 FILEOS 0x40004
 FILETYPE 0x2
 BEGIN
@@ -22,12 +24,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "YiIME"
       VALUE "FileDescription", "YiIME TSF input method"
-      VALUE "FileVersion", "0.1.1"
+      VALUE "FileVersion", YIIME_VERSION
       VALUE "InternalName", "input_translation_tsf.dll"
       VALUE "LegalCopyright", "GPL-3.0"
       VALUE "OriginalFilename", "input_translation_tsf.dll"
       VALUE "ProductName", "YiIME"
-      VALUE "ProductVersion", "0.1.1"
+      VALUE "ProductVersion", YIIME_VERSION
     END
   END
   BLOCK "VarFileInfo"

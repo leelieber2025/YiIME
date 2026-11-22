@@ -1,16 +1,14 @@
-//! Input memory: Translate the original Chinese text and translation on the screen, with the latest
-//! first, and only the latest Chinese sentence for the same sentence is retained. The file contents
-//! are [`Sealer`] encrypted (DPAPI on Windows, local only).
+//! Input history: translated Chinese text and its translation, newest first, one entry per Chinese
+//! sentence. The file is encrypted with [`Sealer`] (DPAPI on Windows, local only).
 
 use crate::settings::Sealer;
 use crate::text::single_line;
 use std::path::PathBuf;
 
-/// The maximum number of entries to keep.
 pub const HISTORY_CAP: usize = 500;
 pub const HISTORY_FILE: &str = "history.dat";
 
-/// One input memory: local time, Chinese original text, and translation.
+/// One history entry: local time, Chinese text, translation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryEntry {
     pub time: String,
@@ -18,8 +16,8 @@ pub struct HistoryEntry {
     pub english: String,
 }
 
-/// Input memory in the encrypted file (each line "time <TAB> Chinese <TAB> translation", \TAB CR LF
-/// escape within the field).
+/// History file: one `time<TAB>Chinese<TAB>translation` per line, with TAB/CR/LF escaped inside
+/// fields.
 pub struct History<'a> {
     path: PathBuf,
     sealer: &'a dyn Sealer,
@@ -55,7 +53,7 @@ impl<'a> History<'a> {
     pub fn new(path: PathBuf, sealer: &'a dyn Sealer) -> Self {
         Self { path, sealer }
     }
-    /// Read (newest first); empty if the file does not exist or decryption failed.
+    /// Newest first; empty if the file is missing or cannot be decrypted.
     pub fn load(&self) -> Vec<HistoryEntry> {
         let Ok(bytes) = std::fs::read(&self.path) else {
             return Vec::new();
@@ -97,9 +95,8 @@ impl<'a> History<'a> {
     pub fn clear(&self) -> bool {
         !self.path.exists() || std::fs::remove_file(&self.path).is_ok()
     }
-    /// Make a note of the translation that appears on the screen (blank original text is not
-    /// recorded); only the latest Chinese version of the same sentence will be retained, and the
-    /// oldest one will be discarded if it exceeds the upper limit.
+    /// Records a committed translation (blank text is skipped). A repeated sentence keeps only its
+    /// newest entry; the oldest entries are dropped past the cap.
     pub fn remember(&self, chinese: &str, english: &str, time: String) -> bool {
         if chinese.trim().is_empty() {
             return false;
@@ -119,7 +116,7 @@ impl<'a> History<'a> {
     }
 }
 
-/// Enter a line in the memory window list: time, truncated source text, and translation.
+/// One line in the history list: time, shortened source and translation.
 pub fn history_label(entry: &HistoryEntry) -> String {
     let clip = |text: &str, n: usize| {
         let flat = single_line(text);

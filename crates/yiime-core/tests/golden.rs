@@ -1,11 +1,9 @@
 #![cfg(feature = "bundled")]
-//! Gold test: Compare the engine output with v11 (Windows version, installed test) one by one to
-//! ensure that the behavior remains unchanged after the core is removed.
-//! tests/golden/candidates-v11.tsv is generated from the v11 source code (git tag v11) for the same
-//! batch of codes: the number of candidates per page is 9/5/1 × 40 codes, which are listed as the
-//! number of pages per page, code, serial number, text, source, complete code, and Wubi prompts;
-//! the last line of each code is count (the number of Wubi candidates, whether it can continue to
-//! be Pinyin).
+//! Golden test: engine output must match v11 (the tested Windows release) line by line.
+//!
+//! golden/candidates-v11.tsv was generated from v11 (git tag v11) for 40 codes at 9/5/1 candidates
+//! per page. Columns: page size, code, index, text, source, full code, Wubi hint; each code ends
+//! with a `count` line (Wubi candidate count, whether pinyin can continue).
 
 use std::sync::OnceLock;
 use yiime_core::*;
@@ -87,10 +85,9 @@ fn candidates_identical_to_v11() {
             input.pinyin_continues(code)
         ));
     }
-    // Intentionally changed encoding since v13: There are no candidates under v11 (neither Wubi
-    // code nor Pinyin words), now candidates are given by Quanpin and Simplified Pinyin/mixed
-    // spelling/correction of misspellings/syllabic segmentation. The rest of the encoding must be
-    // the same line-by-line as v11.
+    // Codes that had no candidates in v11 (neither Wubi code nor pinyin word) now get full pinyin,
+    // initials, mixed, typo-corrected or segmented candidates since v13. Every other code must
+    // match v11 line by line.
     let changed = |line: &str| V13_FILLED.contains(&line.split('\t').nth(1).unwrap_or(""));
     let want: Vec<&str> = golden.lines().filter(|l| !changed(l)).collect();
     let got: Vec<&str> = out.lines().filter(|l| !changed(l)).collect();
@@ -112,7 +109,7 @@ fn candidates_identical_to_v11() {
 
 #[test]
 fn named_orderings() {
-    // Wubi precise → Quanpin → Simplified pinin (according to word frequency).
+    // Exact Wubi → full pinyin → initials (by frequency).
     assert_eq!(texts(&compose("gngu", 9))[0], "一心一意");
     let yxyy = compose("yxyy", 9);
     assert_eq!(yxyy.candidates[6].text, "一心一意"); // No. 7: The first 6 are Wubi
@@ -135,7 +132,7 @@ fn named_orderings() {
     assert_eq!(wm.hint(&wm.candidates[1]), "(trwu)");
     assert_eq!(texts(&compose("dsj", 9))[..3], ["碴", "大数据", "电视剧"]);
     assert_eq!(texts(&compose("yixinyiyi", 9))[0], "一心一意");
-    // Universal key z: only mark the complete code.
+    // Wildcard `z` candidates show only the full code.
     let aaz = compose("aaz", 9);
     assert_eq!(texts(&aaz)[..3], ["工", "式", "戒"]);
     assert_eq!(aaz.candidates[1].source, Source::Wildcard);
@@ -147,7 +144,7 @@ fn named_orderings() {
 fn page_size_paging_and_digits() {
     let mut wm = compose("wm", 5);
     assert_eq!(wm.page_items().len(), 5);
-    assert_eq!(wm.candidate_at(6), None); // Pressing 7 has no effect when there are 5 items per page.
+    assert_eq!(wm.candidate_at(6), None); // 7 does nothing with 5 per page.
     wm.turn_page(true);
     assert_eq!(wm.page_label(), "‹ 2/10 ›");
     assert_eq!(wm.candidate_at(1).unwrap().text, "外卖");
@@ -212,31 +209,29 @@ fn letter_rules_and_shift_letter_in_draft() {
             }
         }
     };
-    // The only four codes that automatically appear on the screen: bnhn only has "ye".
+    // Unique four-letter code commits itself: bnhn has only 也.
     type_text(&mut composer, &mut draft, "bnhn");
     assert_eq!(draft.text(), "也");
     assert!(!composer.is_composing());
-    // The top word of the five codes: gngu (two candidates, not automatically displayed on the
-    // screen) and then type w → go to the screen and w starts a new encoding.
+    // Fifth letter: gngu has two candidates (no auto-commit); typing w commits the first and starts
+    // a new code.
     type_text(&mut composer, &mut draft, "gnguw");
     assert_eq!(draft.text(), "也一心一意");
     assert_eq!(composer.code, "w");
-    // Shift+letters: First select the first choice on the screen (wm → 仙), and then enter the
-    // uppercase letters as they are.
+    // Shift+letter: commit the first candidate (wm → 仙), then type the capital letter.
     type_text(&mut composer, &mut draft, "mA");
     assert_eq!(draft.text(), "也一心一意仙A");
     assert!(!composer.is_composing());
-    // When there are no candidates, Shift + the original encoding of the letters on the screen.
+    // Without candidates, Shift+letter commits the raw code.
     type_text(&mut composer, &mut draft, "qwerB");
     assert_eq!(draft.text(), "也一心一意仙AqwerB");
-    // Caps Lock: Does not compose words, and does not flush when the frame is not popping up.
+    // Caps Lock: no composition, and nothing to flush without the input box.
     assert_eq!(
         classify_letter('a', true, false),
         Some(LetterAction::Raw { flush_first: false })
     );
     assert_eq!(classify_letter('1', false, true), None);
-    // Empty code removal: qwer is an empty code, and these four codes are discarded when typing
-    // letters.
+    // Empty code: qwer has no candidates and is dropped when the next letter is typed.
     let mut empty = Composer::default();
     for letter in "qwer".chars() {
         assert!(
@@ -251,8 +246,7 @@ fn letter_rules_and_shift_letter_in_draft() {
             .is_empty()
     );
     assert_eq!(empty.code, "w");
-    // When the rule is turned off: four codes will not automatically appear on the screen, and five
-    // codes will continue to accumulate.
+    // With the rules off, four letters do not auto-commit and a fifth keeps accumulating.
     let off = LetterRules {
         push_fifth: false,
         auto_commit4: false,
@@ -273,7 +267,7 @@ fn selection_keys() {
     let input = input();
     assert_eq!(selection_index(input, "wm", ';'), Some(1));
     assert_eq!(selection_index(input, "wm", '\''), Some(2));
-    // xi may be pinyin: single quotation marks serve as syllable separators.
+    // `xi` may be pinyin, so `'` is a syllable separator.
     assert_eq!(selection_index(input, "xi", '\''), None);
     assert_eq!(selection_index(input, "xi'a", '\''), None);
     assert_eq!(selection_index(input, "wm", ','), None);
@@ -291,7 +285,6 @@ fn learning_reorders_like_v11() {
         ..options(5)
     };
     composer.set_code(input(), "wm".into(), &learn, &learned);
-    // Same as what you see in the Windows test window at 15:03: Takeaway → Xian → We…
     assert_eq!(texts(&composer), ["外卖", "仙", "我们", "我妈", "文明"]);
     composer.set_code(input(), "wm".into(), &options(5), &learned);
     assert_eq!(texts(&composer)[0], "仙"); // No adjustment when learning is off

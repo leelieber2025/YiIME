@@ -8,37 +8,37 @@
 
 use std::time::{Duration, Instant};
 
-/// Maximum hold time for Shift click (same as global Chinese/English switch in TSF DLL).
+/// Longest Shift hold that still counts as a tap (same as the global Chinese/English toggle in the
+/// TSF DLL).
 pub const SHIFT_TAP_MAX: Duration = Duration::from_millis(600);
 
-/// Whether the virtual key is Shift (VK_SHIFT / VK_LSHIFT / VK_RSHIFT).
 pub fn is_shift_key(vk: u32) -> bool {
     matches!(vk, 0x10 | 0xA0 | 0xA1)
 }
 
-/// Small keyboard numbers (VK_NUMPAD0..9): Do not select candidates when composing words, first
-/// display the first choice and then enter the numbers as they are (Microsoft Pinyin convention).
+/// Numpad digits (VK_NUMPAD0..9) do not pick candidates while composing: commit the first
+/// candidate, then type the digit (Microsoft Pinyin convention).
 pub fn is_numpad_digit(vk: u32) -> bool {
     (0x60..=0x69).contains(&vk)
 }
 
-/// Track "Shift alone".
+/// Detects Shift pressed and released on its own.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ShiftTap {
     down: Option<Instant>,
 }
 
 impl ShiftTap {
-    /// Any key pressed. `other_modifier` is whether Ctrl/Alt/Win is held down.
+    /// `other_modifier`: Ctrl/Alt/Win is held.
     pub fn key_down(&mut self, vk: u32, other_modifier: bool, now: Instant) {
         if !is_shift_key(vk) || other_modifier {
             self.down = None;
         } else if self.down.is_none() {
-            // Auto-repeat when held down does not refresh time.
+            // Auto-repeat does not reset the start time.
             self.down = Some(now);
         }
     }
-    /// Key released; returns whether this was a Shift click.
+    /// Returns whether this release completes a Shift tap.
     pub fn key_up(&mut self, vk: u32, now: Instant) -> bool {
         if !is_shift_key(vk) {
             return false;
@@ -52,15 +52,14 @@ impl ShiftTap {
     }
 }
 
-/// The letters that should be displayed on the screen as they are when switching to English: remove
-/// the code of diaphragm (None when the code is empty).
+/// Letters committed when switching to English: the code without `'` separators (None if empty).
 pub fn literal_code(code: &str) -> Option<String> {
     let letters: String = code.chars().filter(|ch| *ch != '\'').collect();
     (!letters.is_empty()).then_some(letters)
 }
 
-/// Characters entered as they are in the English paragraph: visible characters and spaces (control
-/// keys Enter/Esc/Backspace, etc. are still processed according to the original rules).
+/// Characters typed as is in an English segment: printable characters and space
+/// (Enter/Esc/Backspace keep their usual handling).
 pub fn is_literal_in_english(ch: char) -> bool {
     !ch.is_control()
 }
@@ -74,27 +73,26 @@ mod tests {
         let t0 = Instant::now();
         let ms = Duration::from_millis;
         let mut tap = ShiftTap::default();
-        // Click.
         tap.key_down(0x10, false, t0);
         assert!(tap.key_up(0x10, t0 + ms(120)));
-        // It doesn't count if you hold it down for too long.
+        // Held too long.
         tap.key_down(0xA0, false, t0);
         assert!(!tap.key_up(0xA0, t0 + ms(900)));
-        // Auto-repeat does not refresh the starting point.
+        // Auto-repeat keeps the original start.
         tap.key_down(0x10, false, t0);
         tap.key_down(0x10, false, t0 + ms(500));
         assert!(!tap.key_up(0x10, t0 + ms(700)));
-        // Shift+letters (capital letters) and Shift+Enter do not count.
+        // Shift+letter and Shift+Enter are not taps.
         tap.key_down(0x10, false, t0);
         tap.key_down(b'A' as u32, false, t0 + ms(50));
         assert!(!tap.key_up(0x10, t0 + ms(100)));
         tap.key_down(0x10, false, t0);
         tap.key_down(0x0D, false, t0 + ms(50));
         assert!(!tap.key_up(0x10, t0 + ms(100)));
-        // Ctrl does not count when held down (Ctrl+Shift key combination).
+        // Not a tap while Ctrl is held (Ctrl+Shift).
         tap.key_down(0x10, true, t0);
         assert!(!tap.key_up(0x10, t0 + ms(100)));
-        // Simply releasing other keys does not count.
+        // Releasing another key is not a tap.
         assert!(!tap.key_up(b'A' as u32, t0));
     }
 

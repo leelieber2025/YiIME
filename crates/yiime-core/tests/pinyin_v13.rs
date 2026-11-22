@@ -1,8 +1,7 @@
 #![cfg(feature = "bundled")]
-//! The golden test of v13 pinyin error tolerance: correction of misspellings, mixed spelling of
-//! full and simplified spellings, segmentation of syllables and word selection, whole sentences,
-//! fuzzy sounds (default off), and these do not affect Wubi code and pinyin that can be typed
-//! directly (Wubi priority).
+//! Golden test for pinyin tolerance (v13): typo correction, mixed full syllables and initials,
+//! syllable segmentation with partial picks, whole sentences and fuzzy pinyin (off by default).
+//! None of it changes Wubi codes or directly typed pinyin (Wubi first).
 
 use std::sync::OnceLock;
 use yiime_core::*;
@@ -50,7 +49,7 @@ fn position(composer: &Composer, text: &str) -> Option<usize> {
 
 #[test]
 fn typo_correction_ranks_first_when_nothing_exact() {
-    // What users actually encountered: zhonggou (ou/uo reverse) had no candidates before.
+    // Reported by a user: `zhonggou` (ou/uo swapped) used to have no candidates.
     let composer = compose("zhonggou");
     assert_eq!(composer.candidates[0].text, "中国");
     assert_eq!(composer.candidates[0].source, Source::Corrected);
@@ -65,7 +64,7 @@ fn typo_correction_ranks_first_when_nothing_exact() {
     ] {
         assert_eq!(first(typo), (want.to_owned(), Source::Corrected), "{typo}");
     }
-    // English words are not randomly assigned to candidates: spaces remain on the screen as they
+    // English words get no candidates; they stay as typed.
     // are.
     assert!(compose("hello").candidates.is_empty());
 }
@@ -73,8 +72,8 @@ fn typo_correction_ranks_first_when_nothing_exact() {
 #[test]
 fn partial_pick_keeps_remaining_syllables() {
     let mut composer = compose("zhonggou");
-    // The whole sentence (zhong enough) and the first paragraph cut out by syllables
-    // (zhong/kind/heavy..., yu gou) are all after error correction.
+    // The whole sentence (中够) and leading-syllable words (zhong → 中/种/重…, then gou) come after typo
+    // correction.
     let sentence = position(&composer, "中够").expect("整句");
     let zhong = position(&composer, "中").expect("前段字");
     assert!(sentence > 0 && zhong > sentence);
@@ -92,7 +91,7 @@ fn partial_pick_keeps_remaining_syllables() {
     composer.set_code(input(), pick.rest, &options(false), &Learned::default());
     assert_eq!(composer.code, "gou");
     assert_eq!(composer.candidates[0].text, "够");
-    // Diaphragm: The remaining character in the preceding paragraph of zhong'gou is gou.
+    // With a separator, the leading word of `zhong'gou` leaves `gou`.
     let composer = compose("zhong'gou");
     let zhong = position(&composer, "中").unwrap();
     assert_eq!(composer.candidate_at(zhong).unwrap().code, "zhong");
@@ -108,8 +107,7 @@ fn mixed_full_and_abbreviated_pinyin() {
     ] {
         assert_eq!(first(code).0, want, "{code}");
     }
-    // The pure and simplified spelling zhg is the same as v11 (this, China..., according to word
-    // frequency).
+    // Pure initials `zhg` rank as in v11 (by frequency).
     assert_eq!(position(&compose("zhg"), "中国"), Some(1));
 }
 
@@ -130,7 +128,7 @@ fn multi_syllable_inputs_give_sentences() {
 #[test]
 fn wubi_codes_stay_first() {
     assert_eq!(first("gngu"), ("一心一意".to_owned(), Source::Wubi));
-    // xain is Wubi Code (Ji Shi Ji Min) and should not be regarded as a misspelling of xian.
+    // `xain` is a Wubi code (and must not be treated as a typo of xian).
     assert_eq!(first("xain").1, Source::Wubi);
     assert!(
         compose("xain")
@@ -155,8 +153,8 @@ fn fuzzy_pinyin_is_off_by_default() {
 
 #[test]
 fn fifth_letter_typo_is_not_cleared() {
-    // Five-code top word/empty code clearing: zhno is not Wubi code. When you type g again, zhnog
-    // is still Pinyin after transposition and is not cleared.
+    // Fifth-letter/empty-code rule: `zhno` is not a Wubi code, and `zhnog` may still be pinyin
+    // after a swap, so it is not cleared.
     let learned = Learned::default();
     let rules = LetterRules {
         push_fifth: true,
@@ -172,7 +170,7 @@ fn fifth_letter_typo_is_not_cleared() {
     }
     assert_eq!(composer.code, "zhnog");
     assert_eq!(composer.candidates[0].text, "中");
-    // Wubi code is still the same: gngu followed by w means single-mindedness.
+    // Wubi is unchanged: gngu then w commits 一心一意.
     let mut composer = Composer::default();
     let mut picks = Vec::new();
     for letter in "gnguw".chars() {

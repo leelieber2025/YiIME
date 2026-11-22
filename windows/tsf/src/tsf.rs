@@ -1,5 +1,5 @@
-//! Minimal Windows TSF text service. The user edits in the companion window;
-//! the translated result is inserted through a TSF edit session.
+//! Windows TSF text service. Typing happens in the companion input box; the result is inserted
+//! through a TSF edit session.
 #![allow(non_snake_case)]
 
 use std::cell::{Cell, RefCell};
@@ -75,20 +75,20 @@ const TOGGLE_CHORD: TF_PRESERVEDKEY = TF_PRESERVEDKEY {
     uVKey: 0x20,
     uModifiers: TF_MOD_CONTROL,
 };
-/// Reserved key for switching "normal Wubi mode (no translation)"; the key combination is taken
-/// from HKCU\\Software\\InputTranslation\\PlainToggleKey.
+/// Preserved key for toggling plain Wubi mode (no translation); the chord comes from
+/// HKCU\\Software\\InputTranslation\\PlainToggleKey.
 const PLAIN_KEY: GUID = GUID::from_u128(0x6b1f2d0e_93c4_4e1a_9f6d_2a7c51e0b8d3);
-/// Ctrl+.: Chinese/English punctuation; Ctrl+Shift+F: Simplified/Traditional output (same as
+/// Ctrl+.: Chinese/English punctuation; Ctrl+Shift+F: Simplified/Traditional output (as in
 /// Microsoft Wubi).
 const PUNCT_KEY: GUID = GUID::from_u128(0x0d6c5e21_7a43_4f8e_b1d2_6e9a3c4f5b71);
 const PUNCT_CHORD: TF_PRESERVEDKEY = TF_PRESERVEDKEY {
     uVKey: 0xBE,
     uModifiers: TF_MOD_CONTROL,
 };
-/// Input memory: Call up the floating box and load the most recently translated Chinese draft
-/// (default Ctrl+Shift+Z, HKCU …\\HistoryKey).
+/// Input history: open the box with the most recently translated Chinese (default Ctrl+Shift+Z,
+/// HKCU …\\HistoryKey).
 const HISTORY_KEY: GUID = GUID::from_u128(0x2f4b8c6a_51d3_4e07_9a2c_7b1e0d3f6a58);
-/// When the "first key" sent to the editor is 1, it means entering memory retrieval, not letters.
+/// A first key of 1 sent to the editor means "recall history", not a letter.
 const RECALL: u8 = 1;
 const TRAD_KEY: GUID = GUID::from_u128(0x5a8e7f13_2c64_4b9d_8e1f_3d7b6a2c9e04);
 const TRAD_CHORD: TF_PRESERVEDKEY = TF_PRESERVEDKEY {
@@ -99,8 +99,7 @@ const STATE_KEY: &str = "Software\\InputTranslation";
 const LANG_ZH_CN: u16 = 0x0804;
 const DESCRIPTION: &str = "YiIME 译（五笔）";
 const WINDOW_CLASS: &str = "InputTranslationTsfReceiver";
-/// Timer: 1 = Retry forwarding cached keys to the editor; 2 = Timeout waiting for the editor to be
-/// ready.
+/// Timers: 1 = retry forwarding buffered keys to the editor; 2 = give up waiting for the editor.
 const FLUSH_TIMER: usize = 1;
 const READY_TIMER: usize = 2;
 const READY_TIMEOUT_MS: u32 = 5000;
@@ -162,22 +161,20 @@ fn absent_is_ok(result: Result<()>) -> Result<()> {
     }
 }
 
-/// Registered TIP capabilities. SYSTRAYSUPPORT is the prerequisite for the Win8+ taskbar input
-/// indicator to display the "mode icon" (GUID_LBI_INPUTMODE) of this input method and respond to
-/// its click; without it, the system only displays the brand icon and does not call the mode button
-/// (this was the case before v9). Not registering IMMERSIVESUPPORT: The UWP/AppContainer host
-/// cannot launch the floating box EXE, write HKCU or send messages across integrity levels.
-/// Declaring support will cause problems in these applications (Microsoft documentation:
-/// SYSTRAYSUPPORT is used for input methods that "do not support immersive but are compatible with
-/// the tray").
+/// Registered TIP categories. SYSTRAYSUPPORT is required for the Win8+ taskbar input indicator to
+/// show this IME's mode icon (GUID_LBI_INPUTMODE) and forward clicks to it; without it only the
+/// brand icon appears. IMMERSIVESUPPORT is not registered: UWP/AppContainer hosts cannot launch the
+/// input-box EXE, write HKCU or message across integrity levels, so claiming support would break
+/// those apps (Microsoft documents SYSTRAYSUPPORT for IMEs that are not immersive but work in the
+/// system tray).
 const CATEGORIES: [GUID; 4] = [
     GUID_TFCAT_TIP_KEYBOARD,
     GUID_TFCAT_TIPCAP_COMLESS,
     GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT,
     GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
 ];
-/// Lightweight diagnostic log: %TEMP%\YiIME-tsf.log (over 512 KB rotated to .old). If it cannot be
-/// written (AppContainer, etc.), it will be ignored.
+/// Small diagnostic log: %TEMP%\YiIME-tsf.log (rotated to .old over 512 KB); ignored where it
+/// cannot be written (AppContainer etc.).
 fn log(message: &str) {
     use std::io::Write;
     let path = std::env::temp_dir().join("YiIME-tsf.log");
@@ -326,8 +323,8 @@ impl ITfEditSession_Impl for ScopeCheck_Impl {
             )
         };
         if selected.is_err() || fetched == 0 {
-            // When the selection cannot be read, it will be treated as a normal input box,
-            // otherwise the input method will never be activated in this context.
+            // If the selection cannot be read, treat it as a normal text field; otherwise the IME
+            // would never activate here.
             drop(ManuallyDrop::into_inner(selection.range));
             unsafe {
                 OutputDebugStringW(
@@ -378,8 +375,8 @@ impl ITfEditSession_Impl for ScopeCheck_Impl {
     }
 }
 
-/// Read the screen rectangle of the insertion point and display the editor's floating box against
-/// the cursor of the target application.
+/// Reads the screen rectangle of the insertion point so the editor can place its box at the
+/// target's cursor.
 #[implement(ITfEditSession)]
 struct CaretQuery {
     context: ITfContext,
@@ -416,8 +413,7 @@ impl ITfEditSession_Impl for CaretQuery_Impl {
     }
 }
 
-/// Chinese/English mode for read and write threads (GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, 1 =
-/// Chinese).
+/// Chinese/English mode of the thread (GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, 1 = Chinese).
 fn keyboard_mode(manager: &ITfThreadMgr) -> Option<bool> {
     let compartment = unsafe {
         manager
@@ -445,8 +441,8 @@ fn set_keyboard_mode(manager: &ITfThreadMgr, client_id: u32, chinese: bool) -> b
     inner.vt = VT_I4;
     inner.Anonymous.lVal = i32::from(chinese);
     let ok = unsafe { compartment.SetValue(client_id, &value).is_ok() };
-    // At the same time, the NATIVE bit of the "conversion mode" compartment is maintained (other
-    // bits are reserved): press it on the taskbar and touch keyboard to determine Chinese/English.
+    // Also keep the NATIVE bit of the conversion-mode compartment in sync (other bits untouched):
+    // the taskbar and touch keyboard read Chinese/English from it.
     if let Some(mode) = conversion_mode(manager) {
         let native = TF_CONVERSIONMODE_NATIVE as i32;
         let next = if chinese {
@@ -471,7 +467,7 @@ fn conversion_compartment(
             .ok()
     }
 }
-/// Read "Conversion Mode"; if it is not set, it will be calculated as Chinese (NATIVE).
+/// Conversion mode; unset counts as Chinese (NATIVE).
 fn conversion_mode(manager: &ITfThreadMgr) -> Option<i32> {
     let compartment = conversion_compartment(manager)?;
     let mut value = unsafe { compartment.GetValue() }.ok()?;
@@ -494,8 +490,8 @@ fn set_conversion_mode(manager: &ITfThreadMgr, client_id: u32, mode: i32) {
     inner.Anonymous.lVal = mode;
     let _ = unsafe { compartment.SetValue(client_id, &value) };
 }
-/// A floating box/tray EXE in the same directory as this DLL; if it cannot be found, use the
-/// current version directory recorded by the installation script.
+/// Input-box/tray EXE next to this DLL, or else in the current version directory recorded by the
+/// installer.
 fn companion_exe() -> Option<std::path::PathBuf> {
     let path = module_path().ok()?;
     let editor = std::path::Path::new(&path)
@@ -511,11 +507,11 @@ fn companion_exe() -> Option<std::path::PathBuf> {
         .map(|dir| std::path::PathBuf::from(dir).join("InputTranslation-Portable.exe"))
         .filter(|path| path.is_file())
 }
-/// Let the tray instance open settings (WM_APP+5) or input memory (WM_APP+6); start the EXE with
-/// parameters when the tray is not running.
+/// Asks the tray instance to open settings (WM_APP+5) or history (WM_APP+6), starting the EXE with
+/// an argument if the tray is not running.
 fn open_tray_window(history: bool) {
     unsafe {
-        AllowSetForegroundWindow(u32::MAX); // ASFW_ANY: The front desk power is on the order menu side and is given to the tray process.
+        AllowSetForegroundWindow(u32::MAX); // ASFW_ANY: the menu click gave us the foreground right; pass it to the tray process.
     }
     let tray = unsafe {
         FindWindowW(
@@ -541,15 +537,15 @@ fn open_tray_window(history: bool) {
         }
     }
 }
-/// The "Chinese/English" mode button on the left side of the taskbar input method icon (the same
-/// GUID_LBI_INPUTMODE as Microsoft Pinyin/Wubi). Click to switch modes; monitor OPENCLOSE
-/// compartment, Ctrl+Space or other ways to refresh the display when changing modes.
+/// Chinese/English mode button left of the taskbar IME icon (GUID_LBI_INPUTMODE, as in Microsoft
+/// Pinyin/Wubi). Clicking toggles the mode; it watches the OPENCLOSE compartment to refresh when
+/// the mode changes by Ctrl+Space or other means.
 #[implement(ITfLangBarItemButton, ITfSource, ITfCompartmentEventSink)]
 struct InputModeButton {
     manager: ITfThreadMgr,
     client_id: u32,
-    /// Shared with the TextService to facilitate a refresh button when the mode (normal/translated)
-    /// changes elsewhere.
+    /// Shared with the TextService so the button refreshes when plain/translation mode changes
+    /// elsewhere.
     sink: LangBarSink,
 }
 type LangBarSink = Rc<RefCell<Option<ITfLangBarItemSink>>>;
@@ -571,8 +567,8 @@ impl InputModeButton_Impl {
     fn chinese(&self) -> bool {
         keyboard_mode(&self.manager).unwrap_or(true)
     }
-    /// The menu is hung on the window of this thread: the window where the focus input box is
-    /// located, and then the foreground/focus window of this thread (the same as Xiaolanghao).
+    /// Menu owner: the window of the focused context, else this thread's foreground/focus window
+    /// (as Weasel does).
     fn menu_owner(&self) -> HWND {
         let from_context = unsafe {
             self.manager
@@ -594,8 +590,8 @@ impl InputModeButton_Impl {
             .filter(|hwnd| !hwnd.is_null())
             .unwrap_or(null_mut())
     }
-    /// The right-click menu of the taskbar mode icon: Chinese/English, Translation/Common Wubi,
-    /// Punctuation, Simplified and Traditional, Input Memory, and Settings.
+    /// Right-click menu of the taskbar mode icon: Chinese/English, translation/plain Wubi,
+    /// punctuation, Simplified/Traditional, history, settings.
     fn show_menu(&self, x: i32, y: i32) {
         let owner = self.menu_owner();
         if owner.is_null() {
@@ -654,8 +650,8 @@ impl InputModeButton_Impl {
                 },
             }
         }
-        // The icon is on the taskbar and the menu pops up; TPM_RETURNCMD retrieves the selected
-        // item synchronously.
+        // The icon is on the taskbar, so the menu opens upward; TPM_RETURNCMD returns the choice
+        // synchronously.
         let flags = TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN;
         let id = unsafe { TrackPopupMenuEx(menu, flags, x, y, owner, std::ptr::null()) } as u32;
         unsafe {
@@ -687,9 +683,8 @@ impl InputModeButton_Impl {
         refresh_sink(&self.sink);
     }
 }
-/// Normal Wubi mode (no translation): shares HKCU\\Software\\InputTranslation\\PlainMode with the
-/// editor EXE. Storage of setting switches: HKCU\\Software\\InputTranslation (shared with floating
-/// box EXE, name and default value are defined by yiime-core).
+/// Settings switches in HKCU\\Software\\InputTranslation, shared with the input-box EXE (names and
+/// defaults defined in yiime-core).
 struct Registry;
 impl OptionStore for Registry {
     fn get_u32(&self, name: &str) -> Option<u32> {
@@ -730,15 +725,14 @@ fn plain_mode() -> bool {
 fn set_plain_mode(on: bool) -> bool {
     OPTIONS.set_flag(Flag::PlainMode, on)
 }
-/// Chinese punctuation when the input box is not open (virtual key + Shift of the American keyboard
-/// layout, mapped in yiime-core). . and : after numbers remain half-width. Quotes are handled by
-/// the caller on an open/closed basis, and None is returned here.
+/// Chinese punctuation without the input box (US-layout virtual key + Shift, mapping in
+/// yiime-core); `.` `:` after digits stay half-width. Quotes return None and are alternated by the
+/// caller.
 fn chinese_punctuation(key: usize, shift: bool, after_digit: bool) -> Option<&'static str> {
     let key = u16::try_from(key).ok()?;
     us_key_char(key, shift).and_then(|ch| full_width(ch, after_digit))
 }
-/// Parse shortcut keys such as `Ctrl+Shift+Space` (the rules are in yiime-core) and convert them
-/// into TSF reserved keys.
+/// Parses shortcuts such as `Ctrl+Shift+Space` (rules in yiime-core) into a TSF preserved key.
 fn parse_hotkey(text: &str) -> Option<TF_PRESERVEDKEY> {
     let hotkey = yiime_core::parse_hotkey(text)?;
     let mut modifiers = 0u32;
@@ -778,9 +772,8 @@ impl ITfLangBarItem_Impl for InputModeButton_Impl {
             *info = TF_LANGBARITEMINFO {
                 clsidService: CLSID,
                 guidItem: GUID_LBI_INPUTMODE,
-                // The same as the Microsoft input method: only BTN_BUTTON is used; the right-click
-                // menu is opened by OnClick(RIGHT) itself (the input indicator of Win10/11 no
-                // longer calls InitMenu).
+                // As Microsoft's IMEs do: BTN_BUTTON only; OnClick(RIGHT) opens the menu itself
+                // (the Win10/11 input indicator no longer calls InitMenu).
                 dwStyle: TF_LBI_STYLE_BTN_BUTTON,
                 ulSort: 0,
                 szDescription: description,
@@ -847,10 +840,8 @@ impl ITfLangBarItemButton_Impl for InputModeButton_Impl {
         Ok(())
     }
     fn GetIcon(&self) -> Result<windows::Win32::UI::WindowsAndMessaging::HICON> {
-        // Resources 101/102/105: Light taskbar (dark text) Chinese/English/Translation;
-        // 103/104/106: Dark taskbar (white text). The translation mode displays "Yi", the normal
-        // Wubi mode displays "Chinese", and the English display "Eng". The caller is responsible
-        // for the DestroyIcon.
+        // Resources 101/102/105: light taskbar (dark glyph) 中/英/译; 103/104/106: dark taskbar (white
+        // glyph). Translation mode shows 译, plain Wubi 中, English 英. The caller destroys the icon.
         let light = light_taskbar();
         let id = match (self.chinese(), plain_mode()) {
             (false, _) => {
@@ -925,9 +916,8 @@ impl ITfCompartmentEventSink_Impl for InputModeButton_Impl {
         }
         let guid = unsafe { *guid };
         if guid == GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION {
-            // The system (taskbar/touch keyboard) changed the NATIVE bit of the conversion mode:
-            // let the on/off follow up (the same value is not written to avoid triggering back and
-            // forth).
+            // The taskbar or touch keyboard changed the NATIVE bit: follow it with OPENCLOSE
+            // (skipping equal values to avoid ping-pong).
             if let Some(mode) = conversion_mode(&self.manager) {
                 let native = mode & TF_CONVERSIONMODE_NATIVE as i32 != 0;
                 if native != self.chinese() {
@@ -941,8 +931,8 @@ impl ITfCompartmentEventSink_Impl for InputModeButton_Impl {
         Ok(())
     }
 }
-/// The maximum hold time for clicking Shift to switch between Chinese/English (exceeding it is
-/// regarded as Shift+mouse selection and other uses).
+/// Longest Shift hold that counts as a Chinese/English tap (longer is Shift+click selection and the
+/// like).
 const SHIFT_TAP_MAX: std::time::Duration = std::time::Duration::from_millis(600);
 fn is_shift(key: usize) -> bool {
     matches!(key, 0x10 | 0xA0 | 0xA1)
@@ -950,8 +940,8 @@ fn is_shift(key: usize) -> bool {
 fn caps_lock() -> bool {
     (unsafe { GetKeyState(VK_CAPITAL as i32) } & 1) != 0
 }
-/// Letters cached during float startup preserve case (Shift XORed with Caps Lock): lowercase is
-/// encoded, uppercase is put into draft by the float as is.
+/// Buffered letters keep their case (Shift XOR Caps Lock): lowercase composes, uppercase goes into
+/// the draft as is.
 fn typed_letter(key: u8) -> char {
     let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
     let letter = key as char;
@@ -962,8 +952,7 @@ fn typed_letter(key: u8) -> char {
     }
 }
 const LANGBAR_SINK_COOKIE: u32 = 0x4954_4c42;
-/// A modal button has been added to the language bar, and its event cookie on the OPENCLOSE
-/// compartment.
+/// Mode button added to the language bar, with its OPENCLOSE compartment advise cookies.
 type ModeButton = Option<(ITfLangBarItemButton, Vec<(ITfSource, u32)>, LangBarSink)>;
 
 #[implement(
@@ -988,21 +977,17 @@ struct TextService {
     edit_sink: RefCell<Option<(ITfContext, u32)>>,
     tested_key: RefCell<Option<(ITfContext, usize, bool)>>,
     mode_button: RefCell<ModeButton>,
-    /// The moment when Shift is pressed alone; cleared if other keys are pressed during the period.
-    /// If it is still there and short enough when released, switch to Chinese/English.
+    /// When Shift went down alone; cleared by any other key. If still set and short enough on
+    /// release, toggle Chinese/English.
     shift_down: Cell<Option<std::time::Instant>>,
-    /// The registered "normal mode" reserved keys are activated this time (the same combination
-    /// must be used when logging out).
+    /// Plain-mode preserved key registered at activation (unregistering needs the same chord).
     plain_chord: Cell<Option<TF_PRESERVEDKEY>>,
     history_chord: Cell<Option<TF_PRESERVEDKEY>>,
-    /// Whether the last key passed directly to the application was a number (determines whether . :
-    /// remains half-width).
+    /// Whether the last key passed to the application was a digit (keeps `.` `:` half-width).
     after_digit: Cell<bool>,
-    /// Chinese quotation marks open/close alternately: (single quotation mark, double quotation
-    /// mark).
     quotes: Cell<Quotes>,
-    /// The normal mode state of the mode button when it was last displayed; refreshes the button
-    /// accordingly when the tray or other application changes it.
+    /// Plain-mode state last shown by the button; refreshed when the tray or another app changes
+    /// it.
     shown_plain: Cell<bool>,
 }
 impl TextService {
@@ -1059,17 +1044,15 @@ impl TextService {
             }
         }
     }
-    /// An input session is in progress (the editor is starting, or the floating box is displayed):
-    /// the letters pressed in the host are cached and transferred to the floating box, and appended
-    /// to the current encoding. In the past, when the floating box was not brought to the front,
-    /// each letter would be reactivated and the code would be cleared, which would appear as
-    /// "letters coming out of the box one by one." The session ends (up screen, cancel, lose focus)
-    /// and is closed only after being notified by the editor.
+    /// An input session is running (editor starting or box shown): letters typed in the host are
+    /// buffered and forwarded to the box, appended to its code, instead of reactivating and
+    /// clearing it on every key. The session closes only when the editor reports that it ended
+    /// (commit, cancel, focus loss).
     fn buffering(&self) -> bool {
         self.editor_open.get()
     }
-    /// Allow the editor process to bring the floating box to the foreground (only the current
-    /// foreground process, the host, can grant this).
+    /// Lets the editor bring its box to the foreground (only the current foreground process, the
+    /// host, can grant this).
     fn allow_editor_foreground(&self) {
         if let Some(child) = self.editor.borrow().as_ref() {
             unsafe {
@@ -1077,8 +1060,8 @@ impl TextService {
             }
         }
     }
-    /// Synchronously reads the insertion point screen rectangle; can only be called when the
-    /// document lock can be obtained, such as key processing.
+    /// Reads the insertion point's screen rectangle synchronously; only where the document lock is
+    /// available, e.g. key handling.
     fn caret_rect(&self, context: &ITfContext) -> Option<RECT> {
         let result = Rc::new(Cell::new(None));
         let session: ITfEditSession = CaretQuery {
@@ -1149,9 +1132,8 @@ impl TextService {
                 .as_ref()
                 .is_some_and(|active| active == context);
         }
-        // No active session: Start a new typing of letters without modifier keys. Shift+letters,
-        // letters when Caps Lock is turned on are handed over to the application as usual (input
-        // capitals/letters directly, no pop-up box, consistent with Microsoft Wubi).
+        // No session: plain letters start one. Shift+letter and letters under Caps Lock go to the
+        // application as usual (capitals typed directly, no box, as in Microsoft Wubi).
         !caps_lock()
             && !modifier(VK_CONTROL)
             && !modifier(VK_MENU)
@@ -1159,8 +1141,8 @@ impl TextService {
             && !modifier(VK_RWIN)
             && !modifier(VK_SHIFT)
     }
-    /// When the input box is not opened, in Chinese mode, and Chinese punctuation is used, this key
-    /// should be converted into Chinese punctuation.
+    /// The Chinese punctuation this key produces when the box is closed, Chinese mode is on and
+    /// Chinese punctuation is enabled.
     fn punctuation(&self, context: &ITfContext, key: usize) -> Option<String> {
         let modifier = |vk| unsafe { GetKeyState(vk as i32) } < 0;
         if running_in_editor()
@@ -1186,7 +1168,7 @@ impl TextService {
         }
         chinese_punctuation(key, shift, self.after_digit.get()).map(str::to_owned)
     }
-    /// Insert text directly into the current document (without going through the floating box).
+    /// Inserts text straight into the document (without the box).
     fn insert_direct(&self, context: &ITfContext, text: String) -> bool {
         let session: ITfEditSession = CommitEdit {
             context: context.clone(),
@@ -1220,10 +1202,9 @@ impl TextService {
         let _ = unsafe { VariantClear(&mut value) };
         open
     }
-    /// When switching to this input method, it always enters Chinese mode. The OPENCLOSE
-    /// compartment is shared by all input methods in the same thread. If the "English" status left
-    /// by other input methods is used, the keys will go up the screen directly and the floating box
-    /// will not appear.
+    /// Always start in Chinese mode when switching to this IME. The OPENCLOSE compartment is shared
+    /// by all IMEs on the thread; inheriting another IME's English state would send keys straight
+    /// to the application and never open the box.
     fn ensure_keyboard_mode(manager: &ITfThreadMgr, client_id: u32) {
         set_keyboard_mode(manager, client_id, true);
     }
@@ -1232,29 +1213,26 @@ impl TextService {
         let Some(manager) = manager.as_ref() else {
             return false;
         };
-        // The mode button monitors compartment changes and automatically refreshes the
-        // "Chinese/English" display.
+        // The mode button listens to the compartment and refreshes itself.
         set_keyboard_mode(manager, self.client_id.get(), !self.keyboard_open())
     }
-    /// Tracking "Shift alone": Time is recorded when Shift is pressed, canceled by any other key
-    /// press.
+    /// Tracks Shift pressed alone: remember when it went down; any other key cancels.
     fn track_key_down(&self, key: usize) {
         if is_shift(key) {
             let modifier = |vk| unsafe { GetKeyState(vk as i32) } < 0;
             if modifier(VK_CONTROL) || modifier(VK_MENU) || modifier(VK_LWIN) || modifier(VK_RWIN) {
                 self.shift_down.set(None);
             } else if self.shift_down.get().is_none() {
-                // Automatic repeated presses do not refresh the time.
+                // Auto-repeat does not reset the time.
                 self.shift_down.set(Some(std::time::Instant::now()));
             }
         } else {
             self.shift_down.set(None);
         }
     }
-    /// Release Shift: If no other keys are pressed during this period and the time is short enough,
-    /// switch between Chinese and English (synchronized with Ctrl+Space and language bar buttons,
-    /// both written as OPENCLOSE compartment). Drafts and coding in the floating box are not
-    /// affected.
+    /// Shift released: if no other key was pressed and it was short enough, toggle Chinese/English
+    /// (through the OPENCLOSE compartment, like Ctrl+Space and the language-bar button). The box's
+    /// draft and code are unaffected.
     fn track_key_up(&self, key: usize) {
         if !is_shift(key) {
             return;
@@ -1275,8 +1253,8 @@ impl TextService {
             refresh_sink(sink);
         }
     }
-    /// Normal/translation mode may have been changed elsewhere (tray menu, shortcut keys in other
-    /// applications): refresh button if changed.
+    /// Plain/translation mode may have changed elsewhere (tray menu, shortcut in another app):
+    /// refresh the button.
     fn sync_plain_mode(&self) {
         let plain = plain_mode();
         if self.shown_plain.replace(plain) != plain {
@@ -1289,8 +1267,7 @@ impl TextService {
             return false;
         }
         self.shown_plain.set(plain);
-        // The normal mode also supports Chinese input: when switching from English, it returns to
-        // Chinese as well.
+        // Plain mode is also Chinese input: switching to it from English turns Chinese on.
         if !self.keyboard_open()
             && let Some(manager) = self.thread_manager.borrow().as_ref()
         {
@@ -1307,8 +1284,8 @@ impl TextService {
             sink: sink.clone(),
         }
         .into();
-        // Monitor the two compartments of "on/off" (Ctrl+Space, Shift, click) and "conversion mode"
-        // (taskbar, touch keyboard).
+        // Watch both OPENCLOSE (Ctrl+Space, Shift, click) and conversion mode (taskbar, touch
+        // keyboard).
         let mut advices = Vec::new();
         if let Ok(event_sink) = button.cast::<ITfCompartmentEventSink>()
             && let Ok(compartments) = manager.cast::<ITfCompartmentMgr>()
@@ -1357,7 +1334,7 @@ impl TextService {
     fn open_editor(&self, context: ITfContext, first_key: u8) -> bool {
         let target = unsafe { GetForegroundWindow() } as usize;
         let window = self.editor_window.get();
-        // The remaining cached keys from the previous session cannot be transferred to this time.
+        // Keys buffered for the previous session do not carry over.
         self.pending_keys.borrow_mut().clear();
         let caret = self.caret_rect(&context);
         if !window.is_null() && unsafe { IsWindow(window) } != 0 {
@@ -1374,8 +1351,8 @@ impl TextService {
             );
             self.editor_open.set(true);
             self.editor_window.set(null_mut());
-            // First send the cursor rectangle synchronously (if it cannot be retrieved, send an
-            // empty packet to let the editor position itself), and then activate it asynchronously.
+            // Send the cursor rectangle synchronously first (an empty packet if unavailable, so the
+            // editor positions itself), then activate asynchronously.
             let mut rect = caret.map(|rect| [rect.left, rect.top, rect.right, rect.bottom]);
             let packet = COPYDATASTRUCT {
                 dwData: 3,
@@ -1411,9 +1388,8 @@ impl TextService {
         let Some(directory) = std::path::Path::new(&path).parent() else {
             return false;
         };
-        // Priority is given to using an editor in the same directory (same version) as this DLL;
-        // when the EXE in the old version directory is deleted, it will return to the current
-        // version directory recorded by the installation script
+        // Prefer the editor next to this DLL (same version); if an old version directory's EXE has
+        // been removed, fall back to the current directory recorded by the installer
         // (HKLM\\Software\\InputTranslation\\CurrentDir).
         let mut editor = directory.join("InputTranslation-Portable.exe");
         if !editor.is_file() {
@@ -1443,7 +1419,7 @@ impl TextService {
                     format!("{}", first_key as char)
                 },
             ])
-            // The host's working directory and standard handles are not inherited.
+            // Do not inherit the host's working directory or standard handles.
             .current_dir(directory)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
@@ -1561,8 +1537,8 @@ impl TextService {
         if keys.is_empty() {
             return;
         }
-        // Clone first and then initiate an editing session: the session may be executed
-        // synchronously and re-enter finish_editor(borrow_mut).
+        // Clone before starting the edit session: it may run synchronously and re-enter
+        // finish_editor (borrow_mut).
         let context = self.context.borrow().clone();
         if let Some(context) = context {
             let session: ITfEditSession = CommitEdit {
@@ -1628,8 +1604,8 @@ impl TextService_Impl {
 impl ITfTextInputProcessor_Impl for TextService_Impl {
     fn Activate(&self, manager: Ref<ITfThreadMgr>, client_id: u32) -> Result<()> {
         let manager = manager.ok()?.clone();
-        // Complete the cast that may fail first, and then create a receiving window holding the
-        // self pointer to avoid leaving a dangling pointer when it fails.
+        // Do the fallible cast before creating the receiver window that holds the self pointer, so
+        // a failure leaves no dangling pointer.
         let keystroke: ITfKeystrokeMgr = manager.cast()?;
         let receiver = unsafe { create_receiver(self as *const _ as *mut c_void) };
         if receiver.is_null() {
@@ -1806,12 +1782,12 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             self.after_digit.set(false);
             return Ok(self.insert_direct(context, text).into());
         }
-        // Record the numeric keys so that the . and : that follow them are half-width (3.5, 10:30).
+        // Remember digits so a following `.` `:` stays half-width (3.5, 10:30).
         let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
         self.after_digit
             .set((!shift && (0x30..=0x39).contains(&key.0)) || (0x60..=0x69).contains(&key.0));
-        // Only letters will be given to the floating box; during the test phase, the keys that are
-        // eaten by punctuation and whose conditions have changed are released.
+        // Only letters go to the box; keys whose conditions changed since OnTestKeyDown (e.g. eaten
+        // by punctuation) are released.
         if !consume || !(0x41..=0x5a).contains(&key.0) {
             return Ok(false.into());
         }
@@ -1835,8 +1811,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         key: windows::Win32::Foundation::WPARAM,
         _data: windows::Win32::Foundation::LPARAM,
     ) -> Result<BOOL> {
-        // If you release Shift without eating it, the host will receive it as usual; the switch
-        // will only be done once (track_key_up will clear the record).
+        // A Shift released without being eaten reaches the host as usual; the toggle happens once
+        // (track_key_up clears the record).
         self.track_key_up(key.0);
         Ok(false.into())
     }
@@ -1850,15 +1826,15 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         Ok(false.into())
     }
     fn OnPreservedKey(&self, context: Ref<ITfContext>, guid: *const GUID) -> Result<BOOL> {
-        // It is not processed in the editor process (floating box): the floating box responds to
-        // these two shortcut keys by itself and retains the group words and drafts.
+        // Not in the editor process: the box handles these two shortcuts itself and keeps its code
+        // and draft.
         if running_in_editor() || guid.is_null() {
             return Ok(false.into());
         }
         let guid = unsafe { *guid };
         if guid == HISTORY_KEY {
-            // Allowed when input memory is off, floating box is on, English mode, or password box
-            // (the app receives this key combination as usual).
+            // Passed through to the application when history is off, a session is active, in
+            // English mode or in a password field.
             self.refresh_editor();
             let Some(context) = context.as_ref() else {
                 return Ok(false.into());
@@ -2034,8 +2010,8 @@ unsafe extern "system" fn receiver_proc(hwnd: HWND, message: u32, w: WPARAM, l: 
             KillTimer(hwnd, READY_TIMER);
         }
         let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TextService_Impl };
-        // The editor is not ready yet: end it, return the cached letters to the host, and the input
-        // method returns to normal.
+        // The editor never became ready: end the session, give the buffered letters back to the
+        // host and return to normal.
         if !pointer.is_null()
             && unsafe { (&*pointer).editor_open.get() && (&*pointer).editor_window.get().is_null() }
         {

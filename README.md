@@ -7,8 +7,6 @@
 
 五笔/拼音输入法，自带“中文 → 英文”翻译：在任意应用里用中文打字，按 Enter 把译文直接上屏；也可以只打中文、不翻译。
 
-当前版本：**0.1.0**。
-
 | 平台 | 状态 |
 | --- | --- |
 | Windows 10/11 x64 | 输入法（TSF），主力平台 |
@@ -47,7 +45,7 @@
 
 ## 安装
 
-1. 从 [Releases](https://github.com/leelieber2025/YiIME/releases) 下载 `YiIME-0.1.0-setup.exe`，运行并按提示安装（需要管理员权限）。
+1. 从 [Releases](https://github.com/leelieber2025/YiIME/releases) 下载 `YiIME-<版本>-setup.exe`，运行并按提示安装（需要管理员权限）。
 2. 按 Win+空格 切换到“YiIME 译（五笔）”，在任意文本框里打字即可。
 3. 首次使用可在设置窗口选择翻译引擎；默认的免费 Google 翻译无需配置。
 
@@ -64,7 +62,7 @@ macOS 输入法（InputMethodKit）的代码在 `macos/`，CI 能构建通用二
 
 ### Linux（命令行）
 
-Linux 暂时只有命令行工具 `yiime`，输入法（Fcitx5）在计划中。下载 `yiime_0.1.0-1_amd64.deb`（或 arm64）用 `sudo apt install ./yiime_*.deb` 安装，或解压 `yiime-0.1.0-linux-<架构>.tar.gz` 直接运行：
+Linux 暂时只有命令行工具 `yiime`，输入法（Fcitx5）在计划中。下载 `yiime_<版本>-1_amd64.deb`（或 arm64）用 `sudo apt install ./yiime_*.deb` 安装，或解压 `yiime-<版本>-linux-<架构>.tar.gz` 直接运行：
 
 ```bash
 yiime query zhongguo        # 查候选：中国 …
@@ -79,10 +77,12 @@ Windows 版需要 Rust（版本见 `rust-toolchain.toml`）和 MinGW-w64 交叉�
 rustup target add x86_64-pc-windows-gnu
 sudo apt-get install gcc-mingw-w64-x86-64-posix binutils-mingw-w64-x86-64
 bash windows/build.sh                   # 生成 dist/ 下的 EXE、DLL 和 zip
-ISCC=/path/to/ISCC.exe bash windows/build-installer.sh 0.1.0   # 用 Inno Setup 6（Linux 上经 wine）生成安装包
+ISCC=/path/to/ISCC.exe bash windows/build-installer.sh   # 用 Inno Setup 6（Linux 上经 wine）生成安装包
 ```
 
-macOS（开发中）：在 Mac 上运行 `bash macos/build.sh 0.1.0`，生成 `dist/YiIME-0.1.0-macos.pkg`。Linux 命令行：`cargo build --release -p yiime-cli`，打包用 `tools/package-linux.sh` 和 `cargo deb -p yiime-cli`。
+macOS（开发中）：在 Mac 上运行 `bash macos/build.sh`，生成 `dist/YiIME-<版本>-macos.pkg`。Linux 命令行：`cargo build --release -p yiime-cli`，打包用 `tools/package-linux.sh [架构]` 和 `cargo deb -p yiime-cli`。
+
+版本号只在根目录 `Cargo.toml` 的 `[workspace.package]` 里设置，各 crate、Windows 资源、安装包、macOS Info.plist 与打包脚本都从这里取（脚本用 `tools/version.sh`）。
 
 测试：`cargo test --workspace`。平台无关的核心库 `crates/yiime-core` 和命令行 `yiime`（`yiime query <编码>`、`yiime translate <中文>`）可在任何平台运行。
 

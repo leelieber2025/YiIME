@@ -1,8 +1,7 @@
-/// Switch the default shortcut key for "Normal Wubi Mode (No Translation)".
+/// Default shortcut for plain Wubi mode (no translation).
 pub const DEFAULT_PLAIN_TOGGLE: &str = "Ctrl+Shift+Space";
 
-/// Shortcut key: modifier key + Windows virtual key code (platform-independent numerical
-/// convention).
+/// Shortcut: modifiers + Windows virtual-key code (used as a platform-neutral convention).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hotkey {
     pub ctrl: bool,
@@ -11,10 +10,9 @@ pub struct Hotkey {
     pub vk: u16,
 }
 
-/// Parse shortcut keys such as `Ctrl+Shift+Space` (not case sensitive, separated by `+`). The
-/// primary keys support Space, A~Z, 0~9, F1~F12; in addition to the F key, Ctrl or Alt must be
-/// included to avoid taking away ordinary typing. There is a copy of the same rules in the TSF DLL
-/// (windows/tsf/src/tsf.rs), and both sides are synchronized when modified.
+/// Parses shortcuts such as `Ctrl+Shift+Space` (case-insensitive, `+`-separated). Keys: Space, A–Z,
+/// 0–9, F1–F12; except for F keys, Ctrl or Alt is required so ordinary typing is not taken.
+/// windows/tsf/src/tsf.rs has a copy of these rules; change both together.
 pub fn parse_hotkey(text: &str) -> Option<Hotkey> {
     let mut hotkey = Hotkey {
         ctrl: false,

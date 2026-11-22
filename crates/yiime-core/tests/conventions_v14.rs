@@ -1,7 +1,7 @@
 #![cfg(feature = "bundled")]
-//! Common input method conventions added in v14 (Microsoft Pinyin, Sogou, Rime): word
-//! determination, comma and period page turning, deletion of learning records, automatic pairing of
-//! brackets and quotes, small keyboard numbers, and default switches.
+//! Common input-method conventions (Microsoft Pinyin, Sogou, Rime): picking a character from a
+//! word, comma/period paging, forgetting learned picks, auto-closing brackets and quotes, numpad
+//! digits, and default switches.
 
 use yiime_core::*;
 
@@ -20,7 +20,7 @@ fn bracket_picks_first_or_last_char_of_word() {
     assert_eq!(first, "中国人");
     assert_eq!(char_of_word(first, false).as_deref(), Some("中"));
     assert_eq!(char_of_word(first, true).as_deref(), Some("人"));
-    // There is no definite word for a word: [ ] is still treated as punctuation.
+    // A single character has no character to pick: `[` `]` stay punctuation.
     assert_eq!(char_of_word("仙", false), None);
     assert_eq!(char_of_word("", true), None);
 }
@@ -29,7 +29,7 @@ fn bracket_picks_first_or_last_char_of_word() {
 fn paging_keys() {
     assert_eq!(paging_direction('=', false), Some(true));
     assert_eq!(paging_direction('-', false), Some(false));
-    // Commas and periods are turned off by default (Wubi uses them to top the screen).
+    // Comma/period paging is off by default (in Wubi they commit the first candidate).
     assert!(!Flag::CommaPeriodPaging.default_on());
     assert_eq!(paging_direction('.', false), None);
     assert_eq!(paging_direction(',', false), None);
@@ -53,8 +53,8 @@ fn auto_pair_table_and_defaults() {
         assert!(!is_closing(open));
     }
     assert_eq!(closing_pair("，"), None);
-    // Quotation marks alternate and match: the next quote after the opening quote is the closing
-    // quote (it is only skipped if it is exactly after the cursor).
+    // Quotes alternate: after an opening quote comes the closing one (skipped over only when it is
+    // right before the cursor).
     let mut quotes = Quotes::default();
     assert_eq!(quotes.next('"'), Some("“"));
     assert_eq!(quotes.next('"'), Some("”"));

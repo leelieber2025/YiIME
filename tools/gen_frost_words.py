@@ -85,9 +85,8 @@ def main():
             old = words.get(text)
             if old is None or weight > old[1]:
                 words[text] = (" ".join(syllables), weight, code)
-    # All four-character idioms are retained (the word frequency in the idiom database is generally
-    # very low, and truncation based on word frequency will be squeezed out), and the rest are taken
-    # to fill the CAP based on word frequency.
+    # Keep every four-character idiom (idiom frequencies are low and a frequency cut would drop
+    # them), then fill up to CAP by frequency.
     ordered = sorted(words.items(), key=lambda kv: (-kv[1][1], kv[0]))
     must = [item for item in ordered if item[0] in idioms and len(item[0]) == 4]
     must_set = {text for text, _ in must}

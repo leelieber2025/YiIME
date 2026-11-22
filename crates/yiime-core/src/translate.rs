@@ -1,9 +1,9 @@
 use crate::settings::{ApiSettings, Engine};
 use crate::style::{TranslationStyle, system_prompt};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use std::env;
 use std::net::IpAddr;
-use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -21,14 +21,14 @@ pub fn translate_openai(source: &str) -> Result<String, String> {
     )
 }
 
-/// Timing of each request (used for writing diagnostic logs; excluding key and original text).
+/// Timing of one request, for the diagnostic log (never the key or the text).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attempt {
     pub engine: Engine,
-    /// Large model name; Google is empty.
+    /// LLM model; empty for Google.
     pub model: String,
     pub host: String,
-    /// Time (in milliseconds, since the request began) when response headers were received.
+    /// Milliseconds from the start of the request to the response headers.
     pub first_byte_ms: Option<u128>,
     pub total_ms: u128,
     pub chars: usize,
@@ -64,7 +64,7 @@ impl From<String> for Fail {
     }
 }
 
-/// The result and process of a translation (maybe Google failed first, then the large model).
+/// Result of a translation and its attempts (e.g. Google failed, then the LLM).
 #[derive(Debug)]
 pub struct Outcome {
     pub result: Result<String, String>,
@@ -72,8 +72,8 @@ pub struct Outcome {
 }
 
 impl Attempt {
-    /// One line of diagnostic log, such as `engine=llm model=gpt-4o-mini host=api.openai.com
-    /// chars=12 first_byte=820ms total=905ms ok`.
+    /// One diagnostic log line, e.g. `engine=llm model=gpt-4o-mini host=api.openai.com chars=12
+    /// first_byte=820ms total=905ms ok`.
     pub fn log_line(&self) -> String {
         let model = if self.model.is_empty() {
             String::new()
@@ -98,16 +98,15 @@ impl Attempt {
     }
 }
 
-/// Timeout for the free Google interface: it usually returns in 200–400ms, before using the larger
-/// model instead.
+/// Free Google usually answers in 200–400 ms; after this the LLM is tried instead.
 const GOOGLE_FREE_TIMEOUT: Duration = Duration::from_secs(4);
 const GOOGLE_CLOUD_TIMEOUT: Duration = Duration::from_secs(8);
 const LLM_TIMEOUT: Duration = Duration::from_secs(20);
 const GOOGLE_FREE_URL: &str = "https://translate.googleapis.com/translate_a/single";
 const GOOGLE_CLOUD_URL: &str = "https://translation.googleapis.com/language/translate/v2";
 
-/// Shared HTTP client (one with proxy/one without proxy): keep the connection reused, and save DNS,
-/// TCP and TLS handshakes from the second time onwards.
+/// Shared HTTP clients (with and without proxy) so connections are reused and DNS/TCP/TLS happen
+/// once.
 fn agent(bypass_proxy: bool) -> &'static ureq::Agent {
     static AGENTS: OnceLock<[ureq::Agent; 2]> = OnceLock::new();
     let agents = AGENTS.get_or_init(|| {
@@ -139,7 +138,7 @@ fn http_error(error: ureq::Error) -> Fail {
                 .ok()
                 .and_then(|json| json["error"]["message"].as_str().map(str::to_owned))
                 .unwrap_or_else(|| {
-                    // HTML error pages (when Google is throttling) do not fit into the status bar.
+                    // HTML error pages (Google rate limiting) do not fit in the status line.
                     if explanation.trim_start().starts_with('<') {
                         String::new()
                     } else {
@@ -147,25 +146,33 @@ fn http_error(error: ureq::Error) -> Fail {
                     }
                 });
             if code == 429 {
-                Fail::new(&category, format!("HTTP 429（请求太频繁，被限流）: {message}"))
+                Fail::new(
+                    &category,
+                    format!("HTTP 429（请求太频繁，被限流）: {message}"),
+                )
             } else {
                 Fail::new(&category, format!("HTTP {code}: {message}"))
             }
         }
         ureq::Error::Transport(transport) => {
-            // Transport errors may include the request URL (and its query); show only the kind.
+            // `Display` includes the request URL (the free Google query carries the source
+            // text), so the user sees only the kind and the URL-free message.
             let text = transport.to_string();
             if text.contains("timed out") || text.contains("Timeout") {
                 Fail::new("timeout", "请求超时")
             } else {
-                Fail::new("network", format!("网络错误：{}", transport.kind()))
+                let detail = transport
+                    .message()
+                    .map(|message| format!("（{message}）"))
+                    .unwrap_or_default();
+                Fail::new("network", format!("网络错误：{}{detail}", transport.kind()))
             }
         }
     }
 }
 
-/// Translate by settings: Use the selected engine first; automatically switch to the large model if
-/// Google (free or Cloud) fails or times out and the large model has been configured.
+/// Translates with the selected engine; if Google (free or Cloud) fails and an LLM is configured,
+/// falls back to the LLM.
 pub fn translate(settings: &ApiSettings, source: &str) -> Outcome {
     let mut attempts = Vec::new();
     let first = run(settings, settings.engine, source, &mut attempts);
@@ -225,7 +232,7 @@ fn run(
     result.map_err(|fail| fail.message)
 }
 
-/// Free Google interface: `[[["dst","src",…],…],…]`, put together the translations.
+/// Free Google endpoint, answering `[[["dst","src",…],…],…]`; the pieces are joined.
 fn google_free(
     source: &str,
     first_byte: &mut Option<u128>,
@@ -242,7 +249,9 @@ fn google_free(
         .call()
         .map_err(http_error)?;
     *first_byte = Some(started.elapsed().as_millis());
-    let json: Value = response.into_json().map_err(|_| "Google 翻译返回格式不对")?;
+    let json: Value = response
+        .into_json()
+        .map_err(|_| "Google 翻译返回格式不对")?;
     Ok(parse_google_free(&json)?)
 }
 
@@ -290,18 +299,20 @@ fn google_cloud(
 
 /// (endpoint, model) pairs that rejected temperature / max_tokens (some reasoning models answer
 /// 400); only those pairs get the reduced request, other models keep the full one.
-static MINIMAL_BODY: Mutex<Option<HashSet<(String, String)>>> = Mutex::new(None);
+static MINIMAL_BODY: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
+
+fn minimal_body() -> std::sync::MutexGuard<'static, BTreeSet<(String, String)>> {
+    MINIMAL_BODY
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
 
 fn wants_minimal(endpoint: &str, model: &str) -> bool {
-    let set = MINIMAL_BODY.lock().unwrap_or_else(|poison| poison.into_inner());
-    set.as_ref()
-        .is_some_and(|set| set.contains(&(endpoint.to_owned(), model.to_owned())))
+    minimal_body().contains(&(endpoint.to_owned(), model.to_owned()))
 }
 
 fn mark_minimal(endpoint: &str, model: &str) {
-    let mut set = MINIMAL_BODY.lock().unwrap_or_else(|poison| poison.into_inner());
-    set.get_or_insert_with(HashSet::new)
-        .insert((endpoint.to_owned(), model.to_owned()));
+    minimal_body().insert((endpoint.to_owned(), model.to_owned()));
 }
 
 pub fn translate_openai_with(
@@ -343,9 +354,8 @@ fn llm(
         {"role": "system", "content": system_prompt(style, custom)},
         {"role": "user", "content": source}
     ]);
-    // The length of the translation is similar to the original text: about 1–2 tokens per Chinese
-    // character in English, leaving enough margin but not allowing the model to output long
-    // sentences.
+    // English is about 1–2 tokens per Chinese character: leave headroom without allowing long
+    // rambles.
     let max_tokens = (source.chars().count() * 4 + 64).min(2048);
     let full = json!({
         "model": model,
@@ -373,8 +383,13 @@ fn llm(
                     || lower.contains("max_tokens")
                     || lower.contains("unsupported")
                 {
-                    mark_minimal(endpoint, model);
-                    send(&minimal)
+                    // Remember only when the reduced request works: the 400 may be about
+                    // something else (e.g. an unsupported `system` role or model).
+                    let retry = send(&minimal);
+                    if retry.is_ok() {
+                        mark_minimal(endpoint, model);
+                    }
+                    retry
                 } else {
                     let message = serde_json::from_str::<Value>(&text)
                         .ok()
@@ -402,10 +417,9 @@ fn llm(
     Ok(strip_leading_reasoning(content)?)
 }
 
-/// Establish a connection to the translation server in advance (called when the floating box is
-/// opened, and the DNS/TCP/TLS handshake is completed during typing). Only send a HEAD request
-/// without the key and original text; failure will not affect subsequent translations. No repeat
-/// within 30 seconds.
+/// Opens connections to the translation server early (when the input box opens) so DNS/TCP/TLS
+/// finish while typing. Sends only a HEAD request without key or text; failures are ignored. At
+/// most once per 30 seconds.
 pub fn prewarm(settings: &ApiSettings) {
     static LAST: Mutex<Option<Instant>> = Mutex::new(None);
     {
@@ -427,8 +441,7 @@ pub fn prewarm(settings: &ApiSettings) {
         targets.push((url, bypass));
     }
     for (url, bypass) in targets {
-        // The connection will not be put back into the connection pool until the response
-        // (including 4xx) is read.
+        // A connection returns to the pool only after its response (4xx included) is read.
         let _ = match agent(bypass)
             .head(&url)
             .timeout(Duration::from_secs(5))
@@ -440,9 +453,8 @@ pub fn prewarm(settings: &ApiSettings) {
     }
 }
 
-/// Remove the `<think>…</think>` at the beginning; if it is not closed, the output will be regarded
-/// as incomplete, and an error will be reported for empty translations to avoid submitting the
-/// reasoning process or blanks.
+/// Strips a leading `<think>…</think>`. An unclosed block means the output is incomplete, and an
+/// empty translation is an error, so reasoning or blanks are never committed.
 fn strip_leading_reasoning(text: &str) -> Result<String, String> {
     let trimmed = text.trim();
     let answer = match trimmed.strip_prefix("<think>") {
@@ -610,7 +622,7 @@ mod tests {
 
     #[test]
     fn google_free_needs_no_settings_and_falls_back_only_when_llm_ready() {
-        // Do not send network requests: only check fallback conditions.
+        // No network: only checks the fallback condition.
         let defaults = ApiSettings::default();
         assert_eq!(defaults.engine, Engine::GoogleFree);
         assert!(defaults.validate().is_ok());
@@ -622,7 +634,10 @@ mod tests {
     fn fake_llm(requests: usize) -> (String, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("http://{}/v1/chat/completions", listener.local_addr().unwrap());
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
         let server = std::thread::spawn(move || {
             for _ in 0..requests {
                 let (mut stream, _) = listener.accept().unwrap();

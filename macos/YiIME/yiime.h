@@ -1,4 +1,4 @@
-// C interface of yiime-ffi (see crates/yiime-ffi/src/lib.rs for implementation).
+// C interface of yiime-ffi (implemented in crates/yiime-ffi/src/lib.rs).
 #include <stdbool.h>
 #include <stdint.h>
 

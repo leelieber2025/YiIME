@@ -27,8 +27,8 @@ $dll = Join-Path $destination 'input_translation_tsf.dll'
 $exe = Join-Path $destination 'InputTranslation-Portable.exe'
 if (-not (Test-Path $dll)) { Copy-Item $sourceDll $dll }
 if (-not (Test-Path $exe)) { Copy-Item $sourceExe $exe }
-# The large lexicon (rime-frost derivative, GPL-3.0) is a separate file that is read when the EXE is
-# run; it is overwritten with the in-package version on every installation.
+# The large lexicon (derived from rime-frost, GPL-3.0) is a separate file read by the EXE at
+# runtime; every install overwrites it.
 $sourceWords = Join-Path $source 'data\frost\InputTranslation-words.txt'
 if (Test-Path $sourceWords) { Copy-Item $sourceWords (Join-Path $destination 'InputTranslation-words.txt') -Force -ErrorAction SilentlyContinue }
 # Stage both files before touching the current registration. Loaded DLLs remain in their old version directory.
@@ -41,13 +41,13 @@ if ($registrationError -ne 0) {
     if ($oldDll -and (Test-Path $oldDll) -and $oldDll -ne $dll) { [void](Invoke-Regsvr32 @('/s', "`"$oldDll`"")) }
     throw "新版输入法注册失败：$registrationError"
 }
-# Record the current version directory: used when an older DLL (still loaded by a running
-# application) cannot find the EXE in its own directory.
+# Record the current version directory, for an older DLL (still loaded by a running application)
+# that cannot find the EXE next to it.
 $stateKey = 'HKLM:\Software\InputTranslation'
 New-Item -Path $stateKey -Force | Out-Null
 Set-ItemProperty -Path $stateKey -Name 'CurrentDir' -Value $destination
-# Add the input method to the current user's Chinese input method list; the taskbar input method
-# switcher will not display it if it is not in the list.
+# Add the IME to the current user's Chinese input list; the taskbar switcher hides IMEs not in the
+# list.
 $tip = '0804:{A72091C2-7459-4C47-85F4-4626AE42A6C8}{54A39D73-0625-4560-B878-94660908C69D}'
 try {
     $languages = Get-WinUserLanguageList
@@ -65,7 +65,7 @@ try {
     Write-Warning "未能自动加入输入法列表：$_"
     Write-Warning '请在 设置 → 时间和语言 → 语言和区域 → 中文（简体）→ 语言选项 → 添加键盘 中选择「YiIME 译（五笔）」。'
 }
-# Start menu shortcut: Open the translation API settings without going through the input method.
+# Start menu shortcut that opens the translation settings without the IME.
 $programs = [Environment]::GetFolderPath('Programs')
 $oldShortcut = Join-Path $programs '中英输入 设置.lnk'
 if (Test-Path $oldShortcut) { Remove-Item $oldShortcut -Force -ErrorAction SilentlyContinue }
@@ -76,10 +76,9 @@ $shortcut.WorkingDirectory = $destination
 $shortcut.Description = '打开 YiIME 译的翻译 API 设置'
 $shortcut.Save()
 Write-Host '已创建开始菜单快捷方式「YiIME 设置」。'
-# Start a new version of the tray as the current user (non-administrator): The input method list
-# written by the administrator process sometimes does not apply to the user session. When the tray
-# is started, InstallLayoutOrTip will be used to ensure it again (clear the mark to ensure it
-# again).
+# Start the new tray as the current (non-admin) user: the input list written by the elevated process
+# sometimes misses the user session, so the tray re-checks it with InstallLayoutOrTip on start
+# (clearing the marker forces that).
 Remove-Item (Join-Path $env:APPDATA "InputTranslation\ime-list-added") -Force -ErrorAction SilentlyContinue
 Get-CimInstance Win32_Process -Filter "Name='InputTranslation-Portable.exe'" -ErrorAction SilentlyContinue |
     Where-Object { $_.CommandLine -notmatch '--tsf-hwnd' -and $_.ExecutablePath -like "$base*" } |

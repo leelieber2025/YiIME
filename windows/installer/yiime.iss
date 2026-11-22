@@ -1,32 +1,24 @@
-﻿; YiIME translation for Windows installer (Inno Setup 6).
+﻿; YiIME Windows installer (Inno Setup 6).
 ;
-; The layout follows Install-InputTranslation.ps1: installed to Program
-; Files\InputTranslation\<version directory>\, version directory = the first 12 bits of SHA-256 of
-; DLL and EXE (consistent with script installation, the same build will not be installed
-; repeatedly). The input method DLL will be loaded into each process with a text box, and the file
-; cannot be overwritten if it is locked, so each version is placed side by side in its own
-; directory, and the new DLL is registered (the InprocServer32 of CLSID points to the new file); the
-; old DLL that is still loaded by the application continues to serve until the application restarts.
-; When it cannot find the EXE in its own directory, press HKLM\Software\InputTranslation\CurrentDir
-; to find the new version.
+; Same layout as Install-InputTranslation.ps1: Program Files\InputTranslation\<version dir>\, where
+; the version dir is the first 12 hex digits of the DLL and EXE SHA-256 (so reinstalling the same
+; build is a no-op). The IME DLL is loaded into every process with a text box and cannot be
+; overwritten while locked, so each version gets its own directory and the new DLL is registered
+; (CLSID InprocServer32 points to it); old DLLs keep serving until their applications restart and
+; find the new EXE via HKLM\Software\InputTranslation\CurrentDir.
 ;
-; Installation steps: ① Copy files; ② Add ALL APPLICATION PACKAGES to the installation directory to
-; read + execute (required for UWP/AppContainer applications to load DLL); ③ regsvr32 registration
-; (restore the old registration and report an error if it fails); ④ Add the input method to the
-; Chinese input method list as the original user; ⑤ Start menu (settings, input memory, instructions
-; for use, uninstall); ⑥ Once completed, launch the tray as the original user. Uninstall reverse:
-; end the program process, unregister, remove from the input method list, and then delete the file;
-; %APPDATA%\InputTranslation and HKCU\Software\InputTranslation (user settings, keys, input memory,
-; learning records) are retained.
+; Install: ① copy files; ② grant ALL APPLICATION PACKAGES read+execute (UWP/AppContainer apps need
+; it to load the DLL); ③ regsvr32 (restore the old registration and fail on error); ④ add the IME to
+; the original user's Chinese input list; ⑤ Start menu (settings, history, guide, uninstall); ⑥
+; launch the tray as the original user. Uninstall reverses this: stop our processes, unregister,
+; remove from the input list, delete files. %APPDATA%\InputTranslation and
+; HKCU\Software\InputTranslation (settings, keys, history, learned picks) are kept.
 ;
-; Structure: Version side-by-side DLL, icacls, CloseApplications=no, only end own EXE before
-; installation.
-;
-; Usage: windows/build-installer.sh <version> (first windows/build.sh generates dist\), which passes
-; in /DAppVersion=… /DVersionDir=<DLL first 12 digits>-<EXE first 12 digits>
+; Build with windows/build-installer.sh (after windows/build.sh), which passes /DAppVersion=…
+; /DVersionDir=<DLL hash 12>-<EXE hash 12>.
 
 #ifndef AppVersion
-  #define AppVersion "0.1.1"
+  #error 请用 windows/build-installer.sh 构建（需要 /DAppVersion=...）
 #endif
 #ifndef VersionDir
   #error 请用 windows/build-installer.sh 构建（需要 /DVersionDir=...）
@@ -42,7 +34,7 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 AppPublisher=YiIME
-VersionInfoVersion=0.1.1.0
+VersionInfoVersion={#AppVersion}
 VersionInfoDescription={#AppName} 安装程序
 DefaultDirName={autopf}\InputTranslation
 DisableDirPage=yes
@@ -52,8 +44,8 @@ ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
 MinVersion=10.0
 PrivilegesRequired=admin
-; Don't let the Restart Manager close every application that has an input method DLL loaded (that's
-; every application with a text box).
+; Do not let Restart Manager close every application that has the IME DLL loaded (every application
+; with a text box).
 CloseApplications=no
 RestartApplications=no
 UsedUserAreasWarning=no
@@ -77,17 +69,16 @@ FinishedLabel=安装完成。在任务栏输入法切换器（Win+空格）中�
 Name: "{app}\{#VersionDir}"
 
 [Files]
-; The contents of existing DLL/EXEs in the same version directory must be the same (the directory
-; name is their hash), and they will not be overwritten if they already exist (they may be being
-; loaded).
+; Files in an existing version directory are identical (the name is their hash) and may be loaded,
+; so never overwrite them.
 Source: "{#Repo}\dist\{#Dll}"; DestDir: "{app}\{#VersionDir}"; Flags: onlyifdoesntexist uninsrestartdelete
 Source: "{#Repo}\dist\{#Exe}"; DestDir: "{app}\{#VersionDir}"; Flags: onlyifdoesntexist
-; Large lexicon (rime-frost derivative, GPL-3.0): reads from the same directory when the EXE is run.
+; Large lexicon (derived from rime-frost, GPL-3.0), read from the EXE directory at runtime.
 Source: "{#Repo}\data\frost\InputTranslation-words.txt"; DestDir: "{app}\{#VersionDir}"; Flags: ignoreversion
 Source: "{#Repo}\windows\installer\Add-YiIMETip.ps1"; DestDir: "{app}\{#VersionDir}"; Flags: ignoreversion
 Source: "{#Repo}\windows\TSF-使用说明.txt"; DestDir: "{app}\{#VersionDir}"; Flags: ignoreversion
 Source: "{#Repo}\dist\BUILDINFO.txt"; DestDir: "{app}\{#VersionDir}"; Flags: ignoreversion
-; License and Attribution (the same set as the ZIP package).
+; Licenses and attribution (same set as the ZIP).
 Source: "{#Repo}\data\README.md"; DestDir: "{app}\{#VersionDir}\data"; Flags: ignoreversion
 Source: "{#Repo}\data\wubi\LICENSE"; DestDir: "{app}\{#VersionDir}\data\wubi"; Flags: ignoreversion
 Source: "{#Repo}\data\wubi\AUTHORS"; DestDir: "{app}\{#VersionDir}\data\wubi"; Flags: ignoreversion
@@ -99,8 +90,8 @@ Source: "{#Repo}\data\frost\LICENSE"; DestDir: "{app}\{#VersionDir}\data\frost";
 Source: "{#Repo}\data\opencc\LICENSE"; DestDir: "{app}\{#VersionDir}\data\opencc"; Flags: ignoreversion
 
 [Registry]
-; Current version directory: Used when an old version of the DLL (still in a running application)
-; cannot find the EXE in its own directory.
+; Current version directory, for an old DLL (still loaded somewhere) that cannot find the EXE next
+; to it.
 Root: HKLM; Subkey: "Software\InputTranslation"; ValueType: string; ValueName: "CurrentDir"; ValueData: "{app}\{#VersionDir}"; Flags: uninsdeletekey
 
 [Icons]
@@ -110,31 +101,30 @@ Name: "{group}\YiIME 译 使用说明"; Filename: "{app}\{#VersionDir}\TSF-Instr
 Name: "{group}\卸载 YiIME 译"; Filename: "{uninstallexe}"
 
 [InstallDelete]
-; The script installation (Install-InputTranslation.ps1) builds the old shortcut in the runner's
-; "Start Menu\Programs".
+; Shortcut left by the script install (Install-InputTranslation.ps1) in the runner's Start
+; Menu\Programs.
 Type: files; Name: "{userprograms}\YiIME settings.lnk"
 Type: files; Name: "{userprograms}\Chinese and English input settings.lnk"
 
 [Run]
 ; ② *S-1-15-2-1 = ALL APPLICATION PACKAGES (by SID, regardless of system language).
 Filename: "{sys}\icacls.exe"; Parameters: """{app}"" /grant *S-1-15-2-1:(OI)(CI)RX /T /C /Q"; Flags: runhidden waituntilterminated; StatusMsg: "Configure application container permissions..."
-; ④ The input method list is for each user: Join as the original user who started the installation
-; program (not the upgraded administrator account).
+; ④ The input list is per user: add it for the user who started the installer, not the elevated
+; admin account.
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\{#VersionDir}\Add-YiIMETip.ps1"" -Add"; Flags: runasoriginaluser runhidden waituntilterminated; StatusMsg: "Add the current user's input method list..."
-; ⑥ The tray runs as the original user (it will also use InstallLayoutOrTip to ensure the input
-; method list again when it starts).
+; ⑥ The tray runs as the original user (and re-checks the input list with InstallLayoutOrTip on
+; start).
 Filename: "{app}\{#VersionDir}\{#Exe}"; WorkingDir: "{app}\{#VersionDir}"; Description: "Start YiIME translation immediately (tray)"; Flags: runasoriginaluser nowait postinstall
 
 [UninstallRun]
-; End all EXEs (trays and floating boxes) in this installation directory, unregister them, and then
-; remove them from the input method list of the person running the uninstaller.
+; Stop all EXEs (tray and input boxes) in this install directory, unregister, then remove the IME
+; from the uninstalling user's input list.
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\{#VersionDir}\Add-YiIMETip.ps1"" -StopUnder ""{app}"""; Flags: runhidden waituntilterminated; RunOnceId: "StopYiIME"
 Filename: "{sys}\regsvr32.exe"; Parameters: "/u /s ""{app}\{#VersionDir}\{#Dll}"""; Flags: runhidden waituntilterminated; RunOnceId: "UnregTip"
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\{#VersionDir}\Add-YiIMETip.ps1"" -Remove"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveTip"
 
 [UninstallDelete]
-; Version directories left over from previous versions (DLLs still occupied will be deleted after
-; Windows restarts).
+; Version directories from earlier versions (DLLs still in use are deleted after a reboot).
 Type: filesandordirs; Name: "{app}"
 
 [Code]

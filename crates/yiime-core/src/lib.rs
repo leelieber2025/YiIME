@@ -1,15 +1,15 @@
-//! The platform-agnostic core of YiIME translation.
+//! Platform-independent core of YiIME.
 //!
-//! Layering: dictionary/index, candidate engine, input state and setting model are all placed in
-//! the core that does not depend on the operating system; Windows' TSF DLL and floating box EXE are
-//! only responsible for system interfaces (registry, DPAPI, windows, key injection).
+//! Dictionaries and indexes, the candidate engine, input state and settings live here without OS
+//! dependencies; the Windows TSF DLL and input-box EXE only handle system interfaces (registry,
+//! DPAPI, windows, key injection).
 //!
-//! Storage is always via traits: [`OptionStore`] for setting switches (HKCU registry on Windows),
-//! and [`Sealer`] for encryption of keys and input memory (DPAPI on Windows).
+//! Storage goes through traits: [`OptionStore`] for switches (HKCU registry on Windows) and
+//! [`Sealer`] for encrypting keys and history (DPAPI on Windows).
 //!
-//! Features: `engine` (input engine and simplified and traditional vocabulary), `bundled` (built-in
-//! vocabulary), `translate` (translation client), all enabled by default. The TSF DLL only sets the
-//! model, shortcut keys and punctuation mapping, turning off all features to maintain volume.
+//! Features: `engine` (input engine and Simplified→Traditional tables), `bundled` (built-in
+//! dictionaries), `translate` (translation client), all on by default. The TSF DLL uses only the
+//! settings model, shortcuts and punctuation mapping, with every feature off to stay small.
 
 #[cfg(feature = "engine")]
 mod dict;

@@ -5,18 +5,15 @@ use std::sync::{Arc, OnceLock};
 pub enum Source {
     Wubi,
     Pinyin,
-    /// Candidates matched by the Wubi code containing the universal key z (same as Microsoft Wubi,
-    /// z replaces any code).
+    /// Wubi code with the wildcard `z`, which stands for any letter (as in Microsoft Wubi).
     Wildcard,
-    /// The first letter of Pinyin is simplified (yxyy → single-minded, zgr → Chinese), and the full
-    /// Pinyin and simplified version are mixed (zhongg → Chinese).
+    /// Pinyin initials (`yxyy` → 一心一意, `zgr` → 中国人), or initials mixed with full syllables
+    /// (`zhongg` → 中国).
     Abbreviation,
-    /// The pinyin candidate (zhonggou → China) resulting from the corrected misspelling is ranked
-    /// after the accurate result.
+    /// Pinyin with a typo corrected (`zhonggou` → 中国); ranked after exact matches.
     Corrected,
-    /// When the whole string is not in the lexicon, the first part of the word is cut out according
-    /// to syllables (after selecting, [`Candidate::rest`] remains in the encoding to continue
-    /// selecting).
+    /// The whole code is not a word: the leading syllables form one, and [`Candidate::rest`] keeps
+    /// the rest of the code for the next pick.
     Partial,
 }
 
@@ -25,60 +22,51 @@ pub struct Candidate {
     pub text: String,
     pub source: Source,
     pub complete: bool,
-    /// Codes that have not been used after selecting this candidate (only [`Source::Partial`] is
-    /// not empty).
+    /// Code left after picking this candidate; non-empty only for [`Source::Partial`].
     pub rest: String,
 }
 
 #[derive(Clone)]
 struct Entry {
-    /// Shared string: The words in the large dictionary are hung on both Pinyin and Wubi tables at
-    /// the same time, and only one copy is saved.
+    /// Large-lexicon words sit in both the pinyin and the Wubi table; they share one copy.
     text: Arc<str>,
     weight: u64,
-    /// Pinyin original encoding (syllables separated by spaces, such as `xi an`), used for matching
-    /// `'` diaphragms; Wubi is empty.
+    /// Pinyin syllables separated by spaces (`xi an`), used to match `'` separators; empty for
+    /// Wubi.
     syllables: Box<str>,
 }
 
 pub struct MixedInput {
     wubi: BTreeMap<String, Vec<Entry>>,
     pinyin: BTreeMap<String, Vec<Entry>>,
-    /// Single character → (shortest Wubi code, longest Wubi code) is used to mark Wubi codes for
-    /// pinyin candidates; the coding of words is derived from the single character full code
-    /// according to the standard coding rules and checked in the Wubi table. No additional index is
-    /// created to save memory.
+    /// Character → (shortest, longest Wubi code), used to annotate pinyin candidates. Word codes
+    /// are derived from character full codes by the standard rules and checked against the Wubi
+    /// table, so no extra index is kept.
     wubi_codes: HashMap<char, (Box<str>, Box<str>)>,
     frequency: Option<FrequencyWords>,
-    /// Jianpin index: The first input may be the encoding of Jianpin (it will not slow down the
-    /// startup).
+    /// Pinyin-initials index, built on first use so startup stays fast.
     abbreviations: OnceLock<Abbreviations>,
-    /// Legal syllable table: Created when syllables need to be segmented for the first time.
+    /// Valid syllables, built on first use.
     syllable_table: OnceLock<spell::SyllableTable>,
 }
 
 #[path = "spell.rs"]
 mod spell;
 
-/// Simplified spelling index: The keys are sorted in byte order, and a continuous interval is
-/// bifurcated during the query. No separate table is created for each prefix; the key here is the
-/// "first letter of each syllable" (zh/ch/sh is folded into z/c/s), and the tongue information is
-/// recorded separately (capital Z/C/S). Use it to filter when the query writes zh/ch/sh.
+/// Pinyin-initials index. Keys are the first letter of each syllable (zh/ch/sh folded to z/c/s),
+/// sorted bytewise so a prefix query is a binary-searched range. Retroflex initials are kept
+/// separately as uppercase Z/C/S to filter queries that spell out zh/ch/sh.
 struct Abbreviations {
-    /// Multi-syllable words in Rime Pinyin dictionary: (initial consonant string, raised tongue
-    /// capital), words, word frequency, syllables, sorted by folded lowercase keys.
+    /// Multi-syllable Rime pinyin words, sorted by folded key.
     rime: Vec<RimeAbbreviation>,
-    /// Large lexicon line number, sorted by the folded first letter key (words with the same key
-    /// with the highest frequency come first).
+    /// Large-lexicon line numbers sorted by folded key, most frequent first within a key.
     frost: Vec<u32>,
 }
 
-/// One item in the simplified spelling index: (initial consonant string, capitalized with raised
-/// tongue), word, word frequency, syllable.
+/// (initials with Z/C/S for zh/ch/sh, word, frequency, syllables).
 type RimeAbbreviation = (Box<str>, Arc<str>, u64, Box<str>);
 
-/// Syllable string (space separated) → the first letter of each syllable; zh/ch/sh is written as
-/// capital Z/C/S.
+/// First letter of each syllable; zh/ch/sh become Z/C/S.
 fn syllable_initials(syllables: &str) -> String {
     syllables
         .split(' ')
@@ -97,17 +85,16 @@ fn syllable_initials(syllables: &str) -> String {
         .collect()
 }
 
-/// The collapsed initial letter key (zh/ch/sh → z/c/s) does not allocate memory.
+/// Folded initials (zh/ch/sh → z/c/s) without allocating.
 fn folded_initials(syllables: &str) -> impl Iterator<Item = u8> + '_ {
     syllables
         .split(' ')
         .filter_map(|syllable| syllable.bytes().next())
 }
 
-/// Divide the simplified pinin input into the first letters of syllables: zh/ch/sh can be used as
-/// either an initial consonant or two initial letters (zh → font size). Return (collapse key,
-/// per-bit requirement), the requirement is 0, which means no flat tongue is allowed, otherwise it
-/// is required uppercase Z/C/S.
+/// Parses initials input. zh/ch/sh may be one initial or two letters (`zh` → 字号), so a code has
+/// several parses: (folded key, per-letter requirement), where 0 accepts any initial and Z/C/S
+/// requires zh/ch/sh.
 fn abbreviation_parses(code: &str) -> Vec<(String, Vec<u8>)> {
     fn walk(rest: &[u8], key: &mut String, need: &mut Vec<u8>, out: &mut Vec<(String, Vec<u8>)>) {
         let Some(&first) = rest.first() else {
@@ -147,8 +134,8 @@ fn initials_match(initials: &str, need: &[u8]) -> bool {
             .all(|(have, want)| *want == 0 || have == *want)
 }
 
-/// Compact index of large thesaurus at runtime: line range + line number sorted by Pinyin key
-/// (remove spaces)/Wubi code, with words with the highest frequency in the same key first.
+/// Large-lexicon index: line ranges plus line numbers sorted by pinyin key (without spaces) and by
+/// Wubi code, most frequent first within a key.
 struct FrequencyWords {
     text: String,
     lines: Vec<(u32, u32)>,
@@ -183,9 +170,8 @@ impl FrequencyWords {
             by_pinyin: Vec::new(),
             by_code: Vec::new(),
         };
-        // First sort by word frequency in descending order, and then by key for stable sorting.
-        // Within the same key, keep words with higher frequency first; use cache keys to avoid
-        // repeatedly splitting lines.
+        // Sort by frequency first, then stably by key, so each key lists its most frequent words
+        // first.
         let mut by_weight: Vec<u32> = (0..words.lines.len() as u32).collect();
         by_weight.sort_by_cached_key(|i| std::cmp::Reverse(words.line(*i).weight));
         let mut by_pinyin = by_weight.clone();
@@ -197,7 +183,6 @@ impl FrequencyWords {
         words
     }
 
-    /// All line numbers, in descending order of word frequency.
     fn by_weight_order(&self) -> Vec<u32> {
         let mut order: Vec<u32> = (0..self.lines.len() as u32).collect();
         order.sort_by_cached_key(|i| std::cmp::Reverse(self.line(*i).weight));
@@ -244,14 +229,13 @@ impl FrequencyWords {
     }
 }
 
-/// Pinyin key: byte sequence after removing the spaces between syllables.
+/// Pinyin key: the syllables without spaces.
 fn pinyin_key(pinyin: &str) -> std::iter::Filter<std::str::Bytes<'_>, fn(&u8) -> bool> {
     pinyin.bytes().filter(|b| *b != b' ')
 }
 
 impl MixedInput {
-    /// Directly read the text of Rime's Wubi and Pinyin dictionaries; each line is "word <TAB>
-    /// encoding <TAB> word frequency".
+    /// Rime Wubi and pinyin dictionaries, one `word<TAB>code<TAB>frequency` per line.
     pub fn from_rime(wubi: &str, pinyin: &str) -> Self {
         let wubi = parse_dictionary(wubi, false);
         let wubi_codes = code_index(&wubi);
@@ -265,8 +249,8 @@ impl MixedInput {
         }
     }
 
-    /// Thesaurus packaged with the program: Wubi 86 + Pinyin + Supplementary Idioms (programmed
-    /// into binary). Large lexicon and user lexicon are loaded separately at runtime.
+    /// Dictionaries compiled into the binary: Wubi 86, pinyin and supplementary words. The large
+    /// lexicon and user words are loaded at runtime.
     #[cfg(feature = "bundled")]
     pub fn bundled() -> Self {
         Self::from_rime(
@@ -301,9 +285,8 @@ impl MixedInput {
                 .frequency
                 .as_ref()
                 .map(|words| {
-                    // by_pinyin is already "the most frequent words with the same key come first".
-                    // After the stable sorting, the keys with the same initial letter will still be
-                    // roughly ranked according to word frequency.
+                    // Frequency order first, so the stable sort keeps the most frequent words first
+                    // within each key.
                     let mut order: Vec<u32> = words
                         .by_weight_order()
                         .into_iter()
@@ -319,8 +302,8 @@ impl MixedInput {
         })
     }
 
-    /// The simplified pinyin index and syllable table are pre-built (can be called in the
-    /// background thread to avoid getting stuck when typing for the first time).
+    /// Builds the initials index and syllable table ahead of time (from a background thread, so the
+    /// first keystroke does not stall).
     pub fn warm_up(&self) {
         let _ = self.abbreviation_index();
         let _ = self.syllables();
@@ -337,8 +320,7 @@ impl MixedInput {
         })
     }
 
-    /// Candidates with the same pinyin key: original pinyin dictionary + large thesaurus, uniformly
-    /// sorted by word frequency.
+    /// Words for a pinyin key from the Rime dictionary and the large lexicon, sorted by frequency.
     fn homophones(&self, key: &str) -> Vec<(Arc<str>, u64, Box<str>)> {
         let mut homophones: Vec<(Arc<str>, u64, Box<str>)> = self
             .pinyin
@@ -358,8 +340,8 @@ impl MixedInput {
         homophones
     }
 
-    /// Candidates for simplified spelling (at least two initial letters), only words with exactly
-    /// the same number of syllables, sorted by word frequency.
+    /// Words for pinyin initials (at least two), with exactly that many syllables, sorted by
+    /// frequency.
     fn abbreviation(&self, code: &str, limit: usize) -> Vec<Arc<str>> {
         if code.len() < 2 || code.len() > 12 || !code.bytes().all(|b| b.is_ascii_lowercase()) {
             return Vec::new();
@@ -403,9 +385,8 @@ impl MixedInput {
             .collect()
     }
 
-    /// Merged into the supplementary Wubi Dictionary (existing words under the same code are not
-    /// repeated); rearranged according to word frequency, the original dictionary has high word
-    /// frequency and is ranked first.
+    /// Merges supplementary Wubi words (skipping words already under the same code), then re-sorts
+    /// by frequency; the original dictionary has higher frequencies and stays first.
     pub fn with_extra_wubi(mut self, extra: &str) -> Self {
         for (code, entries) in parse_dictionary(extra, false) {
             let slot = self.wubi.entry(code).or_default();
@@ -420,19 +401,16 @@ impl MixedInput {
         self
     }
 
-    /// Hang up the runtime large vocabulary (derived from rime-frost, each line "Word <TAB> Pinyin
-    /// <TAB> Word frequency <TAB> Wubi word code"). The original text is saved as a whole block,
-    /// and only two row number indexes (about 10MB + 2.4MB) are built based on encoding. They are
-    /// not expanded into tables, saving memory and fast startup. Pinyin: sorted by word frequency
-    /// together with the homophones in the original Pinyin dictionary; Wubi: sorted after the
-    /// original words (by word frequency).
+    /// Attaches the large lexicon (from rime-frost, `word<TAB>pinyin<TAB>frequency<TAB>Wubi code`
+    /// per line). The text is kept as one block with two line-number indexes (about 10 MB + 2.4 MB)
+    /// instead of expanded tables, to save memory and start fast. Pinyin words are ranked together
+    /// with the Rime homophones by frequency; Wubi words go after the original words.
     pub fn with_frequency_words(mut self, contents: String) -> Self {
         self.frequency = Some(FrequencyWords::new(contents));
         self
     }
 
-    /// Universal key: z in the code matches any code (only Wubi codes of the same length are looked
-    /// at), sorted by word frequency.
+    /// Wildcard `z` matches any letter; only Wubi codes of the same length, sorted by frequency.
     fn wildcard(&self, code: &str, limit: usize) -> Vec<Arc<str>> {
         let prefix: String = code.chars().take_while(|ch| *ch != 'z').collect();
         let mut found: Vec<&Entry> = self
@@ -456,8 +434,8 @@ impl MixedInput {
             .collect()
     }
 
-    /// Incorporate into the user vocabulary (each line of "word coding", separated by white space,
-    /// starting with # is a comment): ranked at the top of the Wubi code.
+    /// Merges user words (`word code` per line, whitespace-separated, `#` starts a comment), ranked
+    /// first under their code.
     pub fn with_user_words(mut self, contents: &str) -> Self {
         for line in contents.lines() {
             let mut fields = line.split_whitespace();
@@ -482,8 +460,7 @@ impl MixedInput {
         self
     }
 
-    /// The number of different candidates under the complete Wubi code (including large
-    /// vocabulary).
+    /// Number of distinct candidates for a full Wubi code, including the large lexicon.
     pub fn wubi_count(&self, code: &str) -> usize {
         let mut texts: HashSet<&str> = self
             .wubi
@@ -498,8 +475,7 @@ impl MixedInput {
         texts.len()
     }
 
-    /// Is there a Pinyin code starting with `code` (including equality), that is, it may still be
-    /// Pinyin if you continue typing.
+    /// Whether some pinyin starts with `code`, i.e. typing on may still give pinyin.
     pub fn pinyin_continues(&self, code: &str) -> bool {
         self.pinyin
             .range(code.to_owned()..)
@@ -511,8 +487,7 @@ impl MixedInput {
                 .is_some_and(|words| words.has_pinyin_prefix(code))
     }
 
-    /// Is it possible that the pinyin is still possible after swapping two adjacent letters (for
-    /// correction of misspellings).
+    /// Whether swapping two adjacent letters could still give pinyin (typo correction).
     pub fn pinyin_continues_after_swap(&self, code: &str) -> bool {
         let bytes = code.as_bytes();
         (0..bytes.len().saturating_sub(1)).any(|i| {
@@ -524,9 +499,8 @@ impl MixedInput {
         })
     }
 
-    /// Tips for Wubi encoding of characters or words: When there is only one length, it is the
-    /// complete code (such as `toln`), and when there is a short code, it is the "shortest short
-    /// code/complete code" (such as `r/rqyy`). Returns None if it is not in the dictionary.
+    /// Wubi code hint for a character or word: the full code (`toln`), or `shortest/full` when a
+    /// short code exists (`r/rqyy`). None if not in the dictionary.
     pub fn wubi_hint(&self, text: &str) -> Option<String> {
         let chars: Vec<char> = text.chars().collect();
         if let [single] = chars[..] {
@@ -562,14 +536,13 @@ impl MixedInput {
         known.then_some(code)
     }
 
-    /// The complete Wubi code is given priority, followed by Pinyin, and finally the Wubi prefix
-    /// candidates are given.
+    /// Full Wubi codes first, then pinyin, then Wubi-prefix candidates.
     pub fn candidates(&self, raw: &str, limit: usize) -> Vec<Candidate> {
         self.candidates_with_page(raw, limit, 9)
     }
 
-    /// Same as [`Self::candidates`], `page_size` is the number of candidates per page: the
-    /// simplified version of the short code only gives two pages (at least 4).
+    /// Like [`Self::candidates`] with `page_size` candidates per page; short codes get at most two
+    /// pages of initials matches (at least 4).
     pub fn candidates_with_page(
         &self,
         raw: &str,
@@ -579,15 +552,12 @@ impl MixedInput {
         self.candidates_with_options(raw, limit, page_size, false)
     }
 
-    /// Same as [`Self::candidates_with_page`]; `fuzzy` turns on fuzzy sounds (z/zh, n/l,
-    /// an/ang...).
+    /// Like [`Self::candidates_with_page`]; `fuzzy` enables fuzzy pinyin (z/zh, n/l, an/ang…).
     ///
-    /// Sequence: complete Wubi code → precise pinyin → fuzzy sound → correction of misspellings →
-    /// simplified spelling → full spelling, simplified and mixed spelling → whole sentence → first
-    /// words cut out according to syllables → universal key → Wubi prefix. Error correction, mixed
-    /// typing, whole sentences and first paragraphs are only checked when the string of codes is
-    /// neither Wubi code nor a complete Pinyin word, so the Wubi code and the pinyin results that
-    /// can be directly typed are exactly the same as before.
+    /// Order: full Wubi code → exact pinyin → fuzzy pinyin → typo correction → initials → mixed
+    /// full/initials → whole sentence → leading syllables → wildcard → Wubi prefix. Typo
+    /// correction, mixed input, whole sentence and leading syllables run only when the code is
+    /// neither a Wubi code nor a pinyin word, so codes that type directly are unaffected.
     pub fn candidates_with_options(
         &self,
         raw: &str,
@@ -637,8 +607,7 @@ impl MixedInput {
             wubi.extend(words.code(&code).map(|line| Arc::from(line.text)));
         }
         let exact = !wubi.is_empty() || !homophones.is_empty();
-        // Only when the coding is neither Wubi code nor Pinyin words, do error correction, mixed
-        // coding, complete sentences and first paragraphs.
+        // Only when the code is neither a Wubi code nor a pinyin word.
         let spelled = !exact && code.len() >= 4 && code.bytes().all(|b| b.is_ascii_lowercase());
         let (sentence, partial) = if spelled {
             self.segment_fallback(&code, &wanted, page_size.max(1) * 2)
@@ -677,8 +646,7 @@ impl MixedInput {
         if fuzzy {
             push(self.fuzzy(&code, &wanted, limit), Source::Pinyin, true);
         }
-        // The code is neither Wubi code nor Pinyin word: correct the misspelling first (zhonggou →
-        // China).
+        // Typo correction first (`zhonggou` → 中国).
         if spelled {
             push(
                 self.corrections(&code, &wanted, limit),
@@ -686,9 +654,8 @@ impl MixedInput {
                 true,
             );
         }
-        // The simplified pinyin is ranked after the complete pinyin and before the universal key
-        // and Wubi prefix. Short codes (< 4 codes) only give two pages of simplified spellings (at
-        // least 4), followed by five-stroke prefix candidates.
+        // Initials go after full pinyin and before wildcard and Wubi prefix. Short codes (< 4
+        // letters) get at most two pages (at least 4), then Wubi-prefix candidates.
         let abbreviation_limit = if code.len() < 4 {
             limit.min((page_size * 2).max(4))
         } else {
@@ -730,8 +697,8 @@ impl MixedInput {
     }
 }
 
-/// Single word → (shortest Wubi code, longest Wubi code); the one with the same length that comes
-/// first in dictionary order ensures stable results.
+/// Character → (shortest, longest Wubi code); among equal lengths the first in dictionary order
+/// wins, so results are stable.
 fn code_index(wubi: &BTreeMap<String, Vec<Entry>>) -> HashMap<char, (Box<str>, Box<str>)> {
     let mut index: HashMap<char, (Box<str>, Box<str>)> = HashMap::new();
     for (code, entries) in wubi {
@@ -755,8 +722,7 @@ fn code_index(wubi: &BTreeMap<String, Vec<Entry>>) -> HashMap<char, (Box<str>, B
     index
 }
 
-/// The position of the delimiter in the letter string after removing the delimiter, such as `xi'an`
-/// → [2].
+/// Separator positions in the code with separators removed: `xi'an` → [2].
 fn boundaries(code: &str, separator: char) -> Vec<usize> {
     let mut letters = 0;
     let mut result = Vec::new();
@@ -792,8 +758,7 @@ fn parse_dictionary(contents: &str, pinyin: bool) -> BTreeMap<String, Vec<Entry>
             .next()
             .and_then(|value| value.parse::<f64>().ok())
             .unwrap_or(0.0);
-        // Illegal word frequencies such as negative numbers, NaN, overflows, etc. are treated as 0
-        // as missing word frequencies, and no entries are lost.
+        // Negative, NaN or overflowing frequencies count as 0; the entry is kept.
         let weight = if weight.is_finite() && weight >= 0.0 {
             weight as u64
         } else {
@@ -917,11 +882,11 @@ mod tests {
         assert_eq!(input.wubi_hint("翻").as_deref(), Some("toln"));
         assert_eq!(input.wubi_hint("翻译").as_deref(), Some("toyc"));
         assert_eq!(input.wubi_hint("得"), None);
-        // Multi-syllable pinyin words can also be found, with Wubi code for phrases.
+        // Multi-syllable pinyin words get Wubi hints too.
         let words = input.candidates("fanyi", 9);
         assert_eq!(words[0].text, "翻译");
         assert_eq!(words[0].source, Source::Pinyin);
-        // The complete Wubi code still ranks ahead of Pinyin.
+        // A full Wubi code still ranks before pinyin.
         let mixed = MixedInput::from_rime("...\n二\tfan\t1\n", pinyin);
         let list = mixed.candidates("fan", 9);
         assert_eq!(list[0].source, Source::Wubi);
@@ -954,8 +919,7 @@ mod tests {
                 "{word} 应可用 {code} 输入"
             );
         }
-        // Idioms that are only in the supplementary thesaurus can also be entered using the
-        // standard four-character word code.
+        // Idioms only in the supplementary words have the standard four-character code.
         assert!(input.wubi_hint("期期艾艾").is_some());
     }
 
@@ -1002,16 +966,14 @@ mod tests {
         assert_eq!(input.wubi_hint("一心一意").as_deref(), Some("gngu"));
         assert_eq!(texts("zgr"), ["中国人"]);
         assert_eq!(texts("zhgr"), ["中国人"]);
-        // z is not limited to flat and tilted tongues; zh only needs to be tilted and can also be
-        // split into z + h.
+        // `z` matches z and zh; `zh` matches only zh, or z + h.
         assert_eq!(texts("zg"), ["中国", "总共", "字根"]);
         assert_eq!(texts("zhg"), ["中国"]);
         assert_eq!(texts("zh"), ["字号", "知乎"]);
-        // The complete Wubi code is given priority, the complete Pinyin is second, and the
-        // simplified Pinyin is last.
+        // Full Wubi code first, full pinyin second, initials last.
         assert_eq!(texts("ggll")[0], "一");
-        // When there is 1 code per page, at least 4 short codes are given; when there are 9 codes
-        // per page, the maximum number is 18.
+        // One candidate per page still gives at least 4 initials matches; nine per page gives at
+        // most 18.
         let abbreviations = |code: &str, page: usize| {
             input
                 .candidates_with_page(code, 90, page)

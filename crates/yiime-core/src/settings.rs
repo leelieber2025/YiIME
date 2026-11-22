@@ -1,7 +1,7 @@
-//! Set up the model. Storage is through the trait: switch/shortcut key/number of candidates per
-//! page [`OptionStore`] (`HKCU\Software\InputTranslation` on Windows, shared by TSF DLL and EXE),
-//! API configuration is written in settings.json, and the key is encrypted by [`Sealer`] and stored
-//! separately (DPAPI on Windows).
+//! Settings model. Switches, shortcuts and page size go through [`OptionStore`]
+//! (`HKCU\Software\InputTranslation` on Windows, shared by the TSF DLL and the EXE); API settings
+//! live in settings.json, and keys are encrypted with [`Sealer`] and stored separately (DPAPI on
+//! Windows).
 
 use crate::hotkey::{DEFAULT_PLAIN_TOGGLE, parse_hotkey};
 use crate::style::TranslationStyle;
@@ -11,21 +11,20 @@ use std::path::Path;
 
 pub const DEFAULT_URL: &str = "https://api.openai.com/v1/chat/completions";
 pub const DEFAULT_HISTORY_KEY: &str = "Ctrl+Shift+Z";
-/// Default value and allowed range for the number of candidates per page.
+/// Default and allowed range of candidates per page.
 pub const PAGE_SIZE: usize = 9;
 pub const PAGE_SIZE_RANGE: std::ops::RangeInclusive<usize> = 1..=9;
 pub const SETTINGS_FILE: &str = "settings.json";
-/// The encrypted API key file name (the file name from v11 will be used and will be read as usual
-/// after the upgrade).
+/// Encrypted API key file.
 pub const KEY_FILE: &str = "key.dpapi";
-/// User thesaurus: Each line of "word code" is ranked at the top of the code.
+/// User words: `word code` per line, ranked first under that code.
 pub const USER_WORDS_FILE: &str = "user_words.txt";
 
-/// Boolean switch: storage name and default value are conventions between TSF DLL and EXE and are
-/// only defined here.
+/// Boolean switches. Storage names and defaults are shared by the TSF DLL and the EXE and defined
+/// only here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Flag {
-    /// Ordinary Wubi mode (no translation, word selection goes directly to the screen).
+    /// Plain Wubi mode: no translation, picks commit directly.
     PlainMode,
     PunctEnglish,
     Traditional,
@@ -34,16 +33,14 @@ pub enum Flag {
     SemicolonSelect,
     Learn,
     HistoryEnabled,
-    /// Fuzzy sound (off by default).
     FuzzyPinyin,
-    /// When composing characters, `,` `.` also turns the page (default off: Wubi commonly used
-    /// commas and periods top the screen).
+    /// `,` `.` also page while composing (off by default: in Wubi they usually commit the first
+    /// candidate).
     CommaPeriodPaging,
-    /// `[` `]` Determine characters based on words (on by default, single character candidates are
-    /// still punctuation marks).
+    /// `[` `]` pick a character from a word (on by default; with a single-character candidate they
+    /// stay punctuation).
     BracketCharPick,
-    /// Chinese quotation marks, brackets, and book title numbers are automatically matched (off by
-    /// default).
+    /// Auto-close Chinese quotes, brackets and title marks (off by default).
     AutoPair,
 }
 
@@ -90,8 +87,8 @@ impl Flag {
     }
 }
 
-/// Key-value storage (DWORD and short strings). The implementer is responsible for the platform
-/// details, and None will be returned if read fails.
+/// Key-value storage (DWORDs and short strings). Implementations handle the platform; reads return
+/// None on failure.
 pub trait OptionStore {
     fn get_u32(&self, name: &str) -> Option<u32>;
     fn set_u32(&self, name: &str, value: u32) -> bool;
@@ -99,8 +96,8 @@ pub trait OptionStore {
     fn set_string(&self, name: &str, value: &str) -> bool;
 }
 
-/// Typed settings are read and written; the storage is read every time, so changes made by another
-/// process (TSF DLL) can be seen immediately.
+/// Typed settings. Storage is read on every access, so changes from another process (the TSF DLL)
+/// apply immediately.
 pub struct Options<S>(pub S);
 
 impl<S: OptionStore> Options<S> {
@@ -112,13 +109,12 @@ impl<S: OptionStore> Options<S> {
     pub fn set_flag(&self, flag: Flag, on: bool) -> bool {
         self.0.set_u32(flag.name(), on as u32)
     }
-    /// Flips the switch; returns the new value (None if the write fails).
+    /// Flips a switch and returns the new value (None if the write fails).
     pub fn toggle(&self, flag: Flag) -> Option<bool> {
         let on = !self.flag(flag);
         self.set_flag(flag, on).then_some(on)
     }
-    /// Number of candidates per page (out-of-range values ​​are clamped into the range, default
-    /// values ​​when missing).
+    /// Candidates per page, clamped to the allowed range; the default when missing.
     pub fn page_size(&self) -> usize {
         self.0.get_u32("PageSize").map_or(PAGE_SIZE, |value| {
             (value as usize).clamp(*PAGE_SIZE_RANGE.start(), *PAGE_SIZE_RANGE.end())
@@ -128,15 +124,14 @@ impl<S: OptionStore> Options<S> {
         let size = size.clamp(*PAGE_SIZE_RANGE.start(), *PAGE_SIZE_RANGE.end());
         self.0.set_u32("PageSize", size as u32)
     }
-    /// Shortcut text for switching normal/translation mode; if not set or invalid, the default
-    /// value is used.
+    /// Shortcut for toggling plain/translation mode; the default when unset or invalid.
     pub fn plain_toggle_key(&self) -> String {
         self.hotkey("PlainToggleKey", DEFAULT_PLAIN_TOGGLE)
     }
     pub fn set_plain_toggle_key(&self, text: &str) -> bool {
         self.0.set_string("PlainToggleKey", text)
     }
-    /// Enter the memory shortcut text; use the default value if it is not set or is invalid.
+    /// Shortcut for input history; the default when unset or invalid.
     pub fn history_key(&self) -> String {
         self.hotkey("HistoryKey", DEFAULT_HISTORY_KEY)
     }
@@ -151,8 +146,8 @@ impl<S: OptionStore> Options<S> {
     }
 }
 
-/// "Number of candidates per page" input box in the settings window: an error will be reported if
-/// it is not a number, and the number will be clamped to 1–9.
+/// Parses the page-size field in the settings window: an error if not a number, otherwise clamped
+/// to 1–9.
 pub fn parse_page_size(text: &str) -> Result<usize, &'static str> {
     text.trim()
         .parse::<usize>()
@@ -160,7 +155,7 @@ pub fn parse_page_size(text: &str) -> Result<usize, &'static str> {
         .map_err(|_| "每页候选数请填 1～9 的数字")
 }
 
-/// In-memory storage (for testing and headless CLI).
+/// In-memory storage (tests and the CLI).
 #[derive(Default)]
 pub struct MemoryStore {
     numbers: RefCell<HashMap<String, u32>>,
@@ -186,13 +181,13 @@ impl OptionStore for MemoryStore {
     }
 }
 
-/// Encryption/decryption (per current user's DPAPI on Windows). Returns None on failure.
+/// Encryption (per-user DPAPI on Windows). Returns None on failure.
 pub trait Sealer {
     fn seal(&self, data: &[u8]) -> Option<Vec<u8>>;
     fn open(&self, data: &[u8]) -> Option<Vec<u8>>;
 }
 
-/// No encryption (for testing with the headless CLI; do not use for real keys).
+/// No encryption, for tests and the CLI; never for real keys.
 pub struct PlainSealer;
 
 impl Sealer for PlainSealer {
@@ -204,34 +199,32 @@ impl Sealer for PlainSealer {
     }
 }
 
-/// Translate API configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiSettings {
-    /// Translation engine; the default is free Google Translate. If a large model is configured
-    /// when it fails, it will automatically switch to the large model.
+    /// Translation engine; free Google by default. If it fails and an LLM is configured, the LLM is
+    /// used instead.
     pub engine: Engine,
     pub url: String,
     pub model: String,
     pub key: String,
     pub style: TranslationStyle,
     pub custom: String,
-    /// API key for Google Cloud Translation v2 (stored encrypted at [`GOOGLE_KEY_FILE`]).
+    /// Google Cloud Translation v2 API key (stored encrypted in [`GOOGLE_KEY_FILE`]).
     pub google_key: String,
 }
 
-/// The encrypted file name of the Google Cloud key (stored separately from the large model key).
+/// Encrypted Google Cloud key file (separate from the LLM key).
 pub const GOOGLE_KEY_FILE: &str = "google.dpapi";
 
-/// Translation engine. `id` is written to settings.json.
+/// Translation engine; `id` is what settings.json stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Engine {
-    /// Free interface of translate.googleapis.com (no key required, unofficial, may be limited).
+    /// Free translate.googleapis.com endpoint (no key, unofficial, may be rate-limited).
     #[default]
     GoogleFree,
-    /// Google Cloud Translation v2 (requires API key).
+    /// Google Cloud Translation v2 (API key required).
     GoogleCloud,
-    /// OpenAI compatible large model interface (supports translation style and custom
-    /// requirements).
+    /// OpenAI-compatible chat completions API (supports translation style and custom instructions).
     Llm,
 }
 
@@ -274,7 +267,7 @@ impl Default for ApiSettings {
 }
 
 impl ApiSettings {
-    /// Read settings.json and encryption key under `dir`; take default values ​​for missing fields.
+    /// Reads settings.json and the encrypted keys under `dir`; missing fields take defaults.
     pub fn load(dir: &Path, sealer: &dyn Sealer) -> Self {
         let mut settings = Self::default();
         let value = std::fs::read(dir.join(SETTINGS_FILE))
@@ -341,8 +334,8 @@ impl ApiSettings {
             }))?,
         )
     }
-    /// Check before sending request: Press the selected engine. Free Google requires no
-    /// configuration; Google Cloud requires a key; see [`Self::validate_llm`] for a large model.
+    /// Checks before sending a request. Free Google needs nothing; Google Cloud needs a key; see
+    /// [`Self::validate_llm`] for the LLM.
     pub fn validate(&self) -> Result<(), &'static str> {
         match self.engine {
             Engine::GoogleFree => Ok(()),
@@ -353,8 +346,7 @@ impl ApiSettings {
             Engine::Llm => self.validate_llm(),
         }
     }
-    /// Large models are available: address, model, and key are required; only HTTPS is allowed, and
-    /// HTTP is available for the local test address.
+    /// LLM usable: URL, model and key are set; HTTPS only, except HTTP to localhost for testing.
     pub fn validate_llm(&self) -> Result<(), &'static str> {
         let lower = self.url.trim().to_ascii_lowercase();
         if self.url.trim().is_empty() || self.model.trim().is_empty() || self.key.trim().is_empty()
@@ -442,8 +434,6 @@ mod tests {
         assert!(bad.validate().is_ok());
         bad.key = " ".into();
         assert!(bad.validate().is_err());
-        // The default engine is Free Google, which requires no configuration; Google Cloud requires
-        // a key.
         assert_eq!(ApiSettings::default().engine, Engine::GoogleFree);
         assert!(ApiSettings::default().validate().is_ok());
         let cloud = ApiSettings {

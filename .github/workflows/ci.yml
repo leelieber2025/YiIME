@@ -12,6 +12,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.96.1
+          components: rustfmt
+      - run: cargo fmt --all --check
   release-gnu:
     runs-on: ubuntu-latest
     steps:
@@ -38,6 +47,12 @@ jobs:
               if first[key] != second[key]:
                   print(f'::warning::{key} differs across clean builds (not yet reproducible)')
           PY
+      - name: VERSIONINFO matches Cargo.toml
+        run: |
+          version="$(tools/version.sh)"
+          for file in dist/InputTranslation-Portable.exe dist/input_translation_tsf.dll; do
+              strings -el "$file" | grep -qx "$version" || { echo "$file 缺少版本 $version" >&2; exit 1; }
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: windows-gnu
@@ -100,7 +115,7 @@ jobs:
           ./target/release/yiime query zhongguo --pages 1 | tee /tmp/query.txt
           grep -q 中国 /tmp/query.txt
       - name: Package tar.gz
-        run: bash tools/package-linux.sh "$(grep -m1 "^version" crates/yiime-cli/Cargo.toml | cut -d\" -f2)" ${{ matrix.arch }}
+        run: bash tools/package-linux.sh ${{ matrix.arch }}
       - name: Package .deb
         run: |
           cargo install cargo-deb --version 2.9.3 --locked

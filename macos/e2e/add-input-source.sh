@@ -14,7 +14,12 @@ step 3-add-dialog
 /tmp/ax focus $id "Use keyword to filter input sources"
 /tmp/keys type "yiime"
 step 4-filter
-/tmp/ax row $id "YiIME"
+if /tmp/ax row $id "YiIME"; then
+    echo 'visibleInSettings=true'
+else
+    echo 'visibleInSettings=false'
+    exit 1
+fi
 step 5-yiime
 /tmp/ax press $id "Add" 1 || /tmp/ax press $id "Add" 0
 step 6-added

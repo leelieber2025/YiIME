@@ -4,7 +4,7 @@ import Security
 
 var candidatesWindow: IMKCandidates?
 
-/// Maximum hold time for Shift-click (same as Windows version).
+/// Longest Shift hold that counts as a tap (same as Windows).
 private let shiftTapMax: TimeInterval = 0.6
 
 private func takeString(_ pointer: UnsafeMutablePointer<CChar>?) -> String {
@@ -13,9 +13,9 @@ private func takeString(_ pointer: UnsafeMutablePointer<CChar>?) -> String {
     return String(cString: pointer)
 }
 
-/// Large model settings: address and model name in UserDefaults (llmUrl, llmModel of
-/// com.yiime.inputmethod.YiIME), keys in keychain (common password, service YiIME, account llm). If
-/// nothing is filled in, just use free Google Translate.
+/// LLM settings: URL and model in UserDefaults (llmUrl, llmModel of com.yiime.inputmethod.YiIME),
+/// key in the keychain (generic password, service YiIME, account llm). If unset, only free Google
+/// Translate is used.
 private func llmSettings() -> (String, String, String) {
     let defaults = UserDefaults(suiteName: "com.yiime.inputmethod.YiIME") ?? .standard
     let url = defaults.string(forKey: "llmUrl") ?? ""
@@ -62,8 +62,8 @@ class YiIMEInputController: IMKInputController {
         switch event.keyCode {
         case 36, 76: // Return / Enter
             guard active else { return false }
-            // Press Enter during grouping: the code is put into the draft alphabetically (same as
-            // Microsoft Pinyin), and then displayed together on the screen.
+            // Enter while composing: the code goes into the draft as letters (as in Microsoft
+            // Pinyin), then everything is committed.
             yiime_commit_code(ime)
             if event.modifierFlags.contains(.shift) {
                 commit(takeString(yiime_take_text(ime)), client: client)
@@ -115,14 +115,13 @@ class YiIMEInputController: IMKInputController {
         return (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any] ?? [:]
     }
 
-    /// The draft + code is displayed as marked text at the cursor, and the candidate is in the
-    /// candidate window.
+    /// Shows draft + code as marked text at the cursor, candidates in the candidate window.
     private func refresh(client: IMKTextInput) {
         let state = self.state()
         let draft = state["draft"] as? String ?? ""
         let code = state["code"] as? String ?? ""
         let english = state["english"] as? Bool ?? false
-        // English paragraphs are marked with "[英]" at the end (only displayed, not on the screen).
+        // An English segment is marked with "[英]" at the end (display only, never committed).
         let marked = draft + code + (english ? "[英]" : "")
         let attributes: [NSAttributedString.Key: Any] = [.underlineStyle: NSUnderlineStyle.single.rawValue]
         client.setMarkedText(NSAttributedString(string: marked, attributes: attributes),

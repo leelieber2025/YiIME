@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-# Use Inno Setup 6 to generate dist/YiIME-<version>-setup.exe (run windows/build.sh first to
-# generate dist/). Call ISCC.exe through wine on Linux: the ISCC path is specified with the ISCC
-# environment variable (ISCC.exe is found in PATH by default).
+# Builds dist/YiIME-<version>-setup.exe with Inno Setup 6 (run windows/build.sh first). On Linux
+# ISCC.exe runs under wine; set ISCC to its path (default: ISCC.exe on PATH).
 set -euo pipefail
 cd "$(dirname "$0")/.."
-version="${1:-0.1.1}"
+version="$(tools/version.sh)"
 for file in dist/input_translation_tsf.dll dist/InputTranslation-Portable.exe dist/BUILDINFO.txt; do
     [ -f "$file" ] || { echo "缺少 $file，请先运行 windows/build.sh" >&2; exit 1; }
 done

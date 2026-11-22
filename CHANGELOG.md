@@ -2,6 +2,23 @@
 
 本文件记录各版本的主要变化。
 
+## [0.1.2] - 2026-11-21
+
+### 修复
+
+- macOS 安装包：Info.plist 的版本号不再随构建参数更新、CI 仍按 0.1.0 打包的问题；现在版本号统一取自 `Cargo.toml`。
+- 大模型参数降级：只有去掉 temperature / max_tokens 后请求成功才记住该模型，不再因无关的 400（如不支持 system 角色）而永久降级。
+- 网络错误提示带上不含网址的具体原因（如证书、DNS 错误），日志仍只记类别。
+- Windows 资源版本号在 MinGW（windres）下编译失败的问题：版本字符串改为在 .rc 内由数字宏拼出。
+
+### 变更
+
+- 版本号只在根目录 `Cargo.toml` 的 `[workspace.package]` 设置；各 crate、Windows 资源（VERSIONINFO）、安装包、macOS Info.plist 与打包脚本都从这里取（脚本用 `tools/version.sh`），打包脚本不再接受版本参数，`tools/package-linux.sh` 的第一个参数改为架构。
+- CI 增加 `cargo fmt --check`。
+- macOS CI：分别检测输入法的注册、枚举、启用与选中状态，并校验安装包版本与 Info.plist（macOS 预览版仍不随发布提供）。
+- 命令行帮助注明 `--words` 的路径不能以 `-` 开头。
+- 整理代码注释：删去重复代码含义或提及旧版本的注释，改写机器翻译不通顺的注释。
+
 ## [0.1.1] - 2026-11-21
 
 ### 修复

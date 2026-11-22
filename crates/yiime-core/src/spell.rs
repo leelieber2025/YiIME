@@ -1,17 +1,14 @@
-//! Error tolerance and coverage of Pinyin: syllable segmentation, correction of common
-//! misspellings, mixed spelling of full and simplified spelling, fuzzy sounds (optional), and when
-//! the whole sentence is not in the vocabulary, it will be divided into syllables to give the first
-//! part of the word (after selection, the remaining syllables will remain in the code for continued
-//! selection). Behavior refers to Microsoft Pinyin.
+//! Pinyin tolerance: syllable segmentation, common typo correction, mixed full syllables and
+//! initials, optional fuzzy pinyin, and, when the whole code is not a word, a leading-syllables
+//! word with the rest left in the code for the next pick. Behaviour follows Microsoft Pinyin.
 
 use super::{Arc, BTreeSet, HashSet, MixedInput, folded_initials};
 
-/// List of legal syllables (taken from the Pinyin dictionary itself, excluding interjectional
-/// sounds without vowels such as m/n/ng/hm).
+/// Valid syllables, taken from the pinyin dictionary (without vowel-less interjections such as
+/// m/n/ng/hm).
 pub(super) struct SyllableTable {
     full: HashSet<Box<str>>,
-    /// The true prefix of a syllable (zh, zho, gu...), used for "the last paragraph is only half
-    /// typed".
+    /// Proper prefixes of syllables (zh, zho, gu…), for a last syllable that is only half typed.
     prefix: HashSet<Box<str>>,
     max_len: usize,
 }
@@ -48,20 +45,20 @@ impl SyllableTable {
     }
 }
 
-/// Mixed paragraph: the complete syllables must be the same; `Prefix` only requires that the
-/// syllable begins with it (initial consonant or half syllable).
+/// Segment of mixed input: a full syllable must match exactly; `Prefix` only requires the syllable
+/// to start with it (an initial or half a syllable).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Piece<'a> {
     Full(&'a str),
     Prefix(&'a str),
 }
 
-/// Fuzzy sounds: initial consonants z/zh c/ch s/sh n/l, finals an/ang en/eng in/ing (including
-/// ian/iang, uan/uang).
+/// Fuzzy pinyin: initials z/zh c/ch s/sh n/l and finals an/ang en/eng in/ing (including ian/iang,
+/// uan/uang).
 const FUZZY_INITIALS: [(&str, &str); 4] = [("zh", "z"), ("ch", "c"), ("sh", "s"), ("n", "l")];
 const FUZZY_FINALS: [(&str, &str); 3] = [("ang", "an"), ("eng", "en"), ("ing", "in")];
-/// Whole string replacement of common misspellings (there are also two adjacent letters swapped:
-/// ou/uo, ei/ie, ui/iu, ng/gn, hz/zh...).
+/// Whole-code replacements for common typos (swapped adjacent letters such as ou/uo, ei/ie, ui/iu,
+/// ng/gn, hz/zh are handled separately).
 const SPELLING_FIXES: [(&str, &str); 4] =
     [("uen", "un"), ("iou", "iu"), ("uei", "ui"), ("vn", "un")];
 
@@ -89,8 +86,8 @@ fn fuzzy_alternatives(syllable: &str) -> Vec<String> {
 }
 
 impl MixedInput {
-    /// All are divided into complete syllables (each is the end position of each syllable), with
-    /// the fewest syllables first; `forced` is the position of the isolation note.
+    /// Every split into full syllables (end offset of each), fewest syllables first; `forced` holds
+    /// the `'` positions.
     pub(super) fn segmentations(&self, code: &str, forced: &[usize]) -> Vec<Vec<usize>> {
         fn walk(
             table: &SyllableTable,
@@ -128,11 +125,9 @@ impl MixedInput {
         out
     }
 
-    /// Correction of misspellings: swapping adjacent letters (without crossing diaphragms), uen→un,
-    /// etc. After the correction, the whole string can be cut into syllables and there are words in
-    /// the vocabulary. The results are sorted by word frequency (the same word has a higher word
-    /// frequency), marked as an error correction candidate, and ranked after the accurate result of
-    /// the original encoding.
+    /// Typo correction: swap adjacent letters (not across `'`), uen→un and the like, keeping
+    /// results that split into syllables and are words. Sorted by frequency and ranked after exact
+    /// matches of the original code.
     pub(super) fn corrections(&self, code: &str, forced: &[usize], limit: usize) -> Vec<Arc<str>> {
         if code.len() < 3 || code.len() > 24 || !code.bytes().all(|b| b.is_ascii_lowercase()) {
             return Vec::new();
@@ -168,8 +163,8 @@ impl MixedInput {
         rank(found, limit)
     }
 
-    /// Fuzzy sound (when turned on in settings): Change the syllable to the fuzzy corresponding
-    /// sound, and the found words will be ranked after the precise results.
+    /// Fuzzy pinyin (when enabled): swap syllables for their fuzzy counterparts; results go after
+    /// exact matches.
     pub(super) fn fuzzy(&self, code: &str, forced: &[usize], limit: usize) -> Vec<Arc<str>> {
         let mut variants: BTreeSet<String> = BTreeSet::new();
         for ends in self.segmentations(code, forced).into_iter().take(4) {
@@ -208,10 +203,9 @@ impl MixedInput {
         rank(found, limit)
     }
 
-    /// A mixture of Quan Pin and Simplified Pin: each paragraph is a complete syllable or initial
-    /// consonant (the last paragraph can be half a syllable), such as zhongg, zgren, zhongguor,
-    /// xiandai'h. At least one section is complete and one section is incomplete (there are
-    /// separate ways to check pure Quan Pin and pure Simplified Pin).
+    /// Mixed full syllables and initials: each segment is a full syllable or an initial (the last
+    /// may be half a syllable), e.g. zhongg, zgren, zhongguor, xiandai'h. At least one segment is
+    /// full and one is not; pure full pinyin and pure initials are handled elsewhere.
     pub(super) fn mixed_abbreviation(&self, code: &str, limit: usize) -> Vec<Arc<str>> {
         if code.len() < 3 || code.len() > 24 || !code.bytes().all(|b| b.is_ascii_lowercase()) {
             return Vec::new();
@@ -289,8 +283,7 @@ impl MixedInput {
                 return;
             }
             let rest = &code[pos..];
-            // Complete syllables (more than two letters; single-letter syllables a/e/o are treated
-            // as initial consonants).
+            // Full syllables of two or more letters (single-letter a/e/o count as initials).
             for len in (2..=table.max_len.min(rest.len())).rev() {
                 if table.is_syllable(&rest[..len]) {
                     pieces.push(Piece::Full(&rest[..len]));
@@ -298,13 +291,13 @@ impl MixedInput {
                     pieces.pop();
                 }
             }
-            // Half a syllable of the last paragraph (zhonggu → Chinese).
+            // Half-typed last syllable (`zhonggu` → 中国).
             if rest.len() >= 2 && table.is_prefix(rest) && !table.is_syllable(rest) {
                 pieces.push(Piece::Prefix(rest));
                 walk(table, code, code.len(), pieces, out);
                 pieces.pop();
             }
-            // Initial consonants: zh/ch/sh or single letters.
+            // Initials: zh/ch/sh or a single letter.
             if rest.len() >= 2 && matches!(&rest[..2], "zh" | "ch" | "sh") {
                 pieces.push(Piece::Prefix(&rest[..2]));
                 walk(table, code, pos + 2, pieces, out);
@@ -321,11 +314,9 @@ impl MixedInput {
         out
     }
 
-    /// The bottom line when the whole string is not in the lexicon: cut it according to syllables,
-    /// and take the longest front part that can be cut into syllables. Return (whole sentence
-    /// candidate, previous paragraph candidate [(word, remaining code)]). The entire sentence is
-    /// spelled out using the minimum number of words (the number of the same words is the one with
-    /// the highest frequency).
+    /// Fallback when the whole code is not a word: split it into syllables, taking the longest
+    /// leading part that splits. Returns (whole-sentence candidate, leading candidates [(word,
+    /// remaining code)]). The sentence uses the fewest words, then the highest frequency.
     pub(super) fn segment_fallback(
         &self,
         code: &str,
@@ -341,9 +332,8 @@ impl MixedInput {
         }) else {
             return (None, Vec::new());
         };
-        // The remaining tail that has not been cut into syllables can only be half a syllable (the
-        // r in zhongguor); English words such as hello are not full of details, and the spaces
-        // remain on the screen as they are.
+        // The uncovered tail can only be half a syllable (the `r` in `zhongguor`); English words
+        // like `hello` do not split and stay as typed.
         let tail = &code[covered..];
         if !tail.is_empty() && !self.syllables().is_prefix(tail) {
             return (None, Vec::new());
@@ -351,8 +341,7 @@ impl MixedInput {
         let mut starts = vec![0];
         starts.extend(ends.iter().copied());
         let count = ends.len();
-        // Whole sentence: best[j] = (number of words, -Σln(word frequency+1), text), the best
-        // spelling of syllable 0..j.
+        // Whole sentence: best[j] = (word count, -Σln(frequency+1), text) for syllables 0..j.
         let mut sentence = None;
         if covered == code.len() && count >= 2 {
             let mut best: Vec<Option<(usize, f64, String)>> = vec![None; count + 1];
@@ -395,10 +384,10 @@ impl MixedInput {
     }
 }
 
-/// (whole sentence candidate, first paragraph candidate [(word, remaining code)]).
+/// (whole-sentence candidate, leading candidates [(word, remaining code)]).
 type Fallback = (Option<Arc<str>>, Vec<(Arc<str>, String)>);
 
-/// Sort by word frequency in descending order and remove duplicate words from the same word.
+/// Sorts by frequency (descending) and removes duplicates.
 fn rank(mut found: Vec<(Arc<str>, u64)>, limit: usize) -> Vec<Arc<str>> {
     found.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     let mut seen = HashSet::new();

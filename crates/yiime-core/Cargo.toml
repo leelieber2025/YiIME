@@ -1,6 +1,6 @@
 [package]
 name = "yiime-core"
-version = "0.1.1"
+version.workspace = true
 license = "GPL-3.0-only"
 edition = "2024"
 rust-version = "1.85"
@@ -8,12 +8,12 @@ description = "YiIME core: wubi/pinyin lookup, candidate engine, dictionaries, d
 
 [features]
 default = ["engine", "bundled", "translate"]
-# Input engine: dictionary and index, candidate engine, self-learning, draft, Simplified and
-# Traditional conversion (including OpenCC vocabulary about 1MB).
+# Input engine: dictionaries and indexes, candidates, learning, draft, Simplified→Traditional
+# (OpenCC tables, about 1 MB).
 engine = []
-# Bundle Wubi/Pinyin/Supplementary Lexicon into binary (MixedInput::bundled).
+# Compile the Wubi/pinyin/supplementary dictionaries into the binary (MixedInput::bundled).
 bundled = ["engine"]
-# OpenAI compatible translation client (network dependent). TSF DLL is not required.
+# OpenAI-compatible and Google translation client (network). Not needed by the TSF DLL.
 translate = ["dep:ureq", "dep:url"]
 
 [dependencies]

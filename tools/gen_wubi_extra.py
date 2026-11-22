@@ -58,8 +58,7 @@ def main():
     rime = list(parse(ROOT / "data/wubi/wubi86.dict.yaml"))
     existing = {(text, code) for text, code, _ in rime}
     existing_texts = {text for text, _, _ in rime}
-    # Full code of a single word: the longest code of the word, and the one with the highest word
-    # frequency for the same length.
+    # Full code of a character: its longest code, the most frequent one among equal lengths.
     full = {}
     for text, code, weight in rime:
         if len(text) == 1:
@@ -68,8 +67,7 @@ def main():
                 full[text] = (code, weight)
     full = {text: code for text, (code, _) in full.items()}
 
-    # Verification: Use the multi-character words that come with the rime dictionary to check the
-    # coding rules.
+    # Check the word-code rules against the multi-character words in the rime dictionary.
     checked = matched = 0
     rime_codes = {}
     for text, code, _ in rime:

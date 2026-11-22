@@ -1,8 +1,12 @@
 1 ICON "tsf/ime.ico"
 
+// Version string built from the numeric macros (windres drops quotes in -D values).
+#define YIIME_STR(x) #x
+#define YIIME_XSTR(x) YIIME_STR(x)
+#define YIIME_VERSION YIIME_XSTR(YIIME_VERSION_MAJOR.YIIME_VERSION_MINOR.YIIME_VERSION_PATCH)
 1 VERSIONINFO
-FILEVERSION 0,1,1,0
-PRODUCTVERSION 0,1,1,0
+FILEVERSION YIIME_VERSION_MAJOR,YIIME_VERSION_MINOR,YIIME_VERSION_PATCH,0
+PRODUCTVERSION YIIME_VERSION_MAJOR,YIIME_VERSION_MINOR,YIIME_VERSION_PATCH,0
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -12,12 +16,12 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "YiIME"
       VALUE "FileDescription", "YiIME input box and settings"
-      VALUE "FileVersion", "0.1.1"
+      VALUE "FileVersion", YIIME_VERSION
       VALUE "InternalName", "InputTranslation-Portable.exe"
       VALUE "LegalCopyright", "GPL-3.0"
       VALUE "OriginalFilename", "InputTranslation-Portable.exe"
       VALUE "ProductName", "YiIME"
-      VALUE "ProductVersion", "0.1.1"
+      VALUE "ProductVersion", YIIME_VERSION
     END
   END
   BLOCK "VarFileInfo"

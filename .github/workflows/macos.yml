@@ -23,11 +23,23 @@ jobs:
       - name: Tests (core, CLI, FFI)
         run: cargo test -p yiime-core -p yiime-cli -p yiime-ffi
       - name: Build YiIME.app and .pkg
-        run: bash macos/build.sh 0.1.0
+        run: bash macos/build.sh
+      - name: Verify package and input method metadata
+        run: |
+          version="$(tools/version.sh)"
+          app="dist/macos/root/YiIME.app"
+          test -f "dist/YiIME-$version-macos.pkg"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$version"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = 'com.yiime.inputmethod.YiIME'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :InputMethodServerControllerClass' "$app/Contents/Info.plist")" = 'YiIMEInputController'
+          test "$(/usr/libexec/PlistBuddy -c 'Print :ComponentInputModeDict:tsInputModeListKey:com.yiime.inputmethod.YiIME.Hans:TISInputSourceID' "$app/Contents/Info.plist")" = 'com.yiime.inputmethod.YiIME.Hans'
+          lipo -archs "$app/Contents/MacOS/YiIME" | grep -q arm64
+          lipo -archs "$app/Contents/MacOS/YiIME" | grep -q x86_64
+          codesign --verify --verbose "$app"
       # Experimental: macOS 26 runners do not allow enabling an unsigned input method yet.
       - name: End-to-end GUI test (install, select input source, type in TextEdit)
         continue-on-error: true
-        run: bash macos/e2e/run.sh 0.1.0
+        run: bash macos/e2e/run.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
