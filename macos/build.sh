@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Build YiIME.app on macOS (arm64 + x86_64 universal binary) and the installation package
-# dist/YiIME-<version>-macos.pkg (installed to /Library/Input Methods).
+# dist/YiIME-<version>-macos-beta.pkg (installed to /Library/Input Methods).
 #
 # Signing is opt-in: by default the app is ad-hoc signed and the package unsigned. With
 #   MACOS_SIGN_IDENTITY="Developer ID Application: …"      the app is signed with the hardened
@@ -53,9 +53,9 @@ pkgbuild --root "$out/root" --identifier com.yiime.inputmethod.YiIME.pkg --versi
     --install-location "/Library/Input Methods" --scripts macos/pkg-scripts "$out/YiIME-component.pkg"
 if [ -n "${MACOS_INSTALLER_IDENTITY:-}" ]; then
     productbuild --sign "$MACOS_INSTALLER_IDENTITY" --timestamp \
-        --package "$out/YiIME-component.pkg" "dist/YiIME-$version-macos.pkg"
+        --package "$out/YiIME-component.pkg" "dist/YiIME-$version-macos-beta.pkg"
 else
-    productbuild --package "$out/YiIME-component.pkg" "dist/YiIME-$version-macos.pkg"
+    productbuild --package "$out/YiIME-component.pkg" "dist/YiIME-$version-macos-beta.pkg"
 fi
 rm "$out/YiIME-component.pkg"
-ls -l "dist/YiIME-$version-macos.pkg"
+ls -l "dist/YiIME-$version-macos-beta.pkg"

@@ -18,7 +18,7 @@ shot() { screencapture -x "$out/$1.png" 2>>"$out/screencapture.err" || echo "截
 sw_vers | tee "$out/system.txt"
 csrutil status >> "$out/system.txt" 2>&1 || true
 
-check "安装 pkg" sudo installer -pkg "dist/YiIME-$version-macos.pkg" -target /
+check "安装 pkg" sudo installer -pkg "dist/YiIME-$version-macos-beta.pkg" -target /
 app="/Library/Input Methods/YiIME.app"
 check "已装到 /Library/Input Methods" test -x "$app/Contents/MacOS/YiIME"
 check "安装包与应用版本一致" bash -c '[ "$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$1/Contents/Info.plist")" = "$2" ]' _ "$app" "$version"
