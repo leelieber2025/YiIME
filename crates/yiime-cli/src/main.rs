@@ -3,10 +3,13 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
-use yiime_core::{ComposeOptions, Composer, Learned, MixedInput, PAGE_SIZE, PAGE_SIZE_RANGE};
+use yiime_core::{
+    ComposeOptions, Composer, Learned, MixedInput, PAGE_SIZE, PAGE_SIZE_RANGE, Shuangpin,
+};
 
 const USAGE: &str = "用法：yiime translate <中文>…（免费 Google 翻译，打印每次请求的计时）
-      yiime query <编码>… [--page-size N] [--pages N] [--traditional] [--fuzzy] [--pinyin-first] [--all-chars] [--words 文件 | --no-words] [--tsv]
+      yiime query <编码>… [--page-size N] [--pages N] [--traditional] [--fuzzy] [--pinyin-first] [--all-chars] [--shuangpin xiaohe|microsoft|ziranma] [--words 文件 | --no-words] [--tsv]
+      yiime import <词库文件> [--into user_words.txt]（导入搜狗/QQ 导出的 txt 或搜狗 .scel；不加 --into 时打印到标准输出）
   大词库默认查找顺序：--words、环境变量 YIIME_WORDS、程序旁的 InputTranslation-words.txt、
   上级目录中的 data/frost/InputTranslation-words.txt 或 share/yiime/InputTranslation-words.txt。
   --words 的路径不能以 - 开头（写成 ./-文件名）。
@@ -35,6 +38,9 @@ fn main() -> ExitCode {
     if args.first().map(String::as_str) == Some("translate") {
         return translate(&args[1..]);
     }
+    if args.first().map(String::as_str) == Some("import") {
+        return import(&args[1..]);
+    }
     if args.first().map(String::as_str) != Some("query") {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
@@ -46,6 +52,7 @@ fn main() -> ExitCode {
     let mut fuzzy = false;
     let mut pinyin_first = false;
     let mut common_only = true;
+    let mut shuangpin = None;
     let mut tsv = false;
     let mut words: Option<Option<PathBuf>> = None;
     let mut rest = args[1..].iter();
@@ -69,6 +76,12 @@ fn main() -> ExitCode {
             "--fuzzy" => fuzzy = true,
             "--pinyin-first" => pinyin_first = true,
             "--all-chars" => common_only = false,
+            "--shuangpin" => {
+                let Some(scheme) = rest.next().and_then(|id| Shuangpin::from_id(id)) else {
+                    return fail("--shuangpin 需要 xiaohe、microsoft 或 ziranma");
+                };
+                shuangpin = Some(scheme);
+            }
             "--tsv" => tsv = true,
             "--no-words" => words = Some(None),
             "--words" => {
@@ -109,6 +122,7 @@ fn main() -> ExitCode {
         fuzzy,
         pinyin_first,
         common_only,
+        shuangpin,
     };
     let learned = Learned::default();
     let mut composer = Composer::default();
@@ -153,6 +167,46 @@ fn main() -> ExitCode {
             }
         }
     }
+    ExitCode::SUCCESS
+}
+
+/// `yiime import <file> [--into user_words.txt]`: converts another IME's exported user
+/// dictionary into user words.
+fn import(args: &[String]) -> ExitCode {
+    let (file, into) = match args {
+        [file] => (file, None),
+        [file, flag, into] if flag == "--into" => (file, Some(into)),
+        _ => {
+            eprintln!("{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let words = match std::fs::read(file) {
+        Ok(bytes) => match yiime_core::import_words(&bytes) {
+            Ok(words) => words,
+            Err(error) => {
+                eprintln!("{file}：{error}");
+                return ExitCode::FAILURE;
+            }
+        },
+        Err(error) => {
+            eprintln!("读取 {file} 失败：{error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let Some(into) = into else {
+        for (word, code) in &words {
+            println!("{word} {code}");
+        }
+        return ExitCode::SUCCESS;
+    };
+    let existing = std::fs::read_to_string(into).unwrap_or_default();
+    let (contents, added) = yiime_core::merge_user_words(&existing, &words);
+    if let Err(error) = std::fs::write(into, contents) {
+        eprintln!("写入 {into} 失败：{error}");
+        return ExitCode::FAILURE;
+    }
+    eprintln!("已导入 {added} 个新词（共读到 {} 个）", words.len());
     ExitCode::SUCCESS
 }
 

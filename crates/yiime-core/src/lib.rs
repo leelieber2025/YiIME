@@ -19,12 +19,14 @@ mod draft;
 mod engine;
 mod history;
 mod hotkey;
+mod import;
 mod inline;
 #[cfg(feature = "engine")]
 mod keys;
 #[cfg(feature = "engine")]
 mod learn;
 mod settings;
+mod shuangpin;
 mod style;
 #[cfg(feature = "engine")]
 mod table;
@@ -44,11 +46,16 @@ pub use engine::{
 };
 pub use history::{HISTORY_CAP, HISTORY_FILE, History, HistoryEntry, history_label};
 pub use hotkey::{DEFAULT_PLAIN_TOGGLE, Hotkey, parse_hotkey};
+pub use import::{
+    ImportedWord, decode_text, import_words, merge_user_words, parse_scel, parse_text_export,
+};
 pub use inline::{
     SHIFT_TAP_MAX, ShiftTap, is_literal_in_english, is_numpad_digit, is_shift_key, literal_code,
 };
 #[cfg(feature = "engine")]
-pub use keys::{KeyAction, KeyContext, classify_char, with_separator};
+pub use keys::{
+    KeyAction, KeyContext, classify_char, semicolon_is_code, shuangpin_selection, with_separator,
+};
 #[cfg(feature = "engine")]
 pub use learn::{
     HALF_LIFE_DAYS, LEARNED_FILE, LEGACY_LEARNED_FILE, Learned, MAX_ENTRIES, PROMOTE_SCORE,
@@ -59,6 +66,7 @@ pub use settings::{
     KEY_FILE, MemoryStore, OptionStore, Options, PAGE_SIZE, PAGE_SIZE_RANGE, PlainSealer,
     SETTINGS_FILE, Sealer, USER_WORDS_FILE, parse_page_size,
 };
+pub use shuangpin::Shuangpin;
 pub use style::{TranslationStyle, system_prompt};
 #[cfg(feature = "engine")]
 pub use text::to_traditional;

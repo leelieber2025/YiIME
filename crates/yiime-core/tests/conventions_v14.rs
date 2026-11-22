@@ -16,6 +16,7 @@ fn bracket_picks_first_or_last_char_of_word() {
         fuzzy: false,
         pinyin_first: false,
         common_only: false,
+        shuangpin: None,
     };
     composer.set_code(&input, "zgr".into(), &options, &Learned::default());
     let first = &composer.candidates[0].text;

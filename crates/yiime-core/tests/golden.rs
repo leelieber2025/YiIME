@@ -28,6 +28,7 @@ fn options(page_size: usize) -> ComposeOptions {
         fuzzy: false,
         pinyin_first: false,
         common_only: false,
+        shuangpin: None,
     }
 }
 
@@ -301,6 +302,7 @@ fn pinyin_first_ranks_pinyin_and_disables_wubi_automatic_commits() {
     let options = ComposeOptions {
         pinyin_first: true,
         common_only: false,
+        shuangpin: None,
         ..options(9)
     };
     let learned = Learned::default();

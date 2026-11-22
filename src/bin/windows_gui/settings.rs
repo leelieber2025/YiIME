@@ -221,6 +221,50 @@ pub(super) unsafe extern "system" fn settings_proc(
                 let on = option(*option_key) != (*option_key == Flag::PunctEnglish);
                 SendMessageW(checkbox, BM_SETCHECK, on as usize, 0);
             }
+            // Input scheme: Wubi + full pinyin, or a Shuangpin layout; and dictionary import.
+            let scheme_y = 330 + (OPTION_BOXES.len() as i32 + 1) / 2 * 26 + 4;
+            label(hwnd, "输入方案", 16, scheme_y + 4, 80);
+            let scheme = control(
+                hwnd,
+                "COMBOBOX",
+                "",
+                CBS_DROPDOWNLIST as u32 | WS_VSCROLL | WS_TABSTOP,
+                100,
+                scheme_y,
+                196,
+                160,
+                SETTINGS_SCHEME,
+            );
+            SendMessageW(
+                scheme,
+                CB_ADDSTRING,
+                0,
+                wide("五笔 + 全拼（默认）").as_ptr() as isize,
+            );
+            for item in Shuangpin::ALL {
+                SendMessageW(
+                    scheme,
+                    CB_ADDSTRING,
+                    0,
+                    wide(item.label()).as_ptr() as isize,
+                );
+            }
+            let current = OPTIONS
+                .shuangpin()
+                .and_then(|current| Shuangpin::ALL.iter().position(|item| *item == current))
+                .map_or(0, |index| index + 1);
+            SendMessageW(scheme, CB_SETCURSEL, current, 0);
+            control(
+                hwnd,
+                "BUTTON",
+                "导入搜狗/QQ 词库…",
+                WS_TABSTOP,
+                304,
+                scheme_y - 2,
+                120,
+                28,
+                SETTINGS_IMPORT,
+            );
             let history = control(
                 hwnd,
                 "BUTTON",
@@ -504,6 +548,17 @@ pub(super) unsafe extern "system" fn settings_proc(
                         || !OPTIONS.set_plain_toggle_key(&hotkey)
                         || !set_option(Flag::HistoryEnabled, history_on)
                         || !OPTIONS.set_page_size(page)
+                        || !OPTIONS.set_shuangpin(
+                            usize::try_from(SendMessageW(
+                                GetDlgItem(hwnd, SETTINGS_SCHEME),
+                                CB_GETCURSEL,
+                                0,
+                                0,
+                            ))
+                            .ok()
+                            .and_then(|index| index.checked_sub(1))
+                            .and_then(|index| Shuangpin::ALL.get(index).copied()),
+                        )
                         || !OPTIONS.set_history_key(&history_key)
                         || (!history_on && !clear_history())
                         || !OPTION_BOXES.iter().all(|(id, _, option_key)| {
@@ -553,6 +608,9 @@ pub(super) unsafe extern "system" fn settings_proc(
                         );
                     }
                 }
+                SETTINGS_IMPORT => {
+                    import_dictionary(hwnd);
+                }
                 SETTINGS_USER_WORDS => {
                     // Open user words in Notepad (creating the file with a short header if
                     // missing); changes apply the next time the box opens.
@@ -587,4 +645,48 @@ pub(super) unsafe extern "system" fn settings_proc(
         },
         _ => unsafe { DefWindowProcW(hwnd, msg, w, l) },
     }
+}
+
+/// Picks an exported Sogou/QQ user dictionary (.txt) or a Sogou cell dictionary (.scel) and
+/// appends its words to user_words.txt; they apply the next time the box opens.
+unsafe fn import_dictionary(hwnd: HWND) {
+    let mut buffer = vec![0u16; 1024];
+    let filter = wide("词库文件 (*.txt;*.scel)\0*.txt;*.scel\0所有文件\0*.*\0");
+    let title = wide("导入搜狗/QQ 用户词库或搜狗细胞词库");
+    let mut dialog: OPENFILENAMEW = unsafe { std::mem::zeroed() };
+    dialog.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+    dialog.hwndOwner = hwnd;
+    dialog.lpstrFilter = filter.as_ptr();
+    dialog.lpstrFile = buffer.as_mut_ptr();
+    dialog.nMaxFile = buffer.len() as u32;
+    dialog.lpstrTitle = title.as_ptr();
+    dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    if unsafe { GetOpenFileNameW(&mut dialog) } == 0 {
+        return;
+    }
+    let len = buffer.iter().position(|unit| *unit == 0).unwrap_or(0);
+    let path = PathBuf::from(String::from_utf16_lossy(&buffer[..len]));
+    let Some(target) = user_words_path() else {
+        return;
+    };
+    let result = std::fs::read(&path)
+        .map_err(|error| error.to_string())
+        .and_then(|bytes| yiime_core::import_words(&bytes).map_err(str::to_owned))
+        .and_then(|words| {
+            let existing = std::fs::read_to_string(&target).unwrap_or_default();
+            let (contents, added) = yiime_core::merge_user_words(&existing, &words);
+            let _ = std::fs::create_dir_all(target.parent().unwrap_or(&target));
+            if yiime_core::write_atomically(&target, contents.as_bytes()) {
+                Ok((added, words.len()))
+            } else {
+                Err(format!("无法写入 {}", target.display()))
+            }
+        });
+    let text = match result {
+        Ok((added, total)) => {
+            format!("已导入 {added} 个新词（文件中共 {total} 个），下次打开输入框生效。")
+        }
+        Err(error) => format!("导入失败：{error}"),
+    };
+    unsafe { message(hwnd, &text) };
 }

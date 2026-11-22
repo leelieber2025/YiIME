@@ -636,16 +636,29 @@ impl MixedInput {
         } else {
             Vec::new()
         };
+        // User words (e.g. imported pinyin words) also come first in pinyin-only codes; otherwise
+        // they lead the exact Wubi slot below.
+        let user: Vec<Arc<str>> = if pinyin_only {
+            self.user.get(&code).cloned().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         if raw.contains('\'') {
             let mut seen = HashSet::new();
-            let separated = homophones
+            let separated = user
                 .iter()
-                .filter(|(_, _, syllables)| {
-                    let own = boundaries(syllables, ' ');
-                    wanted.iter().all(|offset| own.contains(offset))
-                })
-                .filter(|(text, _, _)| seen.insert(text.clone()))
-                .map(|(text, _, _)| Candidate {
+                .cloned()
+                .chain(
+                    homophones
+                        .iter()
+                        .filter(|(_, _, syllables)| {
+                            let own = boundaries(syllables, ' ');
+                            wanted.iter().all(|offset| own.contains(offset))
+                        })
+                        .map(|(text, _, _)| text.clone()),
+                )
+                .filter(|text| seen.insert(text.clone()))
+                .map(|text| Candidate {
                     text: text.to_string(),
                     source: Source::Pinyin,
                     complete: true,
@@ -657,7 +670,7 @@ impl MixedInput {
                 return separated;
             }
         }
-        let mut wubi: Vec<Arc<str>> = Vec::new();
+        let mut wubi: Vec<Arc<str>> = user;
         if !pinyin_only {
             wubi.extend(self.wubi_slot(&code).into_iter().map(|(text, _)| text));
             if let Some(words) = &self.frequency {

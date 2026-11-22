@@ -4,6 +4,7 @@
 //! Windows).
 
 use crate::hotkey::{DEFAULT_PLAIN_TOGGLE, parse_hotkey};
+use crate::shuangpin::Shuangpin;
 use crate::style::TranslationStyle;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -132,6 +133,17 @@ impl<S: OptionStore> Options<S> {
     pub fn set_page_size(&self, size: usize) -> bool {
         let size = size.clamp(*PAGE_SIZE_RANGE.start(), *PAGE_SIZE_RANGE.end());
         self.0.set_u32("PageSize", size as u32)
+    }
+    /// Shuangpin layout (`Shuangpin` string: `xiaohe`, `microsoft`, `ziranma`); None (the default)
+    /// is Wubi + full pinyin.
+    pub fn shuangpin(&self) -> Option<Shuangpin> {
+        self.0
+            .get_string("Shuangpin")
+            .and_then(|id| Shuangpin::from_id(&id))
+    }
+    pub fn set_shuangpin(&self, scheme: Option<Shuangpin>) -> bool {
+        self.0
+            .set_string("Shuangpin", scheme.map_or("", Shuangpin::id))
     }
     /// Shortcut for toggling plain/translation mode; the default when unset or invalid.
     pub fn plain_toggle_key(&self) -> String {

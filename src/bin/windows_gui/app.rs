@@ -41,6 +41,9 @@ use windows_sys::Win32::System::Registry::{
 use windows_sys::Win32::System::Threading::{
     AttachThreadInput, GetCurrentThreadId, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
 };
+use windows_sys::Win32::UI::Controls::Dialogs::{
+    GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
 use windows_sys::Win32::UI::Controls::{
     EM_GETSEL, EM_LIMITTEXT, EM_REPLACESEL, EM_SCROLLCARET, EM_SETSEL,
 };
@@ -59,8 +62,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use yiime_core::{
     ApiSettings, ComposeOptions, Composer, Engine, Flag, HISTORY_CAP, HISTORY_FILE, History,
     HistoryEntry, Hotkey, LEARNED_FILE, Learned, LetterRules, MAX_CODE_LEN, MixedInput,
-    OptionStore, Options, Quotes, Sealer, TranslationStyle, USER_WORDS_FILE, history_label,
-    parse_hotkey, parse_page_size, selection_index, single_line,
+    OptionStore, Options, Quotes, Sealer, Shuangpin, TranslationStyle, USER_WORDS_FILE,
+    history_label, parse_hotkey, parse_page_size, selection_index, single_line,
 };
 
 const DRAFT: i32 = 103;
@@ -97,8 +100,11 @@ const OPTION_BOXES: [(i32, &str, Flag); 12] = [
     (229, "拼音优先（关闭五笔顶字）", Flag::PinyinFirst),
     (230, "只显示常用字（隐藏生僻字）", Flag::CommonOnly),
 ];
+/// Height of the input-scheme row (Wubi + pinyin / Shuangpin layouts, dictionary import) below
+/// the switches.
+const SCHEME_ROW: i32 = 34;
 /// Each extra row of switches moves the controls below it down.
-const OPTION_SHIFT: i32 = (OPTION_BOXES.len() as i32 + 1) / 2 * 26 - 3 * 26;
+const OPTION_SHIFT: i32 = (OPTION_BOXES.len() as i32 + 1) / 2 * 26 - 3 * 26 + SCHEME_ROW;
 const ID_OK: i32 = 1;
 const ID_CANCEL: i32 = 2;
 const TRAY_SETTINGS: usize = 1;
@@ -140,6 +146,8 @@ const SETTINGS_AZURE_KEY: i32 = 226;
 const SETTINGS_AZURE_REGION: i32 = 227;
 const SETTINGS_DEEPL_KEY: i32 = 228;
 const SETTINGS_FALLBACK: i32 = 231;
+const SETTINGS_SCHEME: i32 = 232;
+const SETTINGS_IMPORT: i32 = 233;
 /// Height of the Translation Engine row at the top of the settings window; the other controls
 /// move down by this much.
 const ENGINE_SHIFT: i32 = 168;
@@ -376,6 +384,7 @@ fn compose_options() -> ComposeOptions {
         fuzzy: option(Flag::FuzzyPinyin),
         pinyin_first: option(Flag::PinyinFirst),
         common_only: option(Flag::CommonOnly),
+        shuangpin: OPTIONS.shuangpin(),
     }
 }
 fn history_path() -> Option<PathBuf> {

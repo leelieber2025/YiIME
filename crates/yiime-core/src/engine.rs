@@ -5,6 +5,7 @@
 
 use crate::dict::{Candidate, MixedInput, Source};
 use crate::learn::Learned;
+use crate::shuangpin::Shuangpin;
 use crate::text::to_traditional;
 use std::collections::HashMap;
 
@@ -25,6 +26,9 @@ pub struct ComposeOptions {
     pub pinyin_first: bool,
     /// Hide rare characters and low-frequency initials matches (on by default in the IME).
     pub common_only: bool,
+    /// Shuangpin layout: the code is double-pinyin keys, looked up as full pinyin only (no
+    /// Wubi, no Wubi auto-commit rules). None = Wubi + full pinyin.
+    pub shuangpin: Option<Shuangpin>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -67,18 +71,56 @@ impl Composer {
     ) {
         let size = options.page_size;
         self.page_size = size;
-        let mut candidates = if code.is_empty() {
-            Vec::new()
-        } else {
-            input.candidates_filtered(
-                &code,
+        // Shuangpin with an odd key count ends in a bare initial: show the candidates of the
+        // complete syllables, each leaving that key to compose on.
+        let pending = match options.shuangpin {
+            Some(_) if code.replace('\'', "").len() % 2 == 1 => code.chars().last(),
+            _ => None,
+        };
+        let lookup = match options.shuangpin {
+            _ if code.is_empty() => None,
+            Some(scheme) => {
+                let keys = &code[..code.len() - pending.map_or(0, char::len_utf8)];
+                if keys.replace('\'', "").is_empty() {
+                    None
+                } else {
+                    scheme.expand(keys)
+                }
+            }
+            None => Some(code.clone()),
+        };
+        let mut candidates = match &lookup {
+            None => Vec::new(),
+            Some(lookup) => input.candidates_filtered(
+                lookup,
                 size * CANDIDATE_PAGES,
                 size,
                 options.fuzzy,
-                options.pinyin_first,
+                options.pinyin_first || options.shuangpin.is_some(),
                 options.common_only,
-            )
+            ),
         };
+        // A partial match leaves full pinyin unconsumed; keep the matching typed keys instead.
+        if let Some(scheme) = options.shuangpin {
+            candidates.retain_mut(|candidate| {
+                if candidate.rest.is_empty() {
+                    return true;
+                }
+                match scheme.rest_keys(&code, &candidate.rest) {
+                    Some(keys) => {
+                        candidate.rest = keys;
+                        true
+                    }
+                    None => false,
+                }
+            });
+            if let Some(key) = pending {
+                for candidate in &mut candidates {
+                    candidate.rest.push(key);
+                    candidate.source = Source::Partial;
+                }
+            }
+        }
         self.hints.clear();
         for candidate in &mut candidates {
             let hint = if candidate.source == Source::Wubi {
@@ -193,7 +235,8 @@ impl Composer {
         // Fifth letter: after four letters that cannot continue as pinyin, commit the first
         // candidate, or drop the four letters if there is none; the new letter starts the next
         // character.
-        if !options.pinyin_first && rules.push_fifth && pushes_fifth(input, &code, letter) {
+        let wubi_rules = !options.pinyin_first && options.shuangpin.is_none();
+        if wubi_rules && rules.push_fifth && pushes_fifth(input, &code, letter) {
             if let Some(pick) = self.candidate_at(0).filter(|_| input.wubi_count(&code) > 0) {
                 picks.push(pick);
                 self.set_code(input, String::new(), options, learned);
@@ -205,7 +248,7 @@ impl Composer {
             self.set_code(input, code.clone(), options, learned);
         }
         // A unique four-letter Wubi code commits itself.
-        let auto = !options.pinyin_first && rules.auto_commit4 && auto_commits_four(input, &code);
+        let auto = wubi_rules && rules.auto_commit4 && auto_commits_four(input, &code);
         if let Some(pick) = self.candidate_at(0).filter(|_| auto) {
             picks.push(pick);
             self.set_code(input, String::new(), options, learned);

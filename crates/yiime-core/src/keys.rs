@@ -23,6 +23,8 @@ pub struct KeyContext {
     pub selection: Option<usize>,
     pub comma_period_paging: bool,
     pub bracket_char_pick: bool,
+    /// `;` is a code key here (微软双拼's -ing after an initial key).
+    pub semicolon_is_code: bool,
 }
 
 /// What a character does.
@@ -95,6 +97,9 @@ pub fn classify_char(ch: char, context: &KeyContext) -> KeyAction {
         Some(LetterAction::Compose(letter)) => return KeyAction::Compose(letter),
         None => {}
     }
+    if context.composing && ch == ';' && context.semicolon_is_code {
+        return KeyAction::Compose(';');
+    }
     if !context.composing {
         return match ch {
             '\r' => KeyAction::Submit {
@@ -143,6 +148,23 @@ fn composing_action(ch: char, context: &KeyContext) -> KeyAction {
         },
         _ => other(),
     }
+}
+
+/// What `;`/`'` select while composing `code` (see [`KeyContext::selection`]): with a Shuangpin
+/// layout `'` is never a separator, so it always picks the 3rd candidate, and 微软双拼's `;` after
+/// an initial key is a code key instead.
+pub fn shuangpin_selection(scheme: crate::Shuangpin, code: &str, ch: char) -> Option<usize> {
+    match ch {
+        ';' if semicolon_is_code(scheme, code) => None,
+        ';' => Some(1),
+        '\'' => Some(2),
+        _ => None,
+    }
+}
+
+/// Whether `;` typed after `code` is a code key: 微软双拼 with an odd number of keys.
+pub fn semicolon_is_code(scheme: crate::Shuangpin, code: &str) -> bool {
+    scheme.is_key(';') && code.replace('\'', "").len() % 2 == 1
 }
 
 /// Code after typing a `'` separator: none twice in a row, and within `max_len`.
@@ -298,6 +320,12 @@ mod tests {
                 otherwise: Box::new(KeyAction::Separator)
             }
         );
+        let microsoft = KeyContext {
+            selection: Some(1),
+            semicolon_is_code: true,
+            ..composing()
+        };
+        assert_eq!(classify_char(';', &microsoft), KeyAction::Compose(';'));
         assert_eq!(with_separator("xi", 32).as_deref(), Some("xi'"));
         assert_eq!(with_separator("xi'", 32), None);
         assert_eq!(with_separator("abc", 3), None);

@@ -171,12 +171,13 @@ pub(super) unsafe fn handle_char(hwnd: HWND, state: &State, unit: u32) -> bool {
     };
     // The numpad flag belongs to this one character (Ctrl+Enter does not consume it).
     let numpad = ch != '\n' && state.numpad.replace(false);
-    let composing = !state.composition.borrow().code.is_empty();
-    let selection = if composing && option(Flag::SemicolonSelect) {
-        let code = state.composition.borrow().code.clone();
-        selection_index(&state.input.borrow(), &code, ch)
-    } else {
-        None
+    let code = state.composition.borrow().code.clone();
+    let composing = !code.is_empty();
+    let shuangpin = OPTIONS.shuangpin();
+    let selection = match shuangpin {
+        _ if !composing || !option(Flag::SemicolonSelect) => None,
+        Some(scheme) => yiime_core::shuangpin_selection(scheme, &code, ch),
+        None => selection_index(&state.input.borrow(), &code, ch),
     };
     let context = yiime_core::KeyContext {
         composing,
@@ -187,6 +188,8 @@ pub(super) unsafe fn handle_char(hwnd: HWND, state: &State, unit: u32) -> bool {
         selection,
         comma_period_paging: option(Flag::CommaPeriodPaging),
         bracket_char_pick: option(Flag::BracketCharPick),
+        semicolon_is_code: composing
+            && shuangpin.is_some_and(|scheme| yiime_core::semicolon_is_code(scheme, &code)),
     };
     unsafe { run_key_action(hwnd, state, ch, yiime_core::classify_char(ch, &context)) }
 }
