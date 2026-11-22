@@ -1,17 +1,42 @@
-# YiIME 译
+# YiIME 译 — 用 Rust 写的五笔拼音混输 Windows 输入法，开源免费，中译英直接上屏
 
+**五笔 86 + 拼音混输 · 双拼（小鹤/微软/自然码） · 搜狗/QQ 词库导入 · 在任意应用里打中文、按 Enter 上屏英文译文 · 开源免费（GPL-3.0）**
+
+[![最新版本](https://img.shields.io/github/v/release/leelieber2025/YiIME?include_prereleases&label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC)](https://github.com/leelieber2025/YiIME/releases)
 [![CI](https://github.com/leelieber2025/YiIME/actions/workflows/ci.yml/badge.svg)](https://github.com/leelieber2025/YiIME/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/leelieber2025/YiIME?include_prereleases)](https://github.com/leelieber2025/YiIME/releases)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
+[![下载量](https://img.shields.io/github/downloads/leelieber2025/YiIME/total?label=%E4%B8%8B%E8%BD%BD%E9%87%8F)](https://github.com/leelieber2025/YiIME/releases)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24430891.svg)](https://doi.org/10.5281/zenodo.24430891)
 
-五笔/拼音输入法，自带“中文 → 英文”翻译：在任意应用里用中文打字，按 Enter 把译文直接上屏；也可以只打中文、不翻译。
+中文 | [English](README.en.md)
 
-| 平台 | 状态 |
-| --- | --- |
-| Windows 10/11 x64 | 输入法（TSF），主力平台 |
-| macOS | 测试版 `YiIME-<版本>-macos-beta.pkg`（未签名、未公证，见下文） |
-| Linux x86_64 / aarch64 | 暂时只有命令行工具（输入法计划用 Fcitx5） |
+YiIME 译是一个 Windows 10/11 输入法（TSF）：五笔和拼音可以混着打，不用切换；打完一句中文按 **Enter** 直接上屏英文译文，按 **Shift+Enter** 上屏中文。也可以切到普通五笔模式，只打中文、不翻译。
+
+<!-- TODO: 演示 GIF（录一段在记事本里打字 → Enter 上屏英文），放到 docs/demo.gif 后在这里引用。 -->
+
+## 下载与安装
+
+**[→ 到 Releases 下载最新版](https://github.com/leelieber2025/YiIME/releases)**
+
+| 平台 | 下载 | 状态 |
+| --- | --- | --- |
+| Windows 10/11 x64 | `YiIME-<版本>-setup.exe`（安装包，推荐）<br>`YiIME-<版本>-portable.zip`（免安装测试包） | 主力平台 |
+| macOS | `YiIME-<版本>-macos-beta.pkg` | 测试版，未签名、未公证（见下文） |
+| Linux x86_64 / aarch64 | `yiime_<版本>-1_*.deb`、`yiime-<版本>-linux-*.tar.gz` | 暂时只有命令行工具（输入法计划用 Fcitx5） |
+
+带 `rc` 的版本（如 `0.2.0-rc.1`）是候选版本，标为 Pre-release，欢迎试用反馈；稳定版不带后缀。
+
+### Windows 安装步骤
+
+1. 从 [Releases](https://github.com/leelieber2025/YiIME/releases) 下载 `YiIME-<版本>-setup.exe`，运行并按提示安装（需要管理员权限）。下载后可用同一发布里的 `SHA256SUMS.txt` 核对。
+2. 按 Win+空格 切换到“YiIME 译（五笔）”，在任意文本框里打字即可。
+3. 首次使用可在设置窗口选择翻译引擎；不填 Azure 密钥也能直接用（免费 Google 翻译）。Azure 密钥在 Azure 门户创建 Translator 资源（定价层选 F0）后获取。
+
+**升级**：直接运行新版安装程序，**装完后请重启电脑**（或注销后重新登录）。已经打开的应用里还加载着旧版输入法，不重启会出现新功能不生效的情况。从 0.1.x 升级时，设置会从 `%APPDATA%\InputTranslation`、`HKCU\Software\InputTranslation` 自动迁移到 `%APPDATA%\YiIME`、`HKCU\Software\YiIME`。
+
+**卸载**：Windows“设置 → 应用”里卸载“YiIME 译”，或用开始菜单里的卸载项；建议卸载后重启。
+
+另有免安装包 `YiIME-<版本>-portable.zip`（只含浮动框与设置程序 `YiIME.exe`，用于测试；完整功能需要安装输入法）。0.1.0 时它叫 `InputTranslation-Portable.zip`。`windows/build.sh` 还会生成 `YiIME-<版本>-tsf-test.zip`（EXE + `yiime_tsf.dll` + `Install-YiIME.ps1`，手动注册用的测试包，不随发布上传）。
 
 ## 功能
 
@@ -49,17 +74,31 @@
 
 各项开关在托盘图标菜单（或开始菜单“YiIME 译 设置”）的设置窗口里。
 
-## 安装
+## 常见问题
 
-1. 从 [Releases](https://github.com/leelieber2025/YiIME/releases) 下载 `YiIME-<版本>-setup.exe`，运行并按提示安装（需要管理员权限）。下载后可用同一发布里的 `SHA256SUMS.txt` 核对。
-2. 按 Win+空格 切换到“YiIME 译（五笔）”，在任意文本框里打字即可。
-3. 首次使用可在设置窗口选择翻译引擎；不填 Azure 密钥也能直接用（免费 Google 翻译）。Azure 密钥在 Azure 门户创建 Translator 资源（定价层选 F0）后获取。
+**安装时 Windows 提示“Windows 已保护你的电脑”（SmartScreen）怎么办？**
+目前的安装包还没有代码签名证书，新发布的文件 SmartScreen 不认识，就会拦截。确认是从本仓库 Releases 下载的（可用 `SHA256SUMS.txt` 核对）后，点“更多信息”→“仍要运行”。签名计划见 [SIGNING.md](SIGNING.md)。
 
-**升级**：直接运行新版安装程序，**装完后请重启电脑**（或注销后重新登录）。已经打开的应用里还加载着旧版输入法，不重启会出现新功能不生效的情况。从 0.1.x 升级时，设置会从 `%APPDATA%\InputTranslation`、`HKCU\Software\InputTranslation` 自动迁移到 `%APPDATA%\YiIME`、`HKCU\Software\YiIME`。
+**装好了但切换不出来 / 新功能没生效？**
+安装或升级后请重启电脑（或注销再登录）。然后按 Win+空格 选“YiIME 译（五笔）”。
 
-**卸载**：Windows“设置 → 应用”里卸载“YiIME 译”，或用开始菜单里的卸载项；建议卸载后重启。
+**打字会联网吗？我的输入会被上传吗？**
+打字、选字、自学习都在本机完成，不联网。只有按 Enter 翻译时，这一段中文才会发到你选的那一个翻译服务；失败时改用其他服务默认关闭。输入记忆和学习记录在本机加密保存。详见 [隐私说明 SECURITY.md](SECURITY.md)。
 
-另有免安装包 `YiIME-<版本>-portable.zip`（只含浮动框与设置程序 `YiIME.exe`，用于测试；完整功能需要安装输入法）。0.1.0 时它叫 `InputTranslation-Portable.zip`。`windows/build.sh` 还会生成 `YiIME-<版本>-tsf-test.zip`（EXE + `yiime_tsf.dll` + `Install-YiIME.ps1`，手动注册用的测试包，不随发布上传）。
+**不填任何密钥能用吗？**
+能。默认的 Azure 翻译没填密钥时会用免费 Google 翻译（非官方接口，可能限流）。想更稳定可以填 Azure（F0 免费档每月 200 万字符）、DeepL、Google Cloud 或大模型的密钥。
+
+**只想打中文、不翻译？**
+按 Ctrl+Shift+Space（或在任务栏模式图标、托盘菜单里）切到普通五笔模式；翻译模式下也可以用 Shift+Enter 直接上屏中文。
+
+**怎么用拼音 / 双拼？**
+默认五笔和全拼混输，不用切换。双拼在设置 →“输入方案”里选小鹤、微软或自然码。
+
+**能导入搜狗或 QQ 的词库吗？**
+能。设置 →“导入搜狗/QQ 词库…”，支持搜狗 `.scel` 和导出的文本词库。
+
+**会出现繁体字或生僻字吗？**
+默认开启“只显示常用字”：隐藏扩展区生僻字，GB 2312 之外的繁体、异体单字排在后面。需要时可以在设置里关闭。
 
 ### macOS（测试版）
 
