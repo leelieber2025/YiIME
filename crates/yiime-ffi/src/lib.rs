@@ -230,15 +230,67 @@ unsafe fn from_c(text: *const c_char) -> String {
         .into_owned()
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests set this to make the next guarded call panic inside the guard.
+    static INJECT_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs an FFI body without letting a panic unwind into the caller (Swift/C): a panic returns
+/// `fallback()` instead.
+fn guard<T>(fallback: impl FnOnce() -> T, body: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        if INJECT_PANIC.with(|flag| flag.replace(false)) {
+            panic!("injected panic");
+        }
+        body()
+    }))
+    .unwrap_or_else(|_| fallback())
+}
+
+/// Like [`guard`] for calls that change the session: after a panic the session may be half
+/// updated, so it is reset to an empty one.
+///
+/// # Safety
+/// `ime` is null or comes from [`yiime_new`].
+unsafe fn guard_ime<T>(ime: *mut Ime, fallback: T, body: impl FnOnce(&mut Ime) -> T) -> T {
+    let Some(session) = (unsafe { ime.as_mut() }) else {
+        return fallback;
+    };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        #[cfg(test)]
+        if INJECT_PANIC.with(|flag| flag.replace(false)) {
+            panic!("injected panic");
+        }
+        body(session)
+    })) {
+        Ok(value) => value,
+        Err(_) => {
+            // Replacing the value may itself drop something broken; never unwind from here.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                *ime = Ime::default();
+            }));
+            fallback
+        }
+    }
+}
+
+/// A new session, or null if it could not be created.
 #[unsafe(no_mangle)]
 pub extern "C" fn yiime_new() -> *mut Ime {
-    Box::into_raw(Box::default())
+    guard(std::ptr::null_mut, || Box::into_raw(Box::default()))
 }
 
 /// Preloads dictionaries (safe from a background thread).
 #[unsafe(no_mangle)]
 pub extern "C" fn yiime_preload() {
-    let _ = input();
+    guard(
+        || (),
+        || {
+            let _ = input();
+        },
+    )
 }
 
 /// # Safety
@@ -246,67 +298,69 @@ pub extern "C" fn yiime_preload() {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn yiime_free(ime: *mut Ime) {
     if !ime.is_null() {
-        drop(unsafe { Box::from_raw(ime) });
+        guard(|| (), || drop(unsafe { Box::from_raw(ime) }));
     }
 }
 
+/// Whether the key was handled; `false` (pass the key on) also after an internal error.
+///
 /// # Safety
 /// `ime` comes from [`yiime_new`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn yiime_key(ime: *mut Ime, ch: u32) -> bool {
-    let (Some(ime), Some(ch)) = (unsafe { ime.as_mut() }, char::from_u32(ch)) else {
+    let Some(ch) = char::from_u32(ch) else {
         return false;
     };
-    ime.key(ch)
+    unsafe { guard_ime(ime, false, |ime| ime.key(ch)) }
 }
 
 /// # Safety
 /// `ime` comes from [`yiime_new`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn yiime_shift_tap(ime: *mut Ime) {
-    if let Some(ime) = unsafe { ime.as_mut() } {
-        ime.shift_tap();
-    }
+    unsafe { guard_ime(ime, (), Ime::shift_tap) }
 }
 
 /// # Safety
 /// `ime` comes from [`yiime_new`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn yiime_commit_code(ime: *mut Ime) {
-    if let Some(ime) = unsafe { ime.as_mut() } {
-        ime.commit_code();
-    }
+    unsafe { guard_ime(ime, (), Ime::commit_code) }
 }
 
 /// # Safety
 /// `ime` comes from [`yiime_new`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn yiime_active(ime: *const Ime) -> bool {
-    unsafe { ime.as_ref() }.is_some_and(Ime::active)
+    guard(
+        || false,
+        || unsafe { ime.as_ref() }.is_some_and(Ime::active),
+    )
 }
 
+/// The session as JSON, or null (also after an internal error).
+///
 /// # Safety
 /// `ime` comes from [`yiime_new`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn yiime_state(ime: *const Ime) -> *mut c_char {
-    match unsafe { ime.as_ref() } {
+    guard(std::ptr::null_mut, || match unsafe { ime.as_ref() } {
         Some(ime) => to_c(ime.state_json()),
         None => std::ptr::null_mut(),
-    }
+    })
 }
 
+/// The finished text, or null (also after an internal error, which resets the session).
+///
 /// # Safety
 /// `ime` comes from [`yiime_new`].
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn yiime_take_text(ime: *mut Ime) -> *mut c_char {
-    match unsafe { ime.as_mut() } {
-        Some(ime) => to_c(ime.take_text()),
-        None => std::ptr::null_mut(),
-    }
+    unsafe { guard_ime(ime, std::ptr::null_mut(), |ime| to_c(ime.take_text())) }
 }
 
 /// Blocking translation (call from a background thread). Returns `{"ok":true,"text":…}` or
-/// `{"ok":false,"error":…}`.
+/// `{"ok":false,"error":…}`; null only if even the error could not be built.
 ///
 /// # Safety
 /// The argument is a null pointer or a valid C string.
@@ -317,13 +371,23 @@ pub unsafe extern "C" fn yiime_translate(
     model: *const c_char,
     key: *const c_char,
 ) -> *mut c_char {
-    let (source, url, model, key) =
-        unsafe { (from_c(source), from_c(url), from_c(model), from_c(key)) };
-    let value = match translate_text(&source, &url, &model, &key) {
-        Ok(text) => json!({"ok": true, "text": text}),
-        Err(error) => json!({"ok": false, "error": error}),
-    };
-    to_c(value.to_string())
+    guard(
+        || {
+            std::panic::catch_unwind(|| {
+                to_c(json!({"ok": false, "error": "翻译处理出错，请重试"}).to_string())
+            })
+            .unwrap_or(std::ptr::null_mut())
+        },
+        || {
+            let (source, url, model, key) =
+                unsafe { (from_c(source), from_c(url), from_c(model), from_c(key)) };
+            let value = match translate_text(&source, &url, &model, &key) {
+                Ok(text) => json!({"ok": true, "text": text}),
+                Err(error) => json!({"ok": false, "error": error}),
+            };
+            to_c(value.to_string())
+        },
+    )
 }
 
 /// # Safety
@@ -331,7 +395,7 @@ pub unsafe extern "C" fn yiime_translate(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn yiime_string_free(text: *mut c_char) {
     if !text.is_null() {
-        drop(unsafe { CString::from_raw(text) });
+        guard(|| (), || drop(unsafe { CString::from_raw(text) }));
     }
 }
 
@@ -392,6 +456,62 @@ mod tests {
             let text = yiime_take_text(ime);
             assert_eq!(CStr::from_ptr(text).to_str().unwrap(), "我");
             yiime_string_free(text);
+            yiime_free(ime);
+        }
+    }
+
+    fn inject_panic() {
+        INJECT_PANIC.with(|flag| flag.set(true));
+    }
+
+    #[test]
+    fn panics_return_error_values_instead_of_unwinding() {
+        unsafe {
+            inject_panic();
+            assert!(yiime_new().is_null());
+            let ime = yiime_new();
+            assert!(!ime.is_null());
+            for ch in "nihao".chars() {
+                assert!(yiime_key(ime, ch as u32));
+            }
+            assert!(yiime_active(ime));
+            inject_panic();
+            assert!(!yiime_key(ime, ' ' as u32), "panic → key passed on");
+            // The half-updated session was reset.
+            assert!(!yiime_active(ime));
+            inject_panic();
+            assert!(!yiime_active(ime));
+            inject_panic();
+            assert!(yiime_state(ime).is_null());
+            inject_panic();
+            assert!(yiime_take_text(ime).is_null());
+            inject_panic();
+            yiime_shift_tap(ime);
+            inject_panic();
+            yiime_commit_code(ime);
+            inject_panic();
+            yiime_preload();
+            inject_panic();
+            let error = yiime_translate(
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+                std::ptr::null(),
+            );
+            let value: serde_json::Value =
+                serde_json::from_str(CStr::from_ptr(error).to_str().unwrap()).unwrap();
+            assert_eq!(value["ok"], false);
+            yiime_string_free(error);
+            // Still usable afterwards.
+            for ch in "q ".chars() {
+                yiime_key(ime, ch as u32);
+            }
+            let text = yiime_take_text(ime);
+            assert_eq!(CStr::from_ptr(text).to_str().unwrap(), "我");
+            yiime_string_free(text);
+            // Null sessions are rejected without touching anything.
+            assert!(!yiime_key(std::ptr::null_mut(), 'a' as u32));
+            assert!(yiime_state(std::ptr::null()).is_null());
             yiime_free(ime);
         }
     }
