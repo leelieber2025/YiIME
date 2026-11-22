@@ -67,6 +67,16 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 use yiime_core::{Flag, OptionStore, Options, Quotes, full_width, us_key_char};
 
+mod key_sink;
+mod lang_bar;
+mod receiver;
+mod registration;
+use lang_bar::{
+    InputModeButton, LangBarSink, chinese_punctuation, history_key_text, option, parse_hotkey,
+    plain_mode, plain_toggle_text, refresh_sink, set_plain_mode, toggle_option,
+};
+use registration::{register, unregister};
+
 const CLSID: GUID = GUID::from_u128(0xa72091c2_7459_4c47_85f4_4626ae42a6c8);
 const CLSID_TEXT: &str = "{A72091C2-7459-4C47-85F4-4626AE42A6C8}";
 const PROFILE: GUID = GUID::from_u128(0x54a39d73_0625_4560_b878_94660908c69d);
@@ -144,6 +154,17 @@ fn com_scope(f: impl FnOnce() -> Result<()>) -> Result<()> {
     result
 }
 
+/// Prevent a Rust unwind from crossing a COM ABI boundary into a host application.
+fn com_guard<T>(entry: &'static str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = std::panic::catch_unwind(|| log(&format!("panic in {entry}")));
+            Err(E_FAIL.into())
+        }
+    }
+}
+
 fn absent_is_ok(result: Result<()>) -> Result<()> {
     match result {
         Ok(()) => Ok(()),
@@ -201,55 +222,6 @@ fn log(message: &str) {
         );
     }
 }
-fn register() -> Result<()> {
-    let key = CLASSES_ROOT.create(format!("CLSID\\{CLSID_TEXT}"))?;
-    key.set_string("", DESCRIPTION)?;
-    let inproc = key.create("InprocServer32")?;
-    inproc.set_string("", module_path()?)?;
-    inproc.set_string("ThreadingModel", "Apartment")?;
-    com_scope(|| {
-        let profiles: ITfInputProcessorProfiles = unsafe {
-            CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)?
-        };
-        let description = wide(DESCRIPTION);
-        let icon = wide(&module_path()?);
-        unsafe {
-            profiles.Register(&CLSID)?;
-            profiles.AddLanguageProfile(&CLSID, LANG_ZH_CN, &PROFILE, &description, &icon, 0)?;
-            let _ = profiles.EnableLanguageProfileByDefault(&CLSID, LANG_ZH_CN, &PROFILE, true);
-        }
-        let categories: ITfCategoryMgr =
-            unsafe { CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)? };
-        for category in CATEGORIES {
-            unsafe {
-                categories.RegisterCategory(&CLSID, &category, &CLSID)?;
-            }
-        }
-        Ok(())
-    })
-}
-
-fn unregister() -> Result<()> {
-    com_scope(|| {
-        let categories: ITfCategoryMgr =
-            unsafe { CoCreateInstance(&CLSID_TF_CategoryMgr, None, CLSCTX_INPROC_SERVER)? };
-        let _ = unsafe {
-            categories.UnregisterCategory(&CLSID, &GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT, &CLSID)
-        };
-        for category in CATEGORIES {
-            absent_is_ok(unsafe { categories.UnregisterCategory(&CLSID, &category, &CLSID) })?;
-        }
-        let profiles: ITfInputProcessorProfiles = unsafe {
-            CoCreateInstance(&CLSID_TF_InputProcessorProfiles, None, CLSCTX_INPROC_SERVER)?
-        };
-        absent_is_ok(unsafe { profiles.RemoveLanguageProfile(&CLSID, LANG_ZH_CN, &PROFILE) })?;
-        absent_is_ok(unsafe { profiles.Unregister(&CLSID) })?;
-        Ok(())
-    })?;
-    absent_is_ok(CLASSES_ROOT.remove_tree(format!("CLSID\\{CLSID_TEXT}")))?;
-    Ok(())
-}
-
 #[implement(IClassFactory)]
 struct ClassFactory;
 impl IClassFactory_Impl for ClassFactory_Impl {
@@ -259,17 +231,19 @@ impl IClassFactory_Impl for ClassFactory_Impl {
         iid: *const GUID,
         out: *mut *mut c_void,
     ) -> Result<()> {
-        if !outer.is_null() {
-            return CLASS_E_NOAGGREGATION.ok();
-        }
-        if iid.is_null() || out.is_null() {
-            return E_FAIL.ok();
-        }
-        let object: IUnknown = TextService::new().into();
-        unsafe { object.query(iid, out).ok() }
+        com_guard("CreateInstance", || {
+            if !outer.is_null() {
+                return CLASS_E_NOAGGREGATION.ok();
+            }
+            if iid.is_null() || out.is_null() {
+                return E_FAIL.ok();
+            }
+            let object: IUnknown = TextService::new().into();
+            unsafe { object.query(iid, out).ok() }
+        })
     }
     fn LockServer(&self, _lock: BOOL) -> Result<()> {
-        Ok(())
+        com_guard("LockServer", || Ok(()))
     }
 }
 
@@ -280,28 +254,30 @@ struct CommitEdit {
 }
 impl ITfEditSession_Impl for CommitEdit_Impl {
     fn DoEditSession(&self, cookie: u32) -> Result<()> {
-        let insert: ITfInsertAtSelection = self.context.cast()?;
-        let utf16: Vec<u16> = self.text.encode_utf16().collect();
-        let range = unsafe {
-            insert.InsertTextAtSelection(cookie, INSERT_TEXT_AT_SELECTION_FLAGS(0), &utf16)?
-        };
-        let caret = unsafe { range.Clone()? };
-        unsafe {
-            caret.Collapse(cookie, TF_ANCHOR_END)?;
-        }
-        let selection = TF_SELECTION {
-            range: ManuallyDrop::new(Some(caret)),
-            style: TF_SELECTIONSTYLE {
-                ase: TF_AE_END,
-                fInterimChar: false.into(),
-            },
-        };
-        let result = unsafe {
-            self.context
-                .SetSelection(cookie, std::slice::from_ref(&selection))
-        };
-        drop(ManuallyDrop::into_inner(selection.range));
-        result
+        com_guard("DoEditSession", || {
+            let insert: ITfInsertAtSelection = self.context.cast()?;
+            let utf16: Vec<u16> = self.text.encode_utf16().collect();
+            let range = unsafe {
+                insert.InsertTextAtSelection(cookie, INSERT_TEXT_AT_SELECTION_FLAGS(0), &utf16)?
+            };
+            let caret = unsafe { range.Clone()? };
+            unsafe {
+                caret.Collapse(cookie, TF_ANCHOR_END)?;
+            }
+            let selection = TF_SELECTION {
+                range: ManuallyDrop::new(Some(caret)),
+                style: TF_SELECTIONSTYLE {
+                    ase: TF_AE_END,
+                    fInterimChar: false.into(),
+                },
+            };
+            let result = unsafe {
+                self.context
+                    .SetSelection(cookie, std::slice::from_ref(&selection))
+            };
+            drop(ManuallyDrop::into_inner(selection.range));
+            result
+        })
     }
 }
 
@@ -312,66 +288,68 @@ struct ScopeCheck {
 }
 impl ITfEditSession_Impl for ScopeCheck_Impl {
     fn DoEditSession(&self, cookie: u32) -> Result<()> {
-        let mut selection: TF_SELECTION = unsafe { std::mem::zeroed() };
-        let mut fetched = 0;
-        let selected = unsafe {
-            self.context.GetSelection(
-                cookie,
-                TF_DEFAULT_SELECTION,
-                std::slice::from_mut(&mut selection),
-                &mut fetched,
-            )
-        };
-        if selected.is_err() || fetched == 0 {
-            // If the selection cannot be read, treat it as a normal text field; otherwise the IME
-            // would never activate here.
-            drop(ManuallyDrop::into_inner(selection.range));
-            unsafe {
-                OutputDebugStringW(
-                    wide("InputTranslation: 读取选区失败，按非密码输入框处理").as_ptr(),
-                );
+        com_guard("DoEditSession", || {
+            let mut selection: TF_SELECTION = unsafe { std::mem::zeroed() };
+            let mut fetched = 0;
+            let selected = unsafe {
+                self.context.GetSelection(
+                    cookie,
+                    TF_DEFAULT_SELECTION,
+                    std::slice::from_mut(&mut selection),
+                    &mut fetched,
+                )
+            };
+            if selected.is_err() || fetched == 0 {
+                // If the selection cannot be read, treat it as a normal text field; otherwise the IME
+                // would never activate here.
+                drop(ManuallyDrop::into_inner(selection.range));
+                unsafe {
+                    OutputDebugStringW(
+                        wide("InputTranslation: 读取选区失败，按非密码输入框处理").as_ptr(),
+                    );
+                }
+                self.result.set(Some(false));
+                return Ok(());
             }
-            self.result.set(Some(false));
-            return Ok(());
-        }
-        let mut password = false;
-        let range = ManuallyDrop::into_inner(selection.range);
-        if let Some(range) = range
-            && let Ok(property) = unsafe { self.context.GetAppProperty(&GUID_PROP_INPUTSCOPE) }
-            && let Ok(mut value) = unsafe { property.GetValue(cookie, &range) }
-        {
-            let inner = unsafe { &*value.Anonymous.Anonymous };
-            if inner.vt.0 == 13 {
-                let unknown = unsafe { &*inner.Anonymous.punkVal };
-                if let Some(unknown) = unknown.as_ref()
-                    && let Ok(scope) = unknown.cast::<ITfInputScope>()
-                {
-                    let mut ptr = null_mut();
-                    let mut count = 0;
-                    let read = unsafe { scope.GetInputScopes(&mut ptr, &mut count) }.is_ok();
-                    if read && !ptr.is_null() {
-                        let scopes = unsafe { std::slice::from_raw_parts(ptr, count as usize) };
-                        password = scopes.iter().any(|scope| {
-                            [
-                                IS_PASSWORD,
-                                IS_NUMERIC_PIN,
-                                IS_ALPHANUMERIC_PIN,
-                                IS_ALPHANUMERIC_PIN_SET,
-                            ]
-                            .contains(scope)
-                        });
-                    }
-                    if !ptr.is_null() {
-                        unsafe {
-                            CoTaskMemFree(Some(ptr as _));
+            let mut password = false;
+            let range = ManuallyDrop::into_inner(selection.range);
+            if let Some(range) = range
+                && let Ok(property) = unsafe { self.context.GetAppProperty(&GUID_PROP_INPUTSCOPE) }
+                && let Ok(mut value) = unsafe { property.GetValue(cookie, &range) }
+            {
+                let inner = unsafe { &*value.Anonymous.Anonymous };
+                if inner.vt.0 == 13 {
+                    let unknown = unsafe { &*inner.Anonymous.punkVal };
+                    if let Some(unknown) = unknown.as_ref()
+                        && let Ok(scope) = unknown.cast::<ITfInputScope>()
+                    {
+                        let mut ptr = null_mut();
+                        let mut count = 0;
+                        let read = unsafe { scope.GetInputScopes(&mut ptr, &mut count) }.is_ok();
+                        if read && !ptr.is_null() {
+                            let scopes = unsafe { std::slice::from_raw_parts(ptr, count as usize) };
+                            password = scopes.iter().any(|scope| {
+                                [
+                                    IS_PASSWORD,
+                                    IS_NUMERIC_PIN,
+                                    IS_ALPHANUMERIC_PIN,
+                                    IS_ALPHANUMERIC_PIN_SET,
+                                ]
+                                .contains(scope)
+                            });
+                        }
+                        if !ptr.is_null() {
+                            unsafe {
+                                CoTaskMemFree(Some(ptr as _));
+                            }
                         }
                     }
                 }
+                let _ = unsafe { VariantClear(&mut value) };
             }
-            let _ = unsafe { VariantClear(&mut value) };
-        }
-        self.result.set(Some(password));
-        Ok(())
+            self.result.set(Some(password));
+            Ok(())
+        })
     }
 }
 
@@ -384,32 +362,34 @@ struct CaretQuery {
 }
 impl ITfEditSession_Impl for CaretQuery_Impl {
     fn DoEditSession(&self, cookie: u32) -> Result<()> {
-        let mut selection: TF_SELECTION = unsafe { std::mem::zeroed() };
-        let mut fetched = 0;
-        let selected = unsafe {
-            self.context.GetSelection(
-                cookie,
-                TF_DEFAULT_SELECTION,
-                std::slice::from_mut(&mut selection),
-                &mut fetched,
-            )
-        };
-        let range = ManuallyDrop::into_inner(selection.range);
-        selected?;
-        let Some(range) = range.filter(|_| fetched > 0) else {
-            return Ok(());
-        };
-        let view = unsafe { self.context.GetActiveView()? };
-        let mut rect = RECT::default();
-        let mut clipped = BOOL::default();
-        unsafe {
-            range.Collapse(cookie, TF_ANCHOR_END)?;
-            view.GetTextExt(cookie, &range, &mut rect, &mut clipped)?;
-        }
-        if rect.bottom > rect.top && rect.right >= rect.left {
-            self.result.set(Some(rect));
-        }
-        Ok(())
+        com_guard("DoEditSession", || {
+            let mut selection: TF_SELECTION = unsafe { std::mem::zeroed() };
+            let mut fetched = 0;
+            let selected = unsafe {
+                self.context.GetSelection(
+                    cookie,
+                    TF_DEFAULT_SELECTION,
+                    std::slice::from_mut(&mut selection),
+                    &mut fetched,
+                )
+            };
+            let range = ManuallyDrop::into_inner(selection.range);
+            selected?;
+            let Some(range) = range.filter(|_| fetched > 0) else {
+                return Ok(());
+            };
+            let view = unsafe { self.context.GetActiveView()? };
+            let mut rect = RECT::default();
+            let mut clipped = BOOL::default();
+            unsafe {
+                range.Collapse(cookie, TF_ANCHOR_END)?;
+                view.GetTextExt(cookie, &range, &mut rect, &mut clipped)?;
+            }
+            if rect.bottom > rect.top && rect.right >= rect.left {
+                self.result.set(Some(rect));
+            }
+            Ok(())
+        })
     }
 }
 
@@ -537,403 +517,9 @@ fn open_tray_window(history: bool) {
         }
     }
 }
-/// Chinese/English mode button left of the taskbar IME icon (GUID_LBI_INPUTMODE, as in Microsoft
-/// Pinyin/Wubi). Clicking toggles the mode; it watches the OPENCLOSE compartment to refresh when
-/// the mode changes by Ctrl+Space or other means.
-#[implement(ITfLangBarItemButton, ITfSource, ITfCompartmentEventSink)]
-struct InputModeButton {
-    manager: ITfThreadMgr,
-    client_id: u32,
-    /// Shared with the TextService so the button refreshes when plain/translation mode changes
-    /// elsewhere.
-    sink: LangBarSink,
-}
-type LangBarSink = Rc<RefCell<Option<ITfLangBarItemSink>>>;
-fn refresh_sink(sink: &LangBarSink) {
-    let sink = sink.borrow().clone();
-    if let Some(sink) = sink {
-        let _ = unsafe { sink.OnUpdate(TF_LBI_ICON | TF_LBI_TEXT | TF_LBI_TOOLTIP) };
-    }
-}
-const MENU_CHINESE: u32 = 1;
-const MENU_ENGLISH: u32 = 2;
-const MENU_TRANSLATE: u32 = 3;
-const MENU_PLAIN: u32 = 4;
-const MENU_PUNCT: u32 = 5;
-const MENU_TRAD: u32 = 6;
-const MENU_HISTORY: u32 = 7;
-const MENU_SETTINGS: u32 = 8;
-impl InputModeButton_Impl {
-    fn chinese(&self) -> bool {
-        keyboard_mode(&self.manager).unwrap_or(true)
-    }
-    /// Menu owner: the window of the focused context, else this thread's foreground/focus window
-    /// (as Weasel does).
-    fn menu_owner(&self) -> HWND {
-        let from_context = unsafe {
-            self.manager
-                .GetFocus()
-                .and_then(|document| document.GetTop())
-                .and_then(|context| context.GetActiveView())
-                .and_then(|view| view.GetWnd())
-        }
-        .ok()
-        .map(|hwnd| hwnd.0 as HWND)
-        .filter(|hwnd| !hwnd.is_null());
-        from_context
-            .or_else(|| {
-                let foreground = unsafe { GetForegroundWindow() };
-                let thread = unsafe { GetWindowThreadProcessId(foreground, null_mut()) };
-                (thread == unsafe { GetCurrentThreadId() }).then_some(foreground)
-            })
-            .or_else(|| Some(unsafe { GetFocus() }))
-            .filter(|hwnd| !hwnd.is_null())
-            .unwrap_or(null_mut())
-    }
-    /// Right-click menu of the taskbar mode icon: Chinese/English, translation/plain Wubi,
-    /// punctuation, Simplified/Traditional, history, settings.
-    fn show_menu(&self, x: i32, y: i32) {
-        let owner = self.menu_owner();
-        if owner.is_null() {
-            log("右键菜单：找不到本线程的窗口");
-            return;
-        }
-        let chinese = self.chinese();
-        let plain = plain_mode();
-        let checked = |on: bool| if on { MF_CHECKED } else { 0 };
-        let history = if option(Flag::HistoryEnabled) {
-            let key = OPTIONS.history_key();
-            format!("输入记忆…\t{key}")
-        } else {
-            "输入记忆…（已关闭）".to_owned()
-        };
-        let items: [Option<(u32, String, u32)>; 11] = [
-            Some((MENU_CHINESE, "中文".into(), checked(chinese))),
-            Some((MENU_ENGLISH, "英文".into(), checked(!chinese))),
-            None,
-            Some((
-                MENU_TRANSLATE,
-                format!("翻译模式（译）\t{}", plain_toggle_text()),
-                checked(!plain),
-            )),
-            Some((
-                MENU_PLAIN,
-                format!("普通五笔模式（中）\t{}", plain_toggle_text()),
-                checked(plain),
-            )),
-            None,
-            Some((
-                MENU_PUNCT,
-                "中文标点\tCtrl+.".into(),
-                checked(!option(Flag::PunctEnglish)),
-            )),
-            Some((
-                MENU_TRAD,
-                "繁体输出\tCtrl+Shift+F".into(),
-                checked(option(Flag::Traditional)),
-            )),
-            None,
-            Some((MENU_HISTORY, history, 0)),
-            Some((MENU_SETTINGS, "设置…".into(), 0)),
-        ];
-        let menu = unsafe { CreatePopupMenu() };
-        if menu.is_null() {
-            return;
-        }
-        for item in items {
-            match item {
-                Some((id, text, flags)) => unsafe {
-                    AppendMenuW(menu, MF_STRING | flags, id as usize, wide(&text).as_ptr());
-                },
-                None => unsafe {
-                    AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-                },
-            }
-        }
-        // The icon is on the taskbar, so the menu opens upward; TPM_RETURNCMD returns the choice
-        // synchronously.
-        let flags = TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON | TPM_BOTTOMALIGN;
-        let id = unsafe { TrackPopupMenuEx(menu, flags, x, y, owner, std::ptr::null()) } as u32;
-        unsafe {
-            DestroyMenu(menu);
-        }
-        log(&format!("右键菜单选择 {id}"));
-        match id {
-            MENU_CHINESE | MENU_ENGLISH => {
-                set_keyboard_mode(&self.manager, self.client_id, id == MENU_CHINESE);
-            }
-            MENU_TRANSLATE | MENU_PLAIN => {
-                set_plain_mode(id == MENU_PLAIN);
-                if !chinese {
-                    set_keyboard_mode(&self.manager, self.client_id, true);
-                }
-            }
-            MENU_PUNCT => {
-                toggle_option(Flag::PunctEnglish);
-            }
-            MENU_TRAD => {
-                toggle_option(Flag::Traditional);
-            }
-            MENU_HISTORY => open_tray_window(true),
-            MENU_SETTINGS => open_tray_window(false),
-            _ => {}
-        }
-    }
-    fn refresh(&self) {
-        refresh_sink(&self.sink);
-    }
-}
-/// Settings switches in HKCU\\Software\\InputTranslation, shared with the input-box EXE (names and
-/// defaults defined in yiime-core).
-struct Registry;
-impl OptionStore for Registry {
-    fn get_u32(&self, name: &str) -> Option<u32> {
-        CURRENT_USER
-            .open(STATE_KEY)
-            .and_then(|key| key.get_u32(name))
-            .ok()
-    }
-    fn set_u32(&self, name: &str, value: u32) -> bool {
-        CURRENT_USER
-            .create(STATE_KEY)
-            .and_then(|key| key.set_u32(name, value))
-            .is_ok()
-    }
-    fn get_string(&self, name: &str) -> Option<String> {
-        CURRENT_USER
-            .open(STATE_KEY)
-            .and_then(|key| key.get_string(name))
-            .ok()
-    }
-    fn set_string(&self, name: &str, value: &str) -> bool {
-        CURRENT_USER
-            .create(STATE_KEY)
-            .and_then(|key| key.set_string(name, value))
-            .is_ok()
-    }
-}
-const OPTIONS: Options<Registry> = Options(Registry);
-fn option(flag: Flag) -> bool {
-    OPTIONS.flag(flag)
-}
-fn toggle_option(flag: Flag) -> bool {
-    OPTIONS.toggle(flag).is_some()
-}
-fn plain_mode() -> bool {
-    option(Flag::PlainMode)
-}
-fn set_plain_mode(on: bool) -> bool {
-    OPTIONS.set_flag(Flag::PlainMode, on)
-}
-/// Chinese punctuation without the input box (US-layout virtual key + Shift, mapping in
-/// yiime-core); `.` `:` after digits stay half-width. Quotes return None and are alternated by the
-/// caller.
-fn chinese_punctuation(key: usize, shift: bool, after_digit: bool) -> Option<&'static str> {
-    let key = u16::try_from(key).ok()?;
-    us_key_char(key, shift).and_then(|ch| full_width(ch, after_digit))
-}
-/// Parses shortcuts such as `Ctrl+Shift+Space` (rules in yiime-core) into a TSF preserved key.
-fn parse_hotkey(text: &str) -> Option<TF_PRESERVEDKEY> {
-    let hotkey = yiime_core::parse_hotkey(text)?;
-    let mut modifiers = 0u32;
-    if hotkey.ctrl {
-        modifiers |= TF_MOD_CONTROL;
-    }
-    if hotkey.shift {
-        modifiers |= TF_MOD_SHIFT;
-    }
-    if hotkey.alt {
-        modifiers |= TF_MOD_ALT;
-    }
-    Some(TF_PRESERVEDKEY {
-        uVKey: hotkey.vk as u32,
-        uModifiers: modifiers,
-    })
-}
-fn plain_toggle_text() -> String {
-    OPTIONS.plain_toggle_key()
-}
-fn light_taskbar() -> bool {
-    windows_registry::CURRENT_USER
-        .open("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize")
-        .and_then(|key| key.get_u32("SystemUsesLightTheme"))
-        .is_ok_and(|value| value != 0)
-}
-impl ITfLangBarItem_Impl for InputModeButton_Impl {
-    fn GetInfo(&self, info: *mut TF_LANGBARITEMINFO) -> Result<()> {
-        if info.is_null() {
-            return Err(windows::Win32::Foundation::E_INVALIDARG.into());
-        }
-        let mut description = [0u16; 32];
-        for (slot, unit) in description.iter_mut().zip("中英模式".encode_utf16()) {
-            *slot = unit;
-        }
-        unsafe {
-            *info = TF_LANGBARITEMINFO {
-                clsidService: CLSID,
-                guidItem: GUID_LBI_INPUTMODE,
-                // As Microsoft's IMEs do: BTN_BUTTON only; OnClick(RIGHT) opens the menu itself
-                // (the Win10/11 input indicator no longer calls InitMenu).
-                dwStyle: TF_LBI_STYLE_BTN_BUTTON,
-                ulSort: 0,
-                szDescription: description,
-            };
-        }
-        Ok(())
-    }
-    fn GetStatus(&self) -> Result<u32> {
-        Ok(0)
-    }
-    fn Show(&self, _show: BOOL) -> Result<()> {
-        Ok(())
-    }
-    fn GetTooltipString(&self) -> Result<BSTR> {
-        let toggle = plain_toggle_text();
-        let extras = format!(
-            " · {} · {}",
-            if option(Flag::PunctEnglish) {
-                "英文标点"
-            } else {
-                "中文标点"
-            },
-            if option(Flag::Traditional) {
-                "繁体"
-            } else {
-                "简体"
-            }
-        );
-        Ok(BSTR::from(
-            match (self.chinese(), plain_mode()) {
-                (false, _) => "英文模式（单击、Shift 或 Ctrl+Space 切到中文）".to_owned(),
-                (true, false) => {
-                    format!(
-                        "译：翻译模式（单击/Shift：中英切换；{toggle}：普通五笔模式；右键：菜单）"
-                    )
-                }
-                (true, true) => format!(
-                    "中：普通五笔模式，不翻译（单击/Shift：中英切换；{toggle}：翻译模式；右键：菜单）"
-                ),
-            } + &extras,
-        ))
-    }
-}
-impl ITfLangBarItemButton_Impl for InputModeButton_Impl {
-    fn OnClick(
-        &self,
-        click: TfLBIClick,
-        point: &windows::Win32::Foundation::POINT,
-        _area: *const RECT,
-    ) -> Result<()> {
-        log(&format!("模式按钮 OnClick {}", click.0));
-        if click == TF_LBI_CLK_RIGHT {
-            self.show_menu(point.x, point.y);
-        } else {
-            set_keyboard_mode(&self.manager, self.client_id, !self.chinese());
-        }
-        self.refresh();
-        Ok(())
-    }
-    fn InitMenu(&self, _menu: Ref<ITfMenu>) -> Result<()> {
-        Ok(())
-    }
-    fn OnMenuSelect(&self, _id: u32) -> Result<()> {
-        Ok(())
-    }
-    fn GetIcon(&self) -> Result<windows::Win32::UI::WindowsAndMessaging::HICON> {
-        // Resources 101/102/105: light taskbar (dark glyph) 中/英/译; 103/104/106: dark taskbar (white
-        // glyph). Translation mode shows 译, plain Wubi 中, English 英. The caller destroys the icon.
-        let light = light_taskbar();
-        let id = match (self.chinese(), plain_mode()) {
-            (false, _) => {
-                if light {
-                    102
-                } else {
-                    104
-                }
-            }
-            (true, true) => {
-                if light {
-                    101
-                } else {
-                    103
-                }
-            }
-            (true, false) => {
-                if light {
-                    105
-                } else {
-                    106
-                }
-            }
-        };
-        let size = unsafe { GetSystemMetrics(SM_CXSMICON) };
-        let icon = unsafe {
-            LoadImageW(
-                MODULE.load(Ordering::SeqCst) as _,
-                std::ptr::without_provenance::<u16>(id),
-                IMAGE_ICON,
-                size,
-                size,
-                0,
-            )
-        };
-        if icon.is_null() {
-            log(&format!("模式图标资源 {id} 加载失败"));
-            Err(E_FAIL.into())
-        } else {
-            Ok(windows::Win32::UI::WindowsAndMessaging::HICON(icon))
-        }
-    }
-    fn GetText(&self) -> Result<BSTR> {
-        Ok(BSTR::from(match (self.chinese(), plain_mode()) {
-            (false, _) => "英",
-            (true, true) => "中",
-            (true, false) => "译",
-        }))
-    }
-}
-impl ITfSource_Impl for InputModeButton_Impl {
-    fn AdviseSink(&self, riid: *const GUID, punk: Ref<IUnknown>) -> Result<u32> {
-        if riid.is_null() || unsafe { *riid } != ITfLangBarItemSink::IID {
-            return Err(HRESULT(0x8004_0202_u32 as i32).into()); // CONNECT_E_CANNOTCONNECT
-        }
-        let sink: ITfLangBarItemSink = punk.ok()?.cast()?;
-        *self.sink.borrow_mut() = Some(sink);
-        Ok(LANGBAR_SINK_COOKIE)
-    }
-    fn UnadviseSink(&self, cookie: u32) -> Result<()> {
-        if cookie != LANGBAR_SINK_COOKIE {
-            return Err(HRESULT(0x8004_0200_u32 as i32).into()); // CONNECT_E_NOCONNECTION
-        }
-        self.sink.borrow_mut().take();
-        Ok(())
-    }
-}
-impl ITfCompartmentEventSink_Impl for InputModeButton_Impl {
-    fn OnChange(&self, guid: *const GUID) -> Result<()> {
-        if guid.is_null() {
-            return Ok(());
-        }
-        let guid = unsafe { *guid };
-        if guid == GUID_COMPARTMENT_KEYBOARD_INPUTMODE_CONVERSION {
-            // The taskbar or touch keyboard changed the NATIVE bit: follow it with OPENCLOSE
-            // (skipping equal values to avoid ping-pong).
-            if let Some(mode) = conversion_mode(&self.manager) {
-                let native = mode & TF_CONVERSIONMODE_NATIVE as i32 != 0;
-                if native != self.chinese() {
-                    set_keyboard_mode(&self.manager, self.client_id, native);
-                }
-            }
-            self.refresh();
-        } else if guid == GUID_COMPARTMENT_KEYBOARD_OPENCLOSE {
-            self.refresh();
-        }
-        Ok(())
-    }
-}
-/// Longest Shift hold that counts as a Chinese/English tap (longer is Shift+click selection and the
-/// like).
+/// Longest Shift hold that counts as a Chinese/English tap.
 const SHIFT_TAP_MAX: std::time::Duration = std::time::Duration::from_millis(600);
+
 fn is_shift(key: usize) -> bool {
     matches!(key, 0x10 | 0xA0 | 0xA1)
 }
@@ -1603,294 +1189,166 @@ impl TextService_Impl {
 
 impl ITfTextInputProcessor_Impl for TextService_Impl {
     fn Activate(&self, manager: Ref<ITfThreadMgr>, client_id: u32) -> Result<()> {
-        let manager = manager.ok()?.clone();
-        // Do the fallible cast before creating the receiver window that holds the self pointer, so
-        // a failure leaves no dangling pointer.
-        let keystroke: ITfKeystrokeMgr = manager.cast()?;
-        let receiver = unsafe { create_receiver(self as *const _ as *mut c_void) };
-        if receiver.is_null() {
-            return E_FAIL.ok();
-        }
-        let sink: ITfKeyEventSink = self.to_interface();
-        if let Err(error) = unsafe { keystroke.AdviseKeyEventSink(client_id, &sink, true) } {
-            unsafe {
-                DestroyWindow(receiver);
+        com_guard("Activate", || {
+            let manager = manager.ok()?.clone();
+            // Do the fallible cast before creating the receiver window that holds the self pointer, so
+            // a failure leaves no dangling pointer.
+            let keystroke: ITfKeystrokeMgr = manager.cast()?;
+            let receiver = unsafe { receiver::create_receiver(self as *const _ as *mut c_void) };
+            if receiver.is_null() {
+                return E_FAIL.ok();
             }
-            return Err(error);
-        }
-        self.receiver.set(receiver);
-        self.client_id.set(client_id);
-        if let Ok(source) = manager.cast::<ITfSource>() {
-            let event_sink: ITfThreadMgrEventSink = self.to_interface();
-            if let Ok(cookie) =
-                unsafe { source.AdviseSink(&ITfThreadMgrEventSink::IID, &event_sink) }
-            {
-                self.manager_sink_cookie.set(Some(cookie));
+            let sink: ITfKeyEventSink = self.to_interface();
+            if let Err(error) = unsafe { keystroke.AdviseKeyEventSink(client_id, &sink, true) } {
+                unsafe {
+                    DestroyWindow(receiver);
+                }
+                return Err(error);
             }
-        }
-        log("Activate");
-        TextService::ensure_keyboard_mode(&manager, client_id);
-        self.add_mode_button(&manager, client_id);
-        let description: Vec<u16> = "中英切换 Ctrl+Space".encode_utf16().collect();
-        if let Err(error) =
-            unsafe { keystroke.PreserveKey(client_id, &TOGGLE_KEY, &TOGGLE_CHORD, &description) }
-        {
-            unsafe {
-                OutputDebugStringW(
-                    wide(&format!("InputTranslation: Ctrl+Space 注册失败：{error}")).as_ptr(),
-                );
+            self.receiver.set(receiver);
+            self.client_id.set(client_id);
+            if let Ok(source) = manager.cast::<ITfSource>() {
+                let event_sink: ITfThreadMgrEventSink = self.to_interface();
+                if let Ok(cookie) =
+                    unsafe { source.AdviseSink(&ITfThreadMgrEventSink::IID, &event_sink) }
+                {
+                    self.manager_sink_cookie.set(Some(cookie));
+                }
             }
-        }
-        for (guid, chord, text) in [
-            (&PUNCT_KEY, &PUNCT_CHORD, "中/英文标点 Ctrl+."),
-            (&TRAD_KEY, &TRAD_CHORD, "简/繁输出 Ctrl+Shift+F"),
-        ] {
-            let description: Vec<u16> = text.encode_utf16().collect();
-            let _ = unsafe { keystroke.PreserveKey(client_id, guid, chord, &description) };
-        }
-        let history_text = OPTIONS.history_key();
-        if let Some(chord) = parse_hotkey(&history_text) {
-            let description: Vec<u16> = "输入记忆".encode_utf16().collect();
-            if unsafe { keystroke.PreserveKey(client_id, &HISTORY_KEY, &chord, &description) }
-                .is_ok()
-            {
-                self.history_chord.set(Some(chord));
+            log("Activate");
+            TextService::ensure_keyboard_mode(&manager, client_id);
+            self.add_mode_button(&manager, client_id);
+            let description: Vec<u16> = "中英切换 Ctrl+Space".encode_utf16().collect();
+            if let Err(error) = unsafe {
+                keystroke.PreserveKey(client_id, &TOGGLE_KEY, &TOGGLE_CHORD, &description)
+            } {
+                unsafe {
+                    OutputDebugStringW(
+                        wide(&format!("InputTranslation: Ctrl+Space 注册失败：{error}")).as_ptr(),
+                    );
+                }
             }
-        }
-        if let Some(chord) = parse_hotkey(&plain_toggle_text()) {
-            let description: Vec<u16> = "普通五笔模式 / 翻译模式".encode_utf16().collect();
-            if unsafe { keystroke.PreserveKey(client_id, &PLAIN_KEY, &chord, &description) }.is_ok()
-            {
-                self.plain_chord.set(Some(chord));
+            for (guid, chord, text) in [
+                (&PUNCT_KEY, &PUNCT_CHORD, "中/英文标点 Ctrl+."),
+                (&TRAD_KEY, &TRAD_CHORD, "简/繁输出 Ctrl+Shift+F"),
+            ] {
+                let description: Vec<u16> = text.encode_utf16().collect();
+                let _ = unsafe { keystroke.PreserveKey(client_id, guid, chord, &description) };
             }
-        }
-        let initial_context = unsafe { manager.GetFocus() }
-            .ok()
-            .and_then(|document| unsafe { document.GetTop() }.ok());
-        *self.thread_manager.borrow_mut() = Some(manager);
-        if let Some(context) = initial_context {
-            self.probe_scope(context);
-        }
-        Ok(())
+            let history_text = history_key_text();
+            if let Some(chord) = parse_hotkey(&history_text) {
+                let description: Vec<u16> = "输入记忆".encode_utf16().collect();
+                if unsafe { keystroke.PreserveKey(client_id, &HISTORY_KEY, &chord, &description) }
+                    .is_ok()
+                {
+                    self.history_chord.set(Some(chord));
+                }
+            }
+            if let Some(chord) = parse_hotkey(&plain_toggle_text()) {
+                let description: Vec<u16> = "普通五笔模式 / 翻译模式".encode_utf16().collect();
+                if unsafe { keystroke.PreserveKey(client_id, &PLAIN_KEY, &chord, &description) }
+                    .is_ok()
+                {
+                    self.plain_chord.set(Some(chord));
+                }
+            }
+            let initial_context = unsafe { manager.GetFocus() }
+                .ok()
+                .and_then(|document| unsafe { document.GetTop() }.ok());
+            *self.thread_manager.borrow_mut() = Some(manager);
+            if let Some(context) = initial_context {
+                self.probe_scope(context);
+            }
+            Ok(())
+        })
     }
     fn Deactivate(&self) -> Result<()> {
-        let editor_window = self.editor_window.get();
-        if !editor_window.is_null() {
-            unsafe {
-                PostMessageW(editor_window, WM_APP + 3, 0, 0);
+        com_guard("Deactivate", || {
+            let editor_window = self.editor_window.get();
+            if !editor_window.is_null() {
+                unsafe {
+                    PostMessageW(editor_window, WM_APP + 3, 0, 0);
+                }
+            } else if let Some(child) = self.editor.borrow_mut().as_mut() {
+                let _ = child.kill();
             }
-        } else if let Some(child) = self.editor.borrow_mut().as_mut() {
-            let _ = child.kill();
-        }
-        if let Some((context, cookie)) = self.edit_sink.borrow_mut().take()
-            && let Ok(source) = context.cast::<ITfSource>()
-        {
-            let _ = unsafe { source.UnadviseSink(cookie) };
-        }
-        if let Some(manager) = self.thread_manager.borrow_mut().take() {
-            self.remove_mode_button(&manager);
-            if let Some(cookie) = self.manager_sink_cookie.take()
-                && let Ok(source) = manager.cast::<ITfSource>()
+            if let Some((context, cookie)) = self.edit_sink.borrow_mut().take()
+                && let Ok(source) = context.cast::<ITfSource>()
             {
                 let _ = unsafe { source.UnadviseSink(cookie) };
             }
-            if let Ok(keystroke) = manager.cast::<ITfKeystrokeMgr>() {
-                let _ = unsafe { keystroke.UnpreserveKey(&TOGGLE_KEY, &TOGGLE_CHORD) };
-                let _ = unsafe { keystroke.UnpreserveKey(&PUNCT_KEY, &PUNCT_CHORD) };
-                let _ = unsafe { keystroke.UnpreserveKey(&TRAD_KEY, &TRAD_CHORD) };
-                if let Some(chord) = self.history_chord.take() {
-                    let _ = unsafe { keystroke.UnpreserveKey(&HISTORY_KEY, &chord) };
+            if let Some(manager) = self.thread_manager.borrow_mut().take() {
+                self.remove_mode_button(&manager);
+                if let Some(cookie) = self.manager_sink_cookie.take()
+                    && let Ok(source) = manager.cast::<ITfSource>()
+                {
+                    let _ = unsafe { source.UnadviseSink(cookie) };
                 }
-                if let Some(chord) = self.plain_chord.take() {
-                    let _ = unsafe { keystroke.UnpreserveKey(&PLAIN_KEY, &chord) };
+                if let Ok(keystroke) = manager.cast::<ITfKeystrokeMgr>() {
+                    let _ = unsafe { keystroke.UnpreserveKey(&TOGGLE_KEY, &TOGGLE_CHORD) };
+                    let _ = unsafe { keystroke.UnpreserveKey(&PUNCT_KEY, &PUNCT_CHORD) };
+                    let _ = unsafe { keystroke.UnpreserveKey(&TRAD_KEY, &TRAD_CHORD) };
+                    if let Some(chord) = self.history_chord.take() {
+                        let _ = unsafe { keystroke.UnpreserveKey(&HISTORY_KEY, &chord) };
+                    }
+                    if let Some(chord) = self.plain_chord.take() {
+                        let _ = unsafe { keystroke.UnpreserveKey(&PLAIN_KEY, &chord) };
+                    }
+                    let _ = unsafe { keystroke.UnadviseKeyEventSink(self.client_id.get()) };
                 }
-                let _ = unsafe { keystroke.UnadviseKeyEventSink(self.client_id.get()) };
             }
-        }
-        self.scope_cache.borrow_mut().take();
-        self.tested_key.borrow_mut().take();
-        let receiver = self.receiver.replace(null_mut());
-        if !receiver.is_null() {
-            unsafe {
-                SetWindowLongPtrW(receiver, GWLP_USERDATA, 0);
-                DestroyWindow(receiver);
-            }
-        }
-        self.reset_editor();
-        Ok(())
-    }
-}
-impl ITfKeyEventSink_Impl for TextService_Impl {
-    fn OnSetFocus(&self, foreground: BOOL) -> Result<()> {
-        self.tested_key.borrow_mut().take();
-        self.shift_down.set(None);
-        if foreground.as_bool() {
-            self.sync_plain_mode();
-        }
-        if foreground.as_bool()
-            && let Some(manager) = self.thread_manager.borrow().as_ref()
-            && let Ok(document) = unsafe { manager.GetFocus() }
-            && let Ok(context) = unsafe { document.GetTop() }
-        {
-            self.probe_scope(context);
-        }
-        Ok(())
-    }
-    fn OnTestKeyDown(
-        &self,
-        context: Ref<ITfContext>,
-        key: windows::Win32::Foundation::WPARAM,
-        _data: windows::Win32::Foundation::LPARAM,
-    ) -> Result<BOOL> {
-        self.track_key_down(key.0);
-        let consume = context.as_ref().is_some_and(|context| {
-            self.should_consume(context, key.0) || self.punctuation(context, key.0).is_some()
-        });
-        *self.tested_key.borrow_mut() = context
-            .as_ref()
-            .map(|context| (context.clone(), key.0, consume));
-        Ok(consume.into())
-    }
-    fn OnKeyDown(
-        &self,
-        context: Ref<ITfContext>,
-        key: windows::Win32::Foundation::WPARAM,
-        _data: windows::Win32::Foundation::LPARAM,
-    ) -> Result<BOOL> {
-        self.track_key_down(key.0);
-        let Some(context) = context.as_ref() else {
-            return Ok(false.into());
-        };
-        let tested = self.tested_key.borrow_mut().take();
-        let consume = tested
-            .as_ref()
-            .filter(|(tested_context, tested_key, _)| {
-                tested_context == context && *tested_key == key.0
-            })
-            .map(|(_, _, consume)| *consume)
-            .unwrap_or_else(|| self.should_consume(context, key.0));
-        if !self.buffering()
-            && !self.should_consume(context, key.0)
-            && let Some(text) = self.punctuation(context, key.0)
-        {
-            if key.0 == 0xDE {
-                let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
-                let mut quotes = self.quotes.get();
-                quotes.next(if shift { '"' } else { '\'' });
-                self.quotes.set(quotes);
-            }
-            self.after_digit.set(false);
-            return Ok(self.insert_direct(context, text).into());
-        }
-        // Remember digits so a following `.` `:` stays half-width (3.5, 10:30).
-        let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
-        self.after_digit
-            .set((!shift && (0x30..=0x39).contains(&key.0)) || (0x60..=0x69).contains(&key.0));
-        // Only letters go to the box; keys whose conditions changed since OnTestKeyDown (e.g. eaten
-        // by punctuation) are released.
-        if !consume || !(0x41..=0x5a).contains(&key.0) {
-            return Ok(false.into());
-        }
-        if self.buffering() {
-            self.pending_keys
-                .borrow_mut()
-                .push(typed_letter(key.0 as u8));
-            if !self.editor_window.get().is_null() {
-                self.allow_editor_foreground();
+            self.scope_cache.borrow_mut().take();
+            self.tested_key.borrow_mut().take();
+            let receiver = self.receiver.replace(null_mut());
+            if !receiver.is_null() {
                 unsafe {
-                    PostMessageW(self.receiver.get(), WM_APP + 1, 0, 0);
+                    SetWindowLongPtrW(receiver, GWLP_USERDATA, 0);
+                    DestroyWindow(receiver);
                 }
             }
-            return Ok(true.into());
-        }
-        Ok(self.open_editor(context.clone(), key.0 as u8).into())
-    }
-    fn OnTestKeyUp(
-        &self,
-        _context: Ref<ITfContext>,
-        key: windows::Win32::Foundation::WPARAM,
-        _data: windows::Win32::Foundation::LPARAM,
-    ) -> Result<BOOL> {
-        // A Shift released without being eaten reaches the host as usual; the toggle happens once
-        // (track_key_up clears the record).
-        self.track_key_up(key.0);
-        Ok(false.into())
-    }
-    fn OnKeyUp(
-        &self,
-        _context: Ref<ITfContext>,
-        key: windows::Win32::Foundation::WPARAM,
-        _data: windows::Win32::Foundation::LPARAM,
-    ) -> Result<BOOL> {
-        self.track_key_up(key.0);
-        Ok(false.into())
-    }
-    fn OnPreservedKey(&self, context: Ref<ITfContext>, guid: *const GUID) -> Result<BOOL> {
-        // Not in the editor process: the box handles these two shortcuts itself and keeps its code
-        // and draft.
-        if running_in_editor() || guid.is_null() {
-            return Ok(false.into());
-        }
-        let guid = unsafe { *guid };
-        if guid == HISTORY_KEY {
-            // Passed through to the application when history is off, a session is active, in
-            // English mode or in a password field.
-            self.refresh_editor();
-            let Some(context) = context.as_ref() else {
-                return Ok(false.into());
-            };
-            if !option(Flag::HistoryEnabled)
-                || self.buffering()
-                || !self.keyboard_open()
-                || TextService::disabled(context)
-                || self.password_scope(context)
-            {
-                return Ok(false.into());
-            }
-            return Ok(self.open_editor(context.clone(), RECALL).into());
-        }
-        let toggled = (guid == TOGGLE_KEY && self.toggle_keyboard_mode())
-            || (guid == PLAIN_KEY && self.toggle_plain_mode())
-            || (guid == PUNCT_KEY && toggle_option(Flag::PunctEnglish))
-            || (guid == TRAD_KEY && toggle_option(Flag::Traditional));
-        if toggled {
-            self.refresh_mode_button();
-        }
-        Ok(toggled.into())
+            self.reset_editor();
+            Ok(())
+        })
     }
 }
 impl ITfThreadMgrEventSink_Impl for TextService_Impl {
     fn OnInitDocumentMgr(&self, _document: Ref<ITfDocumentMgr>) -> Result<()> {
-        Ok(())
+        com_guard("OnInitDocumentMgr", || Ok(()))
     }
     fn OnUninitDocumentMgr(&self, _document: Ref<ITfDocumentMgr>) -> Result<()> {
-        Ok(())
+        com_guard("OnUninitDocumentMgr", || Ok(()))
     }
     fn OnSetFocus(
         &self,
         document: Ref<ITfDocumentMgr>,
         _previous: Ref<ITfDocumentMgr>,
     ) -> Result<()> {
-        self.scope_cache.borrow_mut().take();
-        self.tested_key.borrow_mut().take();
-        self.sync_plain_mode();
-        if let Some(document) = document.as_ref()
-            && let Ok(context) = unsafe { document.GetTop() }
-        {
-            self.probe_scope(context);
-        }
-        Ok(())
+        com_guard("OnSetFocus", || {
+            self.scope_cache.borrow_mut().take();
+            self.tested_key.borrow_mut().take();
+            self.sync_plain_mode();
+            if let Some(document) = document.as_ref()
+                && let Ok(context) = unsafe { document.GetTop() }
+            {
+                self.probe_scope(context);
+            }
+            Ok(())
+        })
     }
     fn OnPushContext(&self, context: Ref<ITfContext>) -> Result<()> {
-        if let Some(context) = context.as_ref() {
-            self.probe_scope(context.clone());
-        }
-        Ok(())
+        com_guard("OnPushContext", || {
+            if let Some(context) = context.as_ref() {
+                self.probe_scope(context.clone());
+            }
+            Ok(())
+        })
     }
     fn OnPopContext(&self, _context: Ref<ITfContext>) -> Result<()> {
-        self.scope_cache.borrow_mut().take();
-        self.tested_key.borrow_mut().take();
-        Ok(())
+        com_guard("OnPopContext", || {
+            self.scope_cache.borrow_mut().take();
+            self.tested_key.borrow_mut().take();
+            Ok(())
+        })
     }
 }
 impl ITfTextEditSink_Impl for TextService_Impl {
@@ -1900,164 +1358,13 @@ impl ITfTextEditSink_Impl for TextService_Impl {
         _cookie: u32,
         _record: Ref<ITfEditRecord>,
     ) -> Result<()> {
-        if let Some(context) = context.as_ref() {
-            self.probe_scope(context.clone());
-        }
-        Ok(())
-    }
-}
-
-unsafe fn create_receiver(service: *mut c_void) -> HWND {
-    let instance = MODULE.load(Ordering::SeqCst) as _;
-    let class = wide(WINDOW_CLASS);
-    let wc = WNDCLASSW {
-        lpfnWndProc: Some(receiver_proc),
-        hInstance: instance,
-        lpszClassName: class.as_ptr(),
-        ..unsafe { std::mem::zeroed() }
-    };
-    if unsafe { RegisterClassW(&wc) } == 0
-        && unsafe { GetLastError() } != ERROR_CLASS_ALREADY_EXISTS
-    {
-        return null_mut();
-    }
-    unsafe {
-        CreateWindowExW(
-            0,
-            class.as_ptr(),
-            wide("").as_ptr(),
-            0,
-            0,
-            0,
-            0,
-            0,
-            HWND_MESSAGE,
-            null_mut(),
-            instance,
-            service,
-        )
-    }
-}
-unsafe extern "system" fn receiver_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
-    if message == WM_CREATE {
-        let create = unsafe { &*(l as *const CREATESTRUCTW) };
-        unsafe {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
-        }
-        return 0;
-    }
-    if message == WM_COPYDATA {
-        let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TextService_Impl };
-        if pointer.is_null() || l == 0 {
-            return 0;
-        }
-        let mut sender_pid = 0;
-        unsafe {
-            GetWindowThreadProcessId(w as HWND, &mut sender_pid);
-        }
-        if sender_pid == 0
-            || unsafe {
-                (&(*pointer))
-                    .editor
-                    .borrow()
-                    .as_ref()
-                    .map(std::process::Child::id)
-            } != Some(sender_pid)
-        {
-            return 0;
-        }
-        let packet = unsafe { &*(l as *const COPYDATASTRUCT) };
-        if packet.dwData == 1 {
-            let ready = unsafe { (*pointer).editor_ready(w as HWND) };
-            if ready {
-                unsafe {
-                    PostMessageW(hwnd, WM_APP + 1, 0, 0);
-                }
+        com_guard("OnEndEdit", || {
+            if let Some(context) = context.as_ref() {
+                self.probe_scope(context.clone());
             }
-            return ready as LRESULT;
-        }
-        if packet.dwData != 0 {
-            return 0;
-        }
-        if packet.cbData == 0 {
-            return unsafe { (*pointer).commit(String::new()) as LRESULT };
-        }
-        if packet.cbData as usize > 1_000_000
-            || !packet.cbData.is_multiple_of(2)
-            || packet.lpData.is_null()
-        {
-            return 0;
-        }
-        let units = unsafe {
-            std::slice::from_raw_parts(packet.lpData as *const u16, packet.cbData as usize / 2)
-        };
-        let Ok(text) = String::from_utf16(units) else {
-            return 0;
-        };
-        return unsafe { (*pointer).commit(text) as LRESULT };
+            Ok(())
+        })
     }
-    if message == WM_APP + 1 {
-        let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TextService_Impl };
-        if !pointer.is_null() && unsafe { !(*pointer).flush_keys() } {
-            unsafe {
-                SetTimer(hwnd, FLUSH_TIMER, 100, None);
-            }
-        }
-        return 0;
-    }
-    if message == WM_TIMER && w == READY_TIMER {
-        unsafe {
-            KillTimer(hwnd, READY_TIMER);
-        }
-        let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TextService_Impl };
-        // The editor never became ready: end the session, give the buffered letters back to the
-        // host and return to normal.
-        if !pointer.is_null()
-            && unsafe { (&*pointer).editor_open.get() && (&*pointer).editor_window.get().is_null() }
-        {
-            unsafe {
-                OutputDebugStringW(
-                    wide("InputTranslation: 编辑器就绪超时，已归还缓存按键").as_ptr(),
-                );
-                {
-                    let mut editor = (&*pointer).editor.borrow_mut();
-                    if let Some(child) = editor.as_mut() {
-                        let _ = child.kill();
-                    }
-                }
-                (*pointer).restore_pending_keys();
-                (*pointer).reset_editor();
-            }
-        }
-        return 0;
-    }
-    if message == WM_TIMER && w == FLUSH_TIMER {
-        let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TextService_Impl };
-        if pointer.is_null() || unsafe { (*pointer).flush_keys() } {
-            unsafe {
-                KillTimer(hwnd, FLUSH_TIMER);
-            }
-        } else if unsafe { (&*pointer).flush_attempts.get() } >= 10 {
-            unsafe {
-                KillTimer(hwnd, FLUSH_TIMER);
-                {
-                    let mut editor = (&*pointer).editor.borrow_mut();
-                    if let Some(child) = editor.as_mut() {
-                        let _ = child.kill();
-                    }
-                }
-                (*pointer).restore_pending_keys();
-                (*pointer).reset_editor();
-            }
-        } else {
-            unsafe {
-                let service = &*pointer;
-                service.flush_attempts.set(service.flush_attempts.get() + 1);
-            }
-        }
-        return 0;
-    }
-    unsafe { DefWindowProcW(hwnd, message, w, l) }
 }
 
 #[unsafe(no_mangle)]
@@ -2066,9 +1373,20 @@ extern "system" fn DllGetClassObject(
     iid: *const GUID,
     out: *mut *mut c_void,
 ) -> HRESULT {
+    match std::panic::catch_unwind(|| dll_get_class_object(clsid, iid, out)) {
+        Ok(result) => result,
+        Err(_) => {
+            let _ = std::panic::catch_unwind(|| log("panic in DllGetClassObject"));
+            E_FAIL
+        }
+    }
+}
+
+fn dll_get_class_object(clsid: *const GUID, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
     if clsid.is_null() || iid.is_null() || out.is_null() {
         return E_FAIL;
     }
+    unsafe { *out = null_mut() };
     if unsafe { *clsid } != CLSID {
         return CLASS_E_CLASSNOTAVAILABLE;
     }
@@ -2081,11 +1399,23 @@ extern "system" fn DllCanUnloadNow() -> HRESULT {
 }
 #[unsafe(no_mangle)]
 extern "system" fn DllRegisterServer() -> HRESULT {
-    register().map_or_else(|error| error.code(), |_| S_OK)
+    match std::panic::catch_unwind(register) {
+        Ok(result) => result.map_or_else(|error| error.code(), |_| S_OK),
+        Err(_) => {
+            let _ = std::panic::catch_unwind(|| log("panic in DllRegisterServer"));
+            E_FAIL
+        }
+    }
 }
 #[unsafe(no_mangle)]
 extern "system" fn DllUnregisterServer() -> HRESULT {
-    unregister().map_or_else(|error| error.code(), |_| S_OK)
+    match std::panic::catch_unwind(unregister) {
+        Ok(result) => result.map_or_else(|error| error.code(), |_| S_OK),
+        Err(_) => {
+            let _ = std::panic::catch_unwind(|| log("panic in DllUnregisterServer"));
+            E_FAIL
+        }
+    }
 }
 #[unsafe(no_mangle)]
 extern "system" fn DllMain(instance: HINSTANCE, reason: u32, _reserved: *mut c_void) -> BOOL {
@@ -2093,4 +1423,15 @@ extern "system" fn DllMain(instance: HINSTANCE, reason: u32, _reserved: *mut c_v
         MODULE.store(instance.0, Ordering::SeqCst);
     }
     true.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panic_in_com_callback_becomes_e_fail() {
+        let result: Result<()> = com_guard("test", || panic!("test callback panic"));
+        assert_eq!(result.unwrap_err().code(), E_FAIL);
+    }
 }

@@ -21,6 +21,8 @@ pub struct ComposeOptions {
     pub learn: bool,
     /// Fuzzy pinyin (z/zh c/ch s/sh n/l an/ang en/eng in/ing); off by default.
     pub fuzzy: bool,
+    /// Rank exact pinyin before exact Wubi and disable Wubi auto-commit rules.
+    pub pinyin_first: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -66,7 +68,13 @@ impl Composer {
         let mut candidates = if code.is_empty() {
             Vec::new()
         } else {
-            input.candidates_with_options(&code, size * CANDIDATE_PAGES, size, options.fuzzy)
+            input.candidates_with_options(
+                &code,
+                size * CANDIDATE_PAGES,
+                size,
+                options.fuzzy,
+                options.pinyin_first,
+            )
         };
         self.hints.clear();
         for candidate in &mut candidates {
@@ -97,7 +105,19 @@ impl Composer {
             }
         }
         if options.learn {
-            learned.reorder(&code, &mut candidates);
+            if options.pinyin_first {
+                let exact_pinyin = candidates
+                    .iter()
+                    .take_while(|candidate| {
+                        candidate.source == Source::Pinyin && candidate.complete
+                    })
+                    .count();
+                let (pinyin, others) = candidates.split_at_mut(exact_pinyin);
+                learned.reorder(&code, pinyin);
+                learned.reorder(&code, others);
+            } else {
+                learned.reorder(&code, &mut candidates);
+            }
         }
         self.candidates = candidates;
         self.code = code;
@@ -170,7 +190,7 @@ impl Composer {
         // Fifth letter: after four letters that cannot continue as pinyin, commit the first
         // candidate, or drop the four letters if there is none; the new letter starts the next
         // character.
-        if rules.push_fifth && pushes_fifth(input, &code, letter) {
+        if !options.pinyin_first && rules.push_fifth && pushes_fifth(input, &code, letter) {
             if let Some(pick) = self.candidate_at(0).filter(|_| input.wubi_count(&code) > 0) {
                 picks.push(pick);
                 self.set_code(input, String::new(), options, learned);
@@ -182,7 +202,7 @@ impl Composer {
             self.set_code(input, code.clone(), options, learned);
         }
         // A unique four-letter Wubi code commits itself.
-        let auto = rules.auto_commit4 && auto_commits_four(input, &code);
+        let auto = !options.pinyin_first && rules.auto_commit4 && auto_commits_four(input, &code);
         if let Some(pick) = self.candidate_at(0).filter(|_| auto) {
             picks.push(pick);
             self.set_code(input, String::new(), options, learned);

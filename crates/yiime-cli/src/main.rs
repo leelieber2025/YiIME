@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use yiime_core::{ComposeOptions, Composer, Learned, MixedInput, PAGE_SIZE, PAGE_SIZE_RANGE};
 
 const USAGE: &str = "用法：yiime translate <中文>…（免费 Google 翻译，打印每次请求的计时）
-      yiime query <编码>… [--page-size N] [--pages N] [--traditional] [--fuzzy] [--words 文件 | --no-words] [--tsv]
+      yiime query <编码>… [--page-size N] [--pages N] [--traditional] [--fuzzy] [--pinyin-first] [--words 文件 | --no-words] [--tsv]
   大词库默认查找顺序：--words、环境变量 YIIME_WORDS、程序旁的 InputTranslation-words.txt、
   上级目录中的 data/frost/InputTranslation-words.txt 或 share/yiime/InputTranslation-words.txt。
   --words 的路径不能以 - 开头（写成 ./-文件名）。";
@@ -43,6 +43,7 @@ fn main() -> ExitCode {
     let mut pages = 1usize;
     let mut traditional = false;
     let mut fuzzy = false;
+    let mut pinyin_first = false;
     let mut tsv = false;
     let mut words: Option<Option<PathBuf>> = None;
     let mut rest = args[1..].iter();
@@ -64,6 +65,7 @@ fn main() -> ExitCode {
             }
             "--traditional" => traditional = true,
             "--fuzzy" => fuzzy = true,
+            "--pinyin-first" => pinyin_first = true,
             "--tsv" => tsv = true,
             "--no-words" => words = Some(None),
             "--words" => {
@@ -102,6 +104,7 @@ fn main() -> ExitCode {
         traditional,
         learn: false,
         fuzzy,
+        pinyin_first,
     };
     let learned = Learned::default();
     let mut composer = Composer::default();

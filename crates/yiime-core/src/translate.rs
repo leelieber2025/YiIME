@@ -316,6 +316,7 @@ fn run(
                 &settings.custom,
                 &mut first_byte,
                 started,
+                LLM_TIMEOUT,
             ),
         ),
     };
@@ -510,6 +511,7 @@ pub fn translate_openai_with(
         custom,
         &mut None,
         Instant::now(),
+        LLM_TIMEOUT,
     )
     .map_err(|fail| fail.message)
 }
@@ -524,6 +526,7 @@ fn llm(
     custom: &str,
     first_byte: &mut Option<u128>,
     started: Instant,
+    timeout: Duration,
 ) -> Result<String, Fail> {
     if endpoint.is_empty() || model.is_empty() || key.is_empty() {
         return Err(Fail::new("config", "请填写 API 地址、模型和密钥"));
@@ -546,7 +549,7 @@ fn llm(
     let send = |body: &Value| {
         agent
             .post(endpoint)
-            .timeout(LLM_TIMEOUT)
+            .timeout(timeout)
             .set("Authorization", &format!("Bearer {key}"))
             .send_json(body.clone())
     };
@@ -885,6 +888,10 @@ mod tests {
                         "500 Internal Server Error",
                         json!({"error": {"message": format!("echo: {body}")}}),
                     ),
+                    "rate" => (
+                        "429 Too Many Requests",
+                        json!({"error": {"message": "slow down"}}),
+                    ),
                     _ => (
                         "200 OK",
                         json!({"choices": [{"message": {
@@ -939,6 +946,70 @@ mod tests {
         assert!(line.ends_with("error=http 500"), "{line}");
         assert!(line.contains("chars=4"));
         assert!(!line.contains("秘密") && !line.contains("echo") && !line.contains("secret"));
+    }
+
+    #[test]
+    fn rate_limit_reports_http_status_without_logging_provider_text() {
+        let (url, server) = fake_llm(1);
+        let settings = ApiSettings {
+            engine: Engine::Llm,
+            url,
+            model: "rate".into(),
+            key: "key".into(),
+            ..ApiSettings::default()
+        };
+        let outcome = translate(&settings, "限流测试");
+        server.join().unwrap();
+        assert!(outcome.result.unwrap_err().contains("HTTP 429"));
+        assert_eq!(outcome.attempts[0].failure.as_deref(), Some("http 429"));
+        assert!(!outcome.attempts[0].log_line().contains("slow down"));
+    }
+
+    #[test]
+    fn llm_timeout_is_reported_without_waiting_for_production_timeout() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let server = std::thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+        });
+        let failure = llm(
+            "你好",
+            &url,
+            "slow",
+            "key",
+            TranslationStyle::default(),
+            "",
+            &mut None,
+            Instant::now(),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(failure.category, "timeout");
+    }
+
+    #[test]
+    fn failed_primary_engine_falls_back_to_configured_llm() {
+        let (url, server) = fake_llm(1);
+        let settings = ApiSettings {
+            engine: Engine::DeepL,
+            deepl_key: String::new(),
+            url,
+            model: "fallback".into(),
+            key: "key".into(),
+            ..ApiSettings::default()
+        };
+        let outcome = translate(&settings, "回退测试");
+        server.join().unwrap();
+        assert_eq!(outcome.result.as_deref(), Ok("full"));
+        assert_eq!(outcome.attempts.len(), 2);
+        assert_eq!(outcome.attempts[0].engine, Engine::DeepL);
+        assert_eq!(outcome.attempts[1].engine, Engine::Llm);
     }
 
     #[test]

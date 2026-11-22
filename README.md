@@ -16,7 +16,7 @@
 ## 功能
 
 - **五笔 86 + 拼音混输**：完整五笔码优先，其次全拼、简拼（`zgr` → 中国人、`yxyy` → 一心一意）、五笔前缀；拼音候选后标出五笔编码，方便记码。`'` 分隔音节（`xi'an` → 西安）。
-- **词库**：rime 五笔 86、rime 简体拼音、补充多字词与成语（编进程序），以及单独随包的白霜（rime-frost）大词库 30 万条。
+- **词库**：rime 五笔 86、rime 简体拼音、补充多字词与成语（编进程序），以及单独随包的白霜（rime-frost）大词库 30 万条。大词库在后台加载，浮动框先用内置词库打开，加载完成且当前没有组字时再切换。
 - **中译英**：
   - 默认 Azure 翻译（F0 免费档每月 200 万字符；填密钥和区域，未填时自动用免费 Google 翻译）；
   - 免费 Google 翻译（无需密钥，非官方接口，可能限流；限流后 5 分钟内自动跳过）；
@@ -33,6 +33,7 @@
 - **普通五笔模式**（不翻译）：Ctrl+Shift+Space、任务栏模式图标右键菜单或托盘菜单切换；选字直接上屏。任务栏图标：译 = 翻译模式，中 = 普通五笔模式，英 = 英文。
 - **拼音容错**：相邻字母打反（`zhonggou` → 中国）、uen/iou/uei 简写、全拼简拼混打（`beijingdx` → 北京大学）、按音节逐段选字。
 - **模糊音**（设置里开启）：z/zh、c/ch、s/sh、n/l、an/ang、en/eng、in/ing。
+- **拼音优先**（设置里开启，默认关）：完整拼音排在完整五笔码前面，并关闭四码唯一自动上屏和五码顶字。命令行对应 `yiime query --pinyin-first`。
 - **常用输入法约定**：
   - 空格/数字选字，`;` `'` 选第二/三候选；
   - `-` `=` 与 PageUp/PageDown 翻页（可选 `,` `.` 翻页）；
@@ -92,8 +93,8 @@ macOS（开发中）：在 Mac 上运行 `bash macos/build.sh`，生成 `dist/Yi
 | --- | --- |
 | `crates/yiime-core` | 平台无关核心：词典与索引、候选引擎、拼音容错、草稿、标点与简繁、设置模型、翻译客户端 |
 | `crates/yiime-cli` | 命令行工具 `yiime` |
-| `src/bin/windows_gui.rs` | Windows 浮动框、托盘与设置窗口 |
-| `windows/tsf` | TSF 输入法 DLL |
+| `src/bin/windows_gui.rs`、`src/bin/windows_gui/` | Windows 浮动框、托盘、设置、按键处理与进程通信；大词库在后台加载 |
+| `windows/tsf` | TSF 输入法 DLL；语言栏、按键回调、接收窗口和注册逻辑分模块实现 |
 | `windows/installer` | Inno Setup 安装脚本 |
 | `crates/yiime-ffi` | 给 macOS 输入法用的 C 接口 |
 | `macos` | macOS 输入法（Swift + InputMethodKit）、打包与端到端测试脚本 |

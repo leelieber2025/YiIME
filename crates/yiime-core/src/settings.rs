@@ -34,6 +34,7 @@ pub enum Flag {
     Learn,
     HistoryEnabled,
     FuzzyPinyin,
+    PinyinFirst,
     /// `,` `.` also page while composing (off by default: in Wubi they usually commit the first
     /// candidate).
     CommaPeriodPaging,
@@ -45,7 +46,7 @@ pub enum Flag {
 }
 
 impl Flag {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::PlainMode,
         Self::PunctEnglish,
         Self::Traditional,
@@ -55,6 +56,7 @@ impl Flag {
         Self::Learn,
         Self::HistoryEnabled,
         Self::FuzzyPinyin,
+        Self::PinyinFirst,
         Self::CommaPeriodPaging,
         Self::BracketCharPick,
         Self::AutoPair,
@@ -70,6 +72,7 @@ impl Flag {
             Self::Learn => "Learn",
             Self::HistoryEnabled => "HistoryEnabled",
             Self::FuzzyPinyin => "FuzzyPinyin",
+            Self::PinyinFirst => "PinyinFirst",
             Self::CommaPeriodPaging => "CommaPeriodPaging",
             Self::BracketCharPick => "BracketCharPick",
             Self::AutoPair => "AutoPair",
@@ -446,7 +449,8 @@ mod tests {
         assert_eq!(
             defaults,
             [
-                false, false, false, true, true, true, false, true, false, false, true, false
+                false, false, false, true, true, true, false, true, false, false, false, true,
+                false
             ]
         );
         assert_eq!(options.toggle(Flag::Learn), Some(true));

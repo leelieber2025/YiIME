@@ -549,10 +549,11 @@ impl MixedInput {
         limit: usize,
         page_size: usize,
     ) -> Vec<Candidate> {
-        self.candidates_with_options(raw, limit, page_size, false)
+        self.candidates_with_options(raw, limit, page_size, false, false)
     }
 
     /// Like [`Self::candidates_with_page`]; `fuzzy` enables fuzzy pinyin (z/zh, n/l, an/ang…).
+    /// `pinyin_first` ranks exact pinyin before full Wubi codes.
     ///
     /// Order: full Wubi code → exact pinyin → fuzzy pinyin → typo correction → initials → mixed
     /// full/initials → whole sentence → leading syllables → wildcard → Wubi prefix. Typo
@@ -564,6 +565,7 @@ impl MixedInput {
         limit: usize,
         page_size: usize,
         fuzzy: bool,
+        pinyin_first: bool,
     ) -> Vec<Candidate> {
         let code = raw.to_ascii_lowercase().replace([' ', '\''], "");
         if code.is_empty() {
@@ -637,12 +639,14 @@ impl MixedInput {
                 }
             }
         };
-        push(wubi, Source::Wubi, true);
-        push(
-            homophones.into_iter().map(|(text, _, _)| text).collect(),
-            Source::Pinyin,
-            true,
-        );
+        let pinyin: Vec<_> = homophones.into_iter().map(|(text, _, _)| text).collect();
+        if pinyin_first {
+            push(pinyin, Source::Pinyin, true);
+            push(wubi, Source::Wubi, true);
+        } else {
+            push(wubi, Source::Wubi, true);
+            push(pinyin, Source::Pinyin, true);
+        }
         if fuzzy {
             push(self.fuzzy(&code, &wanted, limit), Source::Pinyin, true);
         }

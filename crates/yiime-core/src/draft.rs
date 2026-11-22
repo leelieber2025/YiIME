@@ -50,10 +50,11 @@ impl Draft {
         if self.cursor == 0 {
             return;
         }
-        let byte = self.text.char_indices().nth(self.cursor - 1).unwrap().0;
-        self.text.remove(byte);
-        self.cursor -= 1;
-        self.translated = None;
+        if let Some((byte, _)) = self.text.char_indices().nth(self.cursor - 1) {
+            self.text.remove(byte);
+            self.cursor -= 1;
+            self.translated = None;
+        }
     }
 
     pub fn move_cursor(&mut self, delta: isize) {

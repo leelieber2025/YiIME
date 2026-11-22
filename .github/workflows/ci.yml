@@ -12,6 +12,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  msrv-core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.85.0
+      - run: cargo +1.85.0 test -p yiime-core -p yiime-cli -p yiime-ffi --locked
+  msrv-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.88.0
+      - run: cargo +1.88.0 build -p input_translation -p input_translation_tsf --locked
   fmt:
     runs-on: ubuntu-latest
     steps:
@@ -129,4 +145,3 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.deb
-

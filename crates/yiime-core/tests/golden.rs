@@ -26,6 +26,7 @@ fn options(page_size: usize) -> ComposeOptions {
         traditional: false,
         learn: false,
         fuzzy: false,
+        pinyin_first: false,
     }
 }
 
@@ -288,4 +289,36 @@ fn learning_reorders_like_v11() {
     assert_eq!(texts(&composer), ["外卖", "仙", "我们", "我妈", "文明"]);
     composer.set_code(input(), "wm".into(), &options(5), &learned);
     assert_eq!(texts(&composer)[0], "仙"); // No adjustment when learning is off
+}
+
+#[test]
+fn pinyin_first_ranks_pinyin_and_disables_wubi_automatic_commits() {
+    let input = MixedInput::from_rime(
+        "...\n二\tfan\t9\n甲\taaaa\t9\n乙\tbbbb\t9\n",
+        "...\n翻\tfan\t9\n",
+    );
+    let options = ComposeOptions {
+        pinyin_first: true,
+        ..options(9)
+    };
+    let learned = Learned::default();
+    let mut composer = Composer::default();
+    composer.set_code(&input, "fan".into(), &options, &learned);
+    assert_eq!(composer.candidates[0].text, "翻");
+    assert_eq!(composer.candidates[0].source, Source::Pinyin);
+    assert_eq!(composer.candidates[1].text, "二");
+
+    composer.set_code(&input, String::new(), &options, &learned);
+    let rules = LetterRules {
+        push_fifth: true,
+        auto_commit4: true,
+    };
+    for letter in "aaaaa".chars() {
+        assert!(
+            composer
+                .type_letter(&input, letter, rules, &options, &learned)
+                .is_empty()
+        );
+    }
+    assert_eq!(composer.code, "aaaaa");
 }
