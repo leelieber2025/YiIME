@@ -45,8 +45,12 @@ jobs:
         with:
           toolchain: 1.96.1
           targets: x86_64-pc-windows-gnu
+          components: clippy
       - name: Install MinGW
         run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64-posix binutils-mingw-w64-x86-64
+      # Windows-only code (YiIME.exe, the TSF DLL) only compiles for a Windows target.
+      - name: Clippy (Windows target)
+        run: cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-gnu -- -D warnings
       # Source hash must match; EXE/DLL are not yet byte-reproducible, so only warn.
       - name: Build actual release target twice
         run: |
@@ -133,6 +137,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.96.1
+          components: clippy
+      # Warnings fail the build; this is what enforces clippy::unwrap_used outside tests.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Tests (core, CLI, FFI)
         run: cargo test -p yiime-core -p yiime-cli -p yiime-ffi
       - name: Build CLI
