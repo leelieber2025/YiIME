@@ -7,8 +7,9 @@ use serde_json::json;
 use std::ffi::{CStr, CString, c_char};
 use std::sync::OnceLock;
 use yiime_core::{
-    ApiSettings, ComposeOptions, Composer, Draft, Engine, Learned, LetterAction, LetterRules,
-    MixedInput, Pick, classify_letter, is_literal_in_english, literal_code, paging_direction,
+    ApiSettings, ComposeOptions, Composer, Draft, Engine, Flushed, Learned, LetterAction,
+    LetterRules, MixedInput, Pick, RequestGate, classify_letter, is_literal_in_english,
+    literal_code, paging_direction,
 };
 
 fn input() -> &'static MixedInput {
@@ -36,6 +37,8 @@ pub struct Ime {
     draft: Draft,
     english: bool,
     learned: Learned,
+    /// Pending translation; kept when the session text is taken (see [`yiime_begin_request`]).
+    requests: RequestGate,
 }
 
 impl Ime {
@@ -60,7 +63,19 @@ impl Ime {
         self.draft.insert(&pick.text);
         self.set_code(pick.rest);
     }
-    /// Commits the first candidate if there is one, otherwise the raw letters.
+    /// Commits the whole code segment by segment (see [`Composer::flush_all`]), so nothing is
+    /// lost when the session ends and punctuation typed next lands after all of it.
+    fn flush_all(&mut self) {
+        let steps = self.composer.flush_all(input(), &OPTIONS, &self.learned);
+        for step in steps {
+            match step {
+                Flushed::Pick(pick) => self.draft.insert(&pick.text),
+                Flushed::Raw(raw) => self.draft.insert(&raw.replace('\'', "")),
+            }
+        }
+    }
+    /// Space: commits the first candidate if there is one (a partial one leaves the rest of the
+    /// code composing), otherwise the raw letters.
     fn flush_first(&mut self) {
         if !self.composer.is_composing() {
             return;
@@ -137,12 +152,12 @@ impl Ime {
                 true
             }
             Some(LetterAction::Raw { .. }) if self.active() => {
-                self.flush_first();
+                self.flush_all();
                 self.draft.insert(&ch.to_string());
                 true
             }
             _ if self.active() && !ch.is_control() => {
-                self.flush_first();
+                self.flush_all();
                 let text = yiime_core::full_width(ch, false)
                     .map(str::to_owned)
                     .unwrap_or_else(|| ch.to_string());
@@ -170,12 +185,14 @@ impl Ime {
         }
         self.set_code(String::new());
     }
-    /// Ends the session and returns the Chinese text to commit (a pending code commits its first
-    /// candidate).
+    /// Ends the session and returns the Chinese text to commit (a pending code is committed whole,
+    /// segment by segment).
     pub fn take_text(&mut self) -> String {
-        self.flush_first();
+        self.flush_all();
         let text = self.draft.text().to_owned();
+        let requests = std::mem::take(&mut self.requests);
         *self = Ime::default();
+        self.requests = requests;
         text
     }
     /// Current state as JSON: code, draft, english, candidates (text, hint), page.
@@ -390,6 +407,36 @@ pub unsafe extern "C" fn yiime_translate(
     )
 }
 
+/// Starts an asynchronous request (a translation) for this session and returns its id, or 0 on
+/// failure. Its result may be used only if [`yiime_finish_request`] later returns true.
+///
+/// # Safety
+/// `ime` is null or comes from [`yiime_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yiime_begin_request(ime: *mut Ime) -> u64 {
+    unsafe { guard_ime(ime, 0, |ime| ime.requests.begin()) }
+}
+
+/// The session ended or moved to another client (deactivation, app switch): results of pending
+/// requests must be dropped.
+///
+/// # Safety
+/// `ime` is null or comes from [`yiime_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yiime_cancel_request(ime: *mut Ime) {
+    unsafe { guard_ime(ime, (), |ime| ime.requests.cancel()) }
+}
+
+/// Request `id` completed: true if its result may be committed now (still the current request,
+/// not cancelled), at most once; false means drop it.
+///
+/// # Safety
+/// `ime` is null or comes from [`yiime_new`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yiime_finish_request(ime: *mut Ime, id: u64) -> bool {
+    unsafe { guard_ime(ime, false, |ime| ime.requests.finish(id)) }
+}
+
 /// # Safety
 /// `text` is the string returned from this library.
 #[unsafe(no_mangle)]
@@ -407,6 +454,65 @@ mod tests {
         for ch in text.chars() {
             ime.key(ch);
         }
+    }
+
+    /// What committing `code` whole gives, segment by segment (the reference for the tests below).
+    fn segments(code: &str) -> Vec<String> {
+        let mut composer = Composer::default();
+        let learned = Learned::default();
+        composer.set_code(input(), code.to_owned(), &OPTIONS, &learned);
+        composer
+            .flush_all(input(), &OPTIONS, &learned)
+            .into_iter()
+            .map(|step| match step {
+                Flushed::Pick(pick) => pick.text,
+                Flushed::Raw(raw) => raw,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ending_the_session_commits_the_leftover_code() {
+        let leftover = segments("x").concat();
+        assert!(!leftover.is_empty());
+        assert_eq!(segments("zhongguox"), ["中国".to_owned(), leftover.clone()]);
+        let mut ime = Ime::default();
+        typed(&mut ime, "zhongguox");
+        assert_eq!(ime.code(), "zhongguox");
+        // Before: only 中国 was committed and the `x` was dropped.
+        assert_eq!(ime.take_text(), format!("中国{leftover}"));
+        assert!(!ime.active());
+    }
+
+    #[test]
+    fn multi_segment_codes_commit_every_segment_in_order() {
+        let code = "zhongguoxian";
+        let steps = segments(code);
+        let expected = steps.concat();
+        assert!(!expected.is_empty());
+        let mut ime = Ime::default();
+        typed(&mut ime, "q ");
+        typed(&mut ime, code);
+        assert_eq!(ime.take_text(), format!("我{expected}"));
+        // Letters with no candidate at all are committed as typed.
+        let mut composer = Composer::default();
+        let learned = Learned::default();
+        composer.set_code(input(), "vvvv".to_owned(), &OPTIONS, &learned);
+        let steps = composer.flush_all(input(), &OPTIONS, &learned);
+        assert!(composer.code.is_empty());
+        assert!(!steps.is_empty());
+    }
+
+    #[test]
+    fn punctuation_lands_after_the_whole_code() {
+        let leftover = segments("x").concat();
+        let mut ime = Ime::default();
+        typed(&mut ime, "zhongguox,");
+        // Before: 中国，then the `x` candidate after the comma (or lost).
+        assert_eq!(ime.draft(), format!("中国{leftover}，"));
+        assert!(ime.code().is_empty());
+        typed(&mut ime, "zhongguox.");
+        assert_eq!(ime.take_text(), format!("中国{leftover}，中国{leftover}。"));
     }
 
     #[test]
@@ -509,9 +615,43 @@ mod tests {
             let text = yiime_take_text(ime);
             assert_eq!(CStr::from_ptr(text).to_str().unwrap(), "我");
             yiime_string_free(text);
+            inject_panic();
+            assert_eq!(yiime_begin_request(ime), 0);
+            inject_panic();
+            yiime_cancel_request(ime);
+            inject_panic();
+            assert!(!yiime_finish_request(ime, 1));
             // Null sessions are rejected without touching anything.
             assert!(!yiime_key(std::ptr::null_mut(), 'a' as u32));
+            assert_eq!(yiime_begin_request(std::ptr::null_mut()), 0);
             assert!(yiime_state(std::ptr::null()).is_null());
+            yiime_free(ime);
+        }
+    }
+
+    #[test]
+    fn translation_results_commit_only_into_the_session_that_asked() {
+        unsafe {
+            let ime = yiime_new();
+            for ch in "nihao".chars() {
+                yiime_key(ime, ch as u32);
+            }
+            // Enter: the text is taken, then the translation starts.
+            yiime_string_free(yiime_take_text(ime));
+            let first = yiime_begin_request(ime);
+            assert_ne!(first, 0);
+            // The user switches applications before the result arrives.
+            yiime_cancel_request(ime);
+            assert!(!yiime_finish_request(ime, first), "stale result is dropped");
+            // A new translation in the next session; taking its text keeps the request.
+            for ch in "q".chars() {
+                yiime_key(ime, ch as u32);
+            }
+            let second = yiime_begin_request(ime);
+            yiime_string_free(yiime_take_text(ime));
+            assert!(!yiime_finish_request(ime, first));
+            assert!(yiime_finish_request(ime, second));
+            assert!(!yiime_finish_request(ime, second), "committed once");
             yiime_free(ime);
         }
     }

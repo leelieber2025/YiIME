@@ -75,16 +75,26 @@ unsafe fn pick_first_or_raw(hwnd: HWND, state: &State) {
     }
 }
 /// Punctuation, Shift+letter, Ctrl+Enter: commit the whole code, picking the first candidate
-/// segment by segment until it is used up.
+/// segment by segment until it is used up (shared with macOS: [`yiime_core::Composer::flush_all`]).
 unsafe fn flush_composition(hwnd: HWND, state: &State) {
-    for _ in 0..MAX_CODE_LEN {
-        if state.composition.borrow().code.is_empty() {
-            break;
-        }
-        unsafe {
-            pick_first_or_raw(hwnd, state);
+    if state.composition.borrow().code.is_empty() {
+        return;
+    }
+    let steps = state.composition.borrow_mut().flush_all(
+        &state.input.borrow(),
+        &compose_options(),
+        &state.learned.borrow(),
+    );
+    for step in steps {
+        match step {
+            yiime_core::Flushed::Pick(pick) => {
+                remember_pick(state, &pick.code, &pick.text);
+                unsafe { insert_text(state, &pick.text) };
+            }
+            yiime_core::Flushed::Raw(raw) => unsafe { insert_text(state, &raw) },
         }
     }
+    unsafe { set_code(hwnd, state, String::new()) };
 }
 unsafe fn turn_page(hwnd: HWND, state: &State, forward: bool) {
     state.composition.borrow_mut().turn_page(forward);
@@ -173,6 +183,10 @@ pub(super) unsafe fn handle_char(hwnd: HWND, state: &State, unit: u32) -> bool {
     let numpad = ch != '\n' && state.numpad.replace(false);
     let code = state.composition.borrow().code.clone();
     let composing = !code.is_empty();
+    if !composing {
+        // A new code: pick up user words imported or edited since the last one.
+        refresh_user_words(state);
+    }
     let shuangpin = OPTIONS.shuangpin();
     let selection = match shuangpin {
         _ if !composing || !option(Flag::SemicolonSelect) => None,

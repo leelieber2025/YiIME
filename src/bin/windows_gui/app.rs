@@ -12,7 +12,6 @@ mod tray;
 use history::{history_proc, open_history};
 use settings::{open_settings, settings_proc};
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -63,9 +62,10 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use yiime_core::{
     ApiSettings, ComposeOptions, Composer, Engine, Flag, HISTORY_CAP, HISTORY_FILE, History,
-    HistoryEntry, Hotkey, LEARNED_FILE, Learned, LetterRules, MAX_CODE_LEN, MixedInput,
+    HistoryEntry, HostOwner, Hotkey, LEARNED_FILE, Learned, LetterRules, MAX_CODE_LEN, MixedInput,
     OptionStore, Options, Quotes, Sealer, Shuangpin, TranslationStyle, USER_WORDS_FILE,
-    history_label, parse_hotkey, parse_page_size, selection_index, single_line,
+    UserWordsReloader, WatchedHosts, history_label, parse_hotkey, parse_page_size, selection_index,
+    single_line,
 };
 
 const DRAFT: i32 = 103;
@@ -123,7 +123,8 @@ const IDLE_EXIT_MS: u32 = 30 * 60 * 1000;
 /// Keeps the watchdog heartbeat going while the message loop is idle.
 const HEARTBEAT_TIMER: usize = 9;
 /// Window class of the TSF DLL's message-only receiver windows.
-const TSF_RECEIVER_CLASS: &str = "InputTranslationTsfReceiver";
+/// Receivers of DLLs speaking another protocol version have another class and are refused.
+const TSF_RECEIVER_CLASS: &str = yiime_core::TSF_RECEIVER_CLASS;
 /// Registry key shared with the TSF DLL.
 const STATE_KEY: &str = "Software\\YiIME";
 /// Settings key and %APPDATA% folder used by 0.1.x; migrated once (see [`migrate_settings`]).
@@ -295,8 +296,11 @@ struct State {
     /// Started by an elevated / high-integrity application (`--private`): serves only that
     /// application's receiver and exits when its session or host ends.
     private: bool,
-    /// Receivers whose host process is being watched (see [`watch_tsf_owner`]).
-    watched_receivers: RefCell<HashSet<usize>>,
+    /// Receivers whose host process is being watched (see [`watch_tsf_owner`]), keyed by handle
+    /// and owner so reused window handles are watched again.
+    watched_receivers: RefCell<WatchedHosts>,
+    /// user_words.txt as last loaded; checked when a session or a code starts.
+    user_words: RefCell<UserWordsReloader>,
     finished: Cell<bool>,
     /// The plain-mode shortcut was pressed in the box: swallow the WM_CHAR it produces.
     swallow_char: Cell<bool>,
@@ -1005,6 +1009,7 @@ unsafe fn activate(hwnd: HWND, state: &State, target: HWND, anchor: Option<RECT>
     unsafe {
         KillTimer(hwnd, IDLE_TIMER);
     }
+    refresh_user_words(state);
     state.target.set(target);
     state.finished.set(false);
     state.pending.set(false);
@@ -1094,14 +1099,26 @@ fn is_tsf_receiver(hwnd: HWND) -> bool {
     let len = unsafe { GetClassNameW(hwnd, name.as_mut_ptr(), name.len() as i32) };
     len > 0 && String::from_utf16_lossy(&name[..len as usize]) == TSF_RECEIVER_CLASS
 }
-/// Watches the process owning `receiver` once, so its session ends when it exits.
+/// Owner process and thread of `receiver`, None when the window is gone.
+fn receiver_owner(receiver: HWND) -> Option<HostOwner> {
+    if unsafe { IsWindow(receiver) } == 0 {
+        return None;
+    }
+    let mut pid = 0;
+    let thread = unsafe { GetWindowThreadProcessId(receiver, &mut pid) };
+    (pid != 0 && thread != 0).then_some(HostOwner { pid, thread })
+}
+/// Watches the process owning `receiver` so its session ends when it exits. Checked again on
+/// every session start: a reused window handle from another process is watched anew.
 fn watch_receiver(hwnd: HWND, state: &State, receiver: HWND) {
+    let owner = receiver_owner(receiver);
     if state
         .watched_receivers
         .borrow_mut()
-        .insert(receiver as usize)
+        .session_started(receiver as usize, owner)
+        && let Some(owner) = owner
     {
-        watch_tsf_owner(receiver, hwnd);
+        watch_tsf_owner(receiver, owner.pid, hwnd);
     }
 }
 /// Another application starts a session: end the current one (telling its DLL), drop its draft
@@ -1272,6 +1289,23 @@ fn adopt_full_input(state: &State) {
         && state.composition.borrow().code.is_empty()
     {
         *state.input.borrow_mut() = input.clone();
+        // The snapshot was built with the user words of startup; bring it up to date.
+        state.user_words.borrow_mut().invalidate();
+        refresh_user_words(state);
+    }
+}
+/// Reloads user_words.txt into the dictionaries in use when it changed since the last load (an
+/// import from any settings window, or an edit in Notepad). Cheap when nothing changed (one
+/// metadata call); runs when a session or a code starts.
+fn refresh_user_words(state: &State) {
+    let Some(contents) = state.user_words.borrow_mut().check() else {
+        return;
+    };
+    state.input.borrow().set_user_words(&contents);
+    if let Some(full) = state.full_input.get()
+        && !Arc::ptr_eq(full, &state.input.borrow())
+    {
+        full.set_user_words(&contents);
     }
 }
 unsafe fn on_translated(hwnd: HWND, state: &State, response: TranslationResult) {
@@ -1491,11 +1525,21 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             }
             0
         }
-        // The application owning receiver `w` deactivated the IME or exited: end its session.
-        // The service itself stays resident for other applications (until IDLE_TIMER).
+        // The application owning receiver `w` deactivated the IME (from its DLL, lParam 0) or
+        // exited (from the exit watch, lParam = its process id): end its session. An exit notice
+        // about an earlier owner of a reused handle is ignored. The service itself stays resident
+        // for other applications (until IDLE_TIMER).
         WM_TSF_EXIT => {
+            let current_host = |state: &State| {
+                l == 0
+                    || state
+                        .watched_receivers
+                        .borrow_mut()
+                        .host_exited(w, l as u32)
+            };
             if let Some(state) = state
                 && w != 0
+                && current_host(state)
                 && w as HWND == state.tsf_receiver.get()
             {
                 state.finished.set(true);
@@ -1617,7 +1661,9 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
     let input = MixedInput::bundled();
     // User words: %APPDATA%\\YiIME\\user_words.txt, `word code` per line, ranked
     // first under that code.
-    let user_words = user_words_path().and_then(|path| std::fs::read_to_string(path).ok());
+    // Reloaded in place when the file changes (an import, or an edit in Notepad), so the resident
+    // service shows new words without a restart.
+    let (user_words_reloader, user_words) = UserWordsReloader::load(user_words_path());
     let input = match &user_words {
         Some(words) => input.with_user_words(words),
         None => input,
@@ -1680,7 +1726,8 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
             tsf_receiver: Cell::new(tsf_receiver),
             tsf_service: !tsf_receiver.is_null(),
             private: !tsf_receiver.is_null() && std::env::args().any(|arg| arg == "--private"),
-            watched_receivers: RefCell::new(HashSet::new()),
+            watched_receivers: RefCell::new(WatchedHosts::default()),
+            user_words: RefCell::new(user_words_reloader),
             finished: Cell::new(false),
             swallow_char: Cell::new(false),
             last_plain: Cell::new(plain_mode()),

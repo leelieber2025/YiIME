@@ -222,7 +222,41 @@ fn set_google_blocked(on: bool) {
 
 type CacheKey = (Engine, String, String, TranslationStyle, String, String);
 const CACHE_CAP: usize = 128;
-static CACHE: Mutex<Vec<(CacheKey, String)>> = Mutex::new(Vec::new());
+static CACHE: Mutex<TranslationCache> = Mutex::new(TranslationCache::new());
+
+/// Recent translations. Each entry remembers the service that actually produced it, so a result
+/// from a fallback service is not handed out once fallback is turned off (that text came from a
+/// service the user no longer allows).
+struct TranslationCache {
+    entries: Vec<(CacheKey, Engine, String)>,
+}
+
+impl TranslationCache {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// A cached result for `key`: one produced by `primary`, or by any service when
+    /// `allow_fallback` is on.
+    fn get(&self, key: &CacheKey, primary: Engine, allow_fallback: bool) -> Option<&str> {
+        self.entries
+            .iter()
+            .rev()
+            .find(|(k, provider, _)| k == key && (allow_fallback || *provider == primary))
+            .map(|(_, _, text)| text.as_str())
+    }
+
+    fn put(&mut self, key: CacheKey, provider: Engine, text: String) {
+        self.entries
+            .retain(|(k, other, _)| !(k == &key && *other == provider));
+        if self.entries.len() >= CACHE_CAP {
+            self.entries.remove(0);
+        }
+        self.entries.push((key, provider, text));
+    }
+}
 
 fn cache_key(settings: &ApiSettings, source: &str) -> CacheKey {
     (
@@ -239,17 +273,6 @@ fn cache_key(settings: &ApiSettings, source: &str) -> CacheKey {
 /// falls back to the LLM. Recent results are cached; free Google is skipped for a while after 429.
 pub fn translate(settings: &ApiSettings, source: &str) -> Outcome {
     let key = cache_key(settings, source);
-    {
-        let cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((_, text)) = cache.iter().find(|(k, _)| *k == key) {
-            return Outcome {
-                result: Ok(text.clone()),
-                attempts: Vec::new(),
-            };
-        }
-    }
-    let mut attempts = Vec::new();
-    let llm_ok = settings.validate_llm().is_ok();
     let engine = match settings.engine {
         Engine::Azure if settings.azure_key.trim().is_empty() => Engine::GoogleFree,
         other => other,
@@ -257,8 +280,22 @@ pub fn translate(settings: &ApiSettings, source: &str) -> Outcome {
     // Using another service after a failure sends the text somewhere the user did not pick, so
     // it only happens when the setting allows it (off by default).
     let fallback = settings.allow_fallback;
+    {
+        let cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(text) = cache.get(&key, engine, fallback) {
+            return Outcome {
+                result: Ok(text.to_owned()),
+                attempts: Vec::new(),
+            };
+        }
+    }
+    let mut attempts = Vec::new();
+    let llm_ok = settings.validate_llm().is_ok();
     let skip_google = fallback && engine == Engine::GoogleFree && llm_ok && google_blocked();
+    // Service that produced the result, for the cache.
+    let mut provider = engine;
     let result = if skip_google {
+        provider = Engine::Llm;
         run(settings, Engine::Llm, source, &mut attempts)
     } else {
         let first = run(settings, engine, source, &mut attempts);
@@ -269,10 +306,12 @@ pub fn translate(settings: &ApiSettings, source: &str) -> Outcome {
         let could_fall_back = (engine != Engine::Llm && llm_ok) || engine == Engine::Azure;
         match first {
             Err(error) if fallback && engine != Engine::Llm && llm_ok => {
+                provider = Engine::Llm;
                 run(settings, Engine::Llm, source, &mut attempts)
                     .map_err(|llm| format!("{error}；改用大模型也失败：{llm}"))
             }
             Err(error) if fallback && engine == Engine::Azure && !google_blocked() => {
+                provider = Engine::GoogleFree;
                 run(settings, Engine::GoogleFree, source, &mut attempts)
                     .map_err(|google| format!("{error}；改用 Google 也失败：{google}"))
             }
@@ -281,11 +320,10 @@ pub fn translate(settings: &ApiSettings, source: &str) -> Outcome {
         }
     };
     if let Ok(text) = &result {
-        let mut cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-        if cache.len() >= CACHE_CAP {
-            cache.remove(0);
-        }
-        cache.push((key, text.clone()));
+        CACHE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .put(key, provider, text.clone());
     }
     Outcome { result, attempts }
 }
@@ -1218,5 +1256,54 @@ mod tests {
         let json = serde_json::json!([{"translations": [{"text": " Hello ", "to": "en"}]}]);
         assert_eq!(super::parse_azure(&json).unwrap(), "Hello");
         assert!(super::parse_azure(&serde_json::json!([])).is_err());
+    }
+
+    #[test]
+    fn cached_fallback_results_need_fallback_allowed() {
+        let settings = ApiSettings {
+            engine: Engine::GoogleFree,
+            ..ApiSettings::default()
+        };
+        let key = cache_key(&settings, "你好");
+        let mut cache = TranslationCache::new();
+        // Google failed and the LLM (fallback) answered.
+        cache.put(key.clone(), Engine::Llm, "Hello (LLM)".to_owned());
+        assert_eq!(
+            cache.get(&key, Engine::GoogleFree, true),
+            Some("Hello (LLM)")
+        );
+        // Fallback turned off: only results from the selected service count.
+        assert_eq!(cache.get(&key, Engine::GoogleFree, false), None);
+        cache.put(key.clone(), Engine::GoogleFree, "Hello".to_owned());
+        assert_eq!(cache.get(&key, Engine::GoogleFree, false), Some("Hello"));
+        // A different text or style is a different key.
+        let other = cache_key(&settings, "再见");
+        assert_eq!(cache.get(&other, Engine::GoogleFree, true), None);
+    }
+
+    #[test]
+    fn translation_cache_is_bounded_and_replaces_entries() {
+        let settings = ApiSettings::default();
+        let mut cache = TranslationCache::new();
+        for i in 0..CACHE_CAP + 10 {
+            cache.put(
+                cache_key(&settings, &i.to_string()),
+                Engine::Llm,
+                i.to_string(),
+            );
+        }
+        assert_eq!(cache.entries.len(), CACHE_CAP);
+        assert_eq!(
+            cache.get(&cache_key(&settings, "0"), Engine::Llm, false),
+            None
+        );
+        let key = cache_key(&settings, "x");
+        cache.put(key.clone(), Engine::Llm, "a".to_owned());
+        cache.put(key.clone(), Engine::Llm, "b".to_owned());
+        assert_eq!(cache.get(&key, Engine::Llm, false), Some("b"));
+        assert_eq!(
+            cache.entries.iter().filter(|(k, _, _)| *k == key).count(),
+            1
+        );
     }
 }

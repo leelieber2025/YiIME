@@ -63,7 +63,7 @@ YiIME 译（五笔） — TSF 系统输入法实验版（Windows 11 x64）
    - Ctrl+. 切换中/英文标点；输入框没打开时，中文标点（，。？！；：“”‘’《》【】、……——￥·～（））也直接上屏（数字后的 . 和 : 保持半角）；
    - Ctrl+Shift+F 切换简/繁输出（OpenCC 词组+单字转换）；
    - 自学习（默认关）：按选用次数调整同一编码的候选顺序，记录在 %APPDATA%\YiIME\learned.dat（加密）；
-   - 用户词库：%APPDATA%\YiIME\user_words.txt，每行「词 编码」，排在该编码第一位（设置窗口「用户词库…」用记事本打开，重新唤出输入框后生效）。
+   - 用户词库：%APPDATA%\YiIME\user_words.txt，每行「词 编码」，排在该编码第一位（设置窗口「用户词库…」用记事本打开，保存后从下一次输入起生效）。
 
 输入法 DLL 与 EXE 会安装到 Program Files\YiIME 的版本目录；升级时保留仍被应用占用的旧版文件。
 如需卸载，以管理员身份运行：powershell -ExecutionPolicy Bypass -File .\Uninstall-YiIME.ps1

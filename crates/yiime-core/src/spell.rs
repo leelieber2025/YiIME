@@ -40,6 +40,26 @@ impl SyllableTable {
     pub(super) fn is_syllable(&self, text: &str) -> bool {
         self.full.contains(text)
     }
+    /// Whether `code` splits into whole syllables (`xian` → xi·an or xian).
+    pub(super) fn spells(&self, code: &str) -> bool {
+        if code.is_empty() || !code.is_ascii() {
+            return false;
+        }
+        // reachable[i]: code[..i] is a run of syllables.
+        let mut reachable = vec![false; code.len() + 1];
+        reachable[0] = true;
+        for start in 0..code.len() {
+            if !reachable[start] {
+                continue;
+            }
+            for end in start + 1..=code.len().min(start + self.max_len) {
+                if self.is_syllable(&code[start..end]) {
+                    reachable[end] = true;
+                }
+            }
+        }
+        reachable[code.len()]
+    }
     fn is_prefix(&self, text: &str) -> bool {
         self.prefix.contains(text)
     }

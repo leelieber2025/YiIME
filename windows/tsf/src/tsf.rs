@@ -120,7 +120,8 @@ const EDITOR_EXE: &str = "YiIME.exe";
 const LEGACY_EDITOR_EXE: &str = "InputTranslation-Portable.exe";
 const LANG_ZH_CN: u16 = 0x0804;
 const DESCRIPTION: &str = "YiIME 译（五笔）";
-const WINDOW_CLASS: &str = "InputTranslationTsfReceiver";
+/// Versioned, so input boxes of another protocol version ignore this receiver.
+const WINDOW_CLASS: &str = yiime_core::TSF_RECEIVER_CLASS;
 /// Timers: 1 = retry forwarding buffered keys to the editor; 2 = give up waiting for the editor.
 const FLUSH_TIMER: usize = 1;
 const READY_TIMER: usize = 2;

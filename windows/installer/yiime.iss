@@ -1,15 +1,18 @@
 ﻿; YiIME Windows installer (Inno Setup 6).
 ;
-; Same layout as Install-YiIME.ps1: Program Files\YiIME\<version dir>\ (an existing 0.1.x install
-; keeps Program Files\InputTranslation, the directory Inno Setup remembers for this AppId), where
+; Same layout as Install-YiIME.ps1: Program Files\YiIME\<version dir>\ (always: an upgrade from 0.1.x
+; or 0.2.0-rc.1 that sits in Program Files\InputTranslation moves to Program Files\YiIME, and the
+; old directories are deleted once no application has their DLL loaded), where
 ; the version dir is the first 12 hex digits of the DLL and EXE SHA-256 (so reinstalling the same
 ; build is a no-op). The IME DLL is loaded into every process with a text box and cannot be
 ; overwritten while locked, so each version gets its own directory and the new DLL is registered
 ; (CLSID InprocServer32 points to it); old DLLs keep serving until their applications restart and
 ; find the new EXE via HKLM\Software\YiIME\CurrentDir.
 ;
-; Install: ① copy files; ② grant ALL APPLICATION PACKAGES read+execute (UWP/AppContainer apps need
-; it to load the DLL); ③ regsvr32 (restore the old registration and fail on error); ④ add the IME to
+; Install: ① copy files; ③ regsvr32 right after the last file, still inside the install phase: on
+; error restore the old registration and abort, so Setup rolls back and reports failure instead of
+; "completed"; ② grant ALL APPLICATION PACKAGES read+execute (UWP/AppContainer apps need it to load
+; the DLL); ④ add the IME to
 ; the original user's Chinese input list; ⑤ Start menu (settings, history, guide, uninstall); ⑥
 ; launch the tray as the original user. Uninstall reverses this: stop our processes, unregister,
 ; remove from the input list, delete files. %APPDATA%\YiIME and HKCU\Software\YiIME (settings,
@@ -46,6 +49,8 @@ VersionInfoVersion={#VersionNumber}
 VersionInfoDescription={#AppName} 安装程序
 DefaultDirName={autopf}\YiIME
 DisableDirPage=yes
+; Do not reuse the 0.1.x directory (Program Files\InputTranslation) remembered for this AppId.
+UsePreviousAppDir=no
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 ArchitecturesAllowed=x64
@@ -66,6 +71,7 @@ Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 SetupLogging=yes
+UninstallLogging=yes
 ; Optional code signing on Windows: ISCC /DSignTool=yiime /Syiime="signtool.exe sign /fd SHA256 ...
 ; $f" signs the setup and its uninstaller (see SIGNING.md). Without it the installer is built
 ; unsigned and windows/build-installer.sh may sign it afterwards.
@@ -78,6 +84,8 @@ SignedUninstaller=yes
 Name: "chs"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 
 [Messages]
+FinishedRestartLabel=旧版输入法仍被正在运行的应用加载。新旧版本同时运行可能导致输入法异常或崩溃，需要重启电脑才能完成升级。%n%n现在重启吗？
+FinishedRestartMessage=旧版输入法仍被正在运行的应用加载。新旧版本同时运行可能导致输入法异常或崩溃，需要重启电脑才能完成升级。%n%n现在重启吗？
 FinishedLabel=安装完成。在任务栏输入法切换器（Win+空格）中选择「YiIME 译（五笔）」即可使用。%n%n安装前已打开的应用要重新打开后才会用上新版；若输入法列表里没有它，注销并重新登录一次。
 
 [Dirs]
@@ -103,7 +111,9 @@ Source: "{#Repo}\data\pinyin\AUTHORS"; DestDir: "{app}\{#VersionDir}\data\pinyin
 Source: "{#Repo}\data\wubi_extra\LICENSE-rime-wubi86-jidian"; DestDir: "{app}\{#VersionDir}\data\wubi_extra"; Flags: ignoreversion
 Source: "{#Repo}\data\wubi_extra\LICENSE-chinese-xinhua"; DestDir: "{app}\{#VersionDir}\data\wubi_extra"; Flags: ignoreversion
 Source: "{#Repo}\data\frost\LICENSE"; DestDir: "{app}\{#VersionDir}\data\frost"; Flags: ignoreversion
-Source: "{#Repo}\data\opencc\LICENSE"; DestDir: "{app}\{#VersionDir}\data\opencc"; Flags: ignoreversion
+; Keep this entry last: its AfterInstall registers the DLL once every file is in place. An
+; exception there is a fatal install error, so Setup rolls back and shows that it did not complete.
+Source: "{#Repo}\data\opencc\LICENSE"; DestDir: "{app}\{#VersionDir}\data\opencc"; Flags: ignoreversion; AfterInstall: RegisterTip
 
 [Registry]
 ; Current version directory, for an old DLL (still loaded somewhere) that cannot find the EXE next
@@ -136,7 +146,7 @@ Filename: "{app}\{#VersionDir}\{#Exe}"; WorkingDir: "{app}\{#VersionDir}"; Descr
 ; Stop all EXEs (tray and input boxes) in this install directory, unregister, then remove the IME
 ; from the uninstalling user's input list.
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\{#VersionDir}\Add-YiIMETip.ps1"" -StopUnder ""{app}"""; Flags: runhidden waituntilterminated; RunOnceId: "StopYiIME"
-Filename: "{sys}\regsvr32.exe"; Parameters: "/u /s ""{app}\{#VersionDir}\{#Dll}"""; Flags: runhidden waituntilterminated; RunOnceId: "UnregTip"
+; Unregistering is done in [Code] (UnregisterTip) so a failure is reported instead of ignored.
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\{#VersionDir}\Add-YiIMETip.ps1"" -Remove"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveTip"
 
 [UninstallDelete]
@@ -183,7 +193,16 @@ begin
   Result := '';
 end;
 
-{ ③ 注册新 DLL；失败时把注册恢复到原来的 DLL，并告诉用户（文件已复制，可重新运行安装）。 }
+function LogHint: String;
+begin
+  Result := ExpandConstant('{log}');
+  if Result = '' then
+    Result := '（未生成日志；可用 /LOG="路径" 重新运行）';
+end;
+
+{ ③ 注册新 DLL（最后一个文件的 AfterInstall，仍在安装阶段）。失败时先把注册恢复到原来的 DLL，再抛出
+  异常：Inno Setup 把它当作安装失败，回滚本次复制的文件并显示“安装未完成”，不会再显示“安装完成”，
+  静默安装的退出码也不为 0。 }
 procedure RegisterTip;
 var
   Code: Integer;
@@ -191,41 +210,73 @@ begin
   Code := RunRegsvr32('/s "' + CurrentDll + '"');
   if Code <> 0 then
   begin
+    Log('regsvr32 注册失败，退出码 ' + IntToStr(Code) + '：' + CurrentDll);
     if (PreviousDll <> '') and (CompareText(PreviousDll, CurrentDll) <> 0) and FileExists(PreviousDll) then
-      RunRegsvr32('/s "' + PreviousDll + '"');
-    SuppressibleMsgBox('输入法注册失败（regsvr32 返回 ' + IntToStr(Code) + '）。已恢复原来的注册；请稍后重新运行安装程序。',
-      mbError, MB_OK, IDOK);
-  end
-  else
-    Log('已注册 ' + CurrentDll);
+    begin
+      if RunRegsvr32('/s "' + PreviousDll + '"') = 0 then
+        Log('已恢复原来的注册 ' + PreviousDll)
+      else
+        Log('恢复原来的注册失败 ' + PreviousDll);
+    end;
+    RaiseException('YiIME 输入法注册失败（regsvr32 退出码 ' + IntToStr(Code) + '）。' + #13#10 +
+      '安装已取消，本次复制的文件会被回滚；原来安装的版本（如有）保持不变。' + #13#10 +
+      '安装日志：' + LogHint);
+  end;
+  Log('已注册 ' + CurrentDll);
 end;
 
-{ 删掉以前的版本目录：DLL 删得掉（没有应用在用）才删整个目录；仍在用的整个保留，下次安装再试。 }
-procedure DeleteStaleVersionDirs;
 var
-  Base, Dir: String;
+  OldDllInUse: Boolean;
+
+{ 删掉 Base 下以前的版本目录：DLL 删得掉（没有应用在用）才删整个目录。删不掉说明仍被正在运行的应用加载：
+  安排重启后删除，并要求重启（NeedRestart），避免新旧版本 DLL 混用。 }
+procedure DeleteStaleVersionDirs(const Base: String);
+var
+  Dir, Dll: String;
   Found: TFindRec;
+  Busy: Boolean;
 begin
-  Base := ExpandConstant('{app}');
+  if not DirExists(Base) then
+    exit;
   if FindFirst(Base + '\*', Found) then
   begin
     try
       repeat
         if ((Found.Attributes and FILE_ATTRIBUTE_DIRECTORY) <> 0) and (Found.Name <> '.') and (Found.Name <> '..')
-          and (CompareText(Found.Name, '{#VersionDir}') <> 0) then
+          and ((CompareText(Base, ExpandConstant('{app}')) <> 0) or (CompareText(Found.Name, '{#VersionDir}') <> 0)) then
         begin
           Dir := Base + '\' + Found.Name;
+          Busy := False;
           { 0.1.x 目录里的 DLL 叫 {#LegacyDll}：同样先删 DLL，删不掉说明仍被加载。 }
-          if ((not FileExists(Dir + '\{#Dll}')) or DeleteFile(Dir + '\{#Dll}'))
-            and ((not FileExists(Dir + '\{#LegacyDll}')) or DeleteFile(Dir + '\{#LegacyDll}')) then
+          Dll := Dir + '\{#Dll}';
+          if FileExists(Dll) and not DeleteFile(Dll) then
           begin
-            if DelTree(Dir, True, True, True) then
-              Log('已删除旧版本目录 ' + Dir)
-            else
-              Log('旧版本目录未能完全删除 ' + Dir);
+            Busy := True;
+            try
+              RestartReplace(Dll, '');
+            except
+              Log('无法安排重启后删除 ' + Dll);
+            end;
+          end;
+          Dll := Dir + '\{#LegacyDll}';
+          if FileExists(Dll) and not DeleteFile(Dll) then
+          begin
+            Busy := True;
+            try
+              RestartReplace(Dll, '');
+            except
+              Log('无法安排重启后删除 ' + Dll);
+            end;
+          end;
+          if Busy then
+          begin
+            OldDllInUse := True;
+            Log('旧版本 DLL 仍被占用，重启后删除；保留 ' + Dir);
           end
+          else if DelTree(Dir, True, True, True) then
+            Log('已删除旧版本目录 ' + Dir)
           else
-            Log('旧版本 DLL 仍被占用，保留 ' + Dir);
+            Log('旧版本目录未能完全删除 ' + Dir);
         end;
       until not FindNext(Found);
     finally
@@ -234,11 +285,69 @@ begin
   end;
 end;
 
+{ 0.1.x 与 0.2.0-rc.1 装在 Program Files\InputTranslation：版本目录按上面的规则删除，旧卸载程序一并删掉
+  （卸载信息已由本次安装接管），目录空了就删除。 }
+procedure DeleteLegacyInstallDir;
+var
+  Legacy: String;
+begin
+  Legacy := ExpandConstant('{autopf}\InputTranslation');
+  if (CompareText(Legacy, ExpandConstant('{app}')) = 0) or not DirExists(Legacy) then
+    exit;
+  DeleteStaleVersionDirs(Legacy);
+  DelTree(Legacy + '\unins*.*', False, True, False);
+  if RemoveDir(Legacy) then
+    Log('已删除旧安装目录 ' + Legacy)
+  else
+    Log('旧安装目录暂时保留（仍有文件在用）' + Legacy);
+end;
+
+function NeedRestart: Boolean;
+begin
+  Result := OldDllInUse;
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
+  { 注册在安装阶段完成（RegisterTip）；走到这里说明已注册成功。 }
   if CurStep = ssPostInstall then
   begin
-    RegisterTip;
-    DeleteStaleVersionDirs;
+    DeleteStaleVersionDirs(ExpandConstant('{app}'));
+    DeleteLegacyInstallDir;
   end;
+end;
+
+{ 卸载：在删除任何文件之前注销输入法。注销失败时不静默继续（否则注册表仍指向即将删除的 DLL，
+  输入法列表里留下用不了的条目）：说明退出码和日志位置，由用户选择继续或取消；静默卸载默认取消。
+  DLL 已经不在时没有可注销的东西，直接继续。 }
+procedure UnregisterTip;
+var
+  Dll: String;
+  Code: Integer;
+begin
+  Dll := ExpandConstant('{app}\{#VersionDir}\{#Dll}');
+  if not FileExists(Dll) then
+  begin
+    Log('DLL 不存在，跳过注销：' + Dll);
+    exit;
+  end;
+  Code := RunRegsvr32('/u /s "' + Dll + '"');
+  if Code = 0 then
+  begin
+    Log('已注销 ' + Dll);
+    exit;
+  end;
+  Log('regsvr32 /u 失败，退出码 ' + IntToStr(Code) + '：' + Dll);
+  if SuppressibleMsgBox('注销 YiIME 输入法失败（regsvr32 退出码 ' + IntToStr(Code) + '）。' + #13#10#13#10 +
+    '继续卸载会删除程序文件，但输入法列表里可能留下无法使用的条目。' + #13#10 +
+    '选“是”继续卸载；选“否”取消卸载（不删除任何文件），可重启电脑后再试。' + #13#10 +
+    '卸载日志在 %TEMP% 文件夹中。',
+    mbError, MB_YESNO or MB_DEFBUTTON2, IDNO) <> IDYES then
+    RaiseException('卸载已取消：输入法注销失败（regsvr32 退出码 ' + IntToStr(Code) + '）。');
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+    UnregisterTip;
 end;

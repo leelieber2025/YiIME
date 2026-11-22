@@ -130,17 +130,25 @@ pub fn may_share_service(host: &ProcessSecurity, service: Option<&ProcessSecurit
         })
 }
 
+/// Version of the DLL ↔ input-box protocol (window messages and COPYDATA packets). It is part of
+/// the receiver window class and the service window title, so a DLL and a service of different
+/// protocol versions never find or accept each other: after an upgrade without a restart, an
+/// application still running an old DLL keeps its own old input box instead of talking to the new
+/// one. Bump it whenever a message or packet changes meaning.
+pub const TSF_PROTOCOL: u32 = 2;
+/// Window class of the TSF DLL's receiver window (the input box accepts sessions only from it).
+pub const TSF_RECEIVER_CLASS: &str = concat!("YiIMETsfReceiver.", 2);
+
 /// Window title of the input box: the shared service has one per integrity level (FindWindow only
 /// sees the caller's session and desktop, and the DLL checks the process as well); a private box
-/// has its own title so no other application finds it.
+/// has its own title so no other application finds it. Every title carries [`TSF_PROTOCOL`].
 pub fn service_window_title(integrity: u32, private: bool) -> String {
     if private {
-        "YiIME 译 · TSF（私有）".to_owned()
+        format!("YiIME 译 · TSF（私有）· p{TSF_PROTOCOL}")
     } else if integrity == MEDIUM_INTEGRITY {
-        // Unchanged name, so a 0.1.x DLL still finds it.
-        "YiIME 译 · TSF".to_owned()
+        format!("YiIME 译 · TSF · p{TSF_PROTOCOL}")
     } else {
-        format!("YiIME 译 · TSF · IL{integrity:x}")
+        format!("YiIME 译 · TSF · IL{integrity:x} · p{TSF_PROTOCOL}")
     }
 }
 
@@ -172,6 +180,59 @@ impl Watchdog {
     pub fn stalled(&self, last_beat_ms: u64, now_ms: u64) -> bool {
         now_ms >= self.grace_ms
             && now_ms.saturating_sub(last_beat_ms.max(self.grace_ms)) > self.limit_ms
+    }
+}
+
+/// Owner of a TSF receiver window: process and thread id from `GetWindowThreadProcessId`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct HostOwner {
+    pub pid: u32,
+    pub thread: u32,
+}
+
+/// Receivers whose host process the service watches for exit. Windows reuses window handles, so a
+/// receiver is keyed by its handle *and* its owner: a reused handle from another process is a new
+/// host (watched again), and an exit notice from the old owner no longer ends its session.
+#[derive(Debug, Default)]
+pub struct WatchedHosts {
+    watched: std::collections::HashMap<usize, HostOwner>,
+}
+
+impl WatchedHosts {
+    /// A session starts for `receiver`, whose current owner is `owner` (None when the window is
+    /// gone). Returns true when a new exit watch must be started for it.
+    pub fn session_started(&mut self, receiver: usize, owner: Option<HostOwner>) -> bool {
+        match owner.filter(|owner| owner.pid != 0) {
+            None => {
+                self.watched.remove(&receiver);
+                false
+            }
+            Some(owner) => self.watched.insert(receiver, owner) != Some(owner),
+        }
+    }
+
+    /// The watched process `pid` of `receiver` exited. Returns true when that is the receiver's
+    /// current host (end its session); false for a stale notice about an earlier owner of a
+    /// reused handle.
+    pub fn host_exited(&mut self, receiver: usize, pid: u32) -> bool {
+        if self
+            .watched
+            .get(&receiver)
+            .is_some_and(|owner| owner.pid == pid)
+        {
+            self.watched.remove(&receiver);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.watched.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.watched.is_empty()
     }
 }
 
@@ -316,12 +377,22 @@ mod tests {
     fn window_titles_per_level() {
         assert_eq!(
             service_window_title(MEDIUM_INTEGRITY, false),
-            "YiIME 译 · TSF"
+            "YiIME 译 · TSF · p2"
         );
         assert_eq!(
             service_window_title(0x1000, false),
-            "YiIME 译 · TSF · IL1000"
+            "YiIME 译 · TSF · IL1000 · p2"
         );
+        // 0.2.0-rc.1 and earlier used unversioned names; they must not match the new ones.
+        assert_ne!(
+            service_window_title(MEDIUM_INTEGRITY, false),
+            "YiIME 译 · TSF"
+        );
+        assert_eq!(
+            TSF_RECEIVER_CLASS,
+            format!("YiIMETsfReceiver.{TSF_PROTOCOL}")
+        );
+        assert_ne!(TSF_RECEIVER_CLASS, "InputTranslationTsfReceiver");
         assert_ne!(
             service_window_title(HIGH_INTEGRITY, true),
             service_window_title(HIGH_INTEGRITY, false)
@@ -352,5 +423,42 @@ mod tests {
         // A beat during the grace period counts from the end of the grace period.
         assert!(!watchdog.stalled(10_000, 24_000));
         assert!(watchdog.stalled(10_000, 25_001));
+    }
+
+    #[test]
+    fn watched_hosts_follow_reused_window_handles() {
+        let first = HostOwner {
+            pid: 100,
+            thread: 7,
+        };
+        let second = HostOwner {
+            pid: 200,
+            thread: 9,
+        };
+        let mut hosts = WatchedHosts::default();
+        assert!(hosts.session_started(0x10, Some(first)));
+        // The same host again (another session, same process): already watched.
+        assert!(!hosts.session_started(0x10, Some(first)));
+        assert_eq!(hosts.len(), 1);
+        // The handle is reused by another process: watch the new owner.
+        assert!(hosts.session_started(0x10, Some(second)));
+        assert_eq!(hosts.len(), 1);
+        // The old owner's exit notice arrives late: it must not end the new host's session.
+        assert!(!hosts.host_exited(0x10, 100));
+        assert!(hosts.host_exited(0x10, 200));
+        assert!(hosts.is_empty());
+        // After the exit the entry is gone, so a reused handle (even with a reused pid) is watched.
+        assert!(hosts.session_started(0x10, Some(second)));
+    }
+
+    #[test]
+    fn watched_hosts_drop_receivers_that_are_gone() {
+        let owner = HostOwner { pid: 5, thread: 6 };
+        let mut hosts = WatchedHosts::default();
+        assert!(hosts.session_started(1, Some(owner)));
+        assert!(!hosts.session_started(1, None));
+        assert!(!hosts.session_started(2, Some(HostOwner { pid: 0, thread: 0 })));
+        assert!(hosts.is_empty());
+        assert!(!hosts.host_exited(1, 5));
     }
 }

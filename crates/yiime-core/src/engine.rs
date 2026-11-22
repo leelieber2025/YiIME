@@ -48,6 +48,15 @@ pub struct Pick {
     pub rest: String,
 }
 
+/// One step of committing a whole code ([`Composer::flush_all`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Flushed {
+    /// The first candidate (record it for learning like a normal pick).
+    Pick(Pick),
+    /// Letters with no candidate, committed as typed.
+    Raw(String),
+}
+
 /// Composition state of the input box.
 #[derive(Debug, Default)]
 pub struct Composer {
@@ -212,6 +221,40 @@ impl Composer {
                 rest: candidate.rest.clone(),
             }
         })
+    }
+    /// Punctuation, Shift+letter, Enter-to-commit or ending the session: commits the whole code by
+    /// picking the first candidate segment by segment (`zhongguox` → 中国, then the first
+    /// candidate of `x`) until nothing is left, the raw letters when a segment has no candidate.
+    /// Returns the steps in order; the code is empty afterwards. Both platforms use this so a
+    /// leftover segment is never dropped and text that follows (punctuation) lands after it.
+    pub fn flush_all(
+        &mut self,
+        input: &MixedInput,
+        options: &ComposeOptions,
+        learned: &Learned,
+    ) -> Vec<Flushed> {
+        let mut steps = Vec::new();
+        // Every step consumes at least one letter; the bound is only a safety net.
+        for _ in 0..=MAX_CODE_LEN {
+            if self.code.is_empty() {
+                break;
+            }
+            match self.candidate_at(0) {
+                Some(pick) if pick.rest.len() < self.code.replace('\'', "").len() => {
+                    self.set_code(input, pick.rest.clone(), options, learned);
+                    steps.push(Flushed::Pick(pick));
+                }
+                _ => {
+                    steps.push(Flushed::Raw(std::mem::take(&mut self.code)));
+                    self.set_code(input, String::new(), options, learned);
+                }
+            }
+        }
+        if !self.code.is_empty() {
+            steps.push(Flushed::Raw(std::mem::take(&mut self.code)));
+            self.set_code(input, String::new(), options, learned);
+        }
+        steps
     }
     /// What space/punctuation/Shift+letter commits: the first candidate on this page, or the raw
     /// code (second item false) when there is none.

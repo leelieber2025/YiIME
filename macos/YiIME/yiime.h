@@ -13,4 +13,7 @@ bool yiime_active(const Ime *ime);
 char *yiime_state(const Ime *ime);
 char *yiime_take_text(Ime *ime);
 char *yiime_translate(const char *source, const char *url, const char *model, const char *key);
+uint64_t yiime_begin_request(Ime *ime);
+void yiime_cancel_request(Ime *ime);
+bool yiime_finish_request(Ime *ime, uint64_t id);
 void yiime_string_free(char *text);

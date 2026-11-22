@@ -1,7 +1,10 @@
 use crate::table::{RawTable, Side, Table, encode, merge_extra, parse_dictionary};
 pub(crate) use crate::table::{folded_initials, normalize_frequency_pinyin};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock, RwLockReadGuard};
+
+/// User words by code, most recent first.
+type UserWords = BTreeMap<String, Vec<Arc<str>>>;
 
 /// Bundled dictionaries precompiled by `build.rs` (see `table.rs`).
 #[cfg(feature = "bundled")]
@@ -44,8 +47,9 @@ pub struct MixedInput {
     /// and checked against the Wubi table). Precompiled at build time for the bundled
     /// dictionaries.
     table: Table,
-    /// User words by code, ranked first under their code.
-    user: BTreeMap<String, Vec<Arc<str>>>,
+    /// User words by code, ranked first under their code. Behind a lock so a running service can
+    /// swap them in place ([`Self::set_user_words`]) without rebuilding the large lexicon.
+    user: RwLock<UserWords>,
     frequency: Option<FrequencyWords>,
     /// Large-lexicon initials index, built on first use so startup stays fast.
     abbreviations: OnceLock<Abbreviations>,
@@ -286,7 +290,7 @@ impl MixedInput {
     fn with_table(table: Table) -> Self {
         Self {
             table,
-            user: BTreeMap::new(),
+            user: RwLock::default(),
             frequency: None,
             abbreviations: OnceLock::new(),
             syllable_table: OnceLock::new(),
@@ -429,7 +433,8 @@ impl MixedInput {
 
     /// Candidates under one full Wubi code: user words first, then the dictionary by frequency.
     fn wubi_slot(&self, code: &str) -> Vec<(Arc<str>, u64)> {
-        let user = self.user.get(code);
+        let words = self.user_words();
+        let user = words.get(code);
         let mut slot: Vec<(Arc<str>, u64)> = user
             .into_iter()
             .flatten()
@@ -457,8 +462,8 @@ impl MixedInput {
                 codes.insert(key);
             }
         }
-        for key in self
-            .user
+        let user = self.user_words();
+        for key in user
             .range::<str, _>((
                 std::ops::Bound::Included(prefix),
                 std::ops::Bound::Unbounded,
@@ -506,20 +511,28 @@ impl MixedInput {
     /// Merges user words (`word code` per line, whitespace-separated, `#` starts a comment), ranked
     /// first under their code.
     pub fn with_user_words(mut self, contents: &str) -> Self {
-        for line in contents.lines() {
-            let mut fields = line.split_whitespace();
-            let (Some(text), Some(code)) = (fields.next(), fields.next()) else {
-                continue;
-            };
-            let code = code.to_ascii_lowercase();
-            if text.starts_with('#') || !code.bytes().all(|b| b.is_ascii_lowercase()) {
-                continue;
-            }
-            let slot = self.user.entry(code).or_default();
-            slot.retain(|word| &**word != text);
-            slot.insert(0, text.into());
-        }
+        let user = self.user.get_mut().unwrap_or_else(PoisonError::into_inner);
+        parse_user_words(user, contents);
         self
+    }
+
+    /// Replaces all user words with `contents` (same format as [`Self::with_user_words`]), in
+    /// place: a running service picks up an import or an edited user_words.txt without
+    /// restarting, and every holder of this dictionary sees the new words.
+    pub fn set_user_words(&self, contents: &str) {
+        let mut user = UserWords::new();
+        parse_user_words(&mut user, contents);
+        *self.user.write().unwrap_or_else(PoisonError::into_inner) = user;
+    }
+
+    fn user_words(&self) -> RwLockReadGuard<'_, UserWords> {
+        self.user.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Whether `code` is a run of whole pinyin syllables (`nihao`, `shiyou`), so user words under
+    /// it count as pinyin candidates; other codes are Wubi.
+    fn is_pinyin_code(&self, code: &str) -> bool {
+        self.syllables().spells(code)
     }
 
     /// Number of distinct candidates for a full Wubi code, including the large lexicon.
@@ -668,12 +681,13 @@ impl MixedInput {
         } else {
             Vec::new()
         };
-        // User words (e.g. imported pinyin words) also come first in pinyin-only codes; otherwise
-        // they lead the exact Wubi slot below.
-        let user: Vec<Arc<str>> = if pinyin_only {
-            self.user.get(&code).cloned().unwrap_or_default()
+        // User words (typed in or imported) come first under their exact code in every order:
+        // Wubi first or pinyin first, they never rank behind built-in words.
+        let user: Vec<Arc<str>> = self.user_words().get(&code).cloned().unwrap_or_default();
+        let user_source = if self.is_pinyin_code(py) {
+            Source::Pinyin
         } else {
-            Vec::new()
+            Source::Wubi
         };
         if raw.contains('\'') {
             let mut seen = HashSet::new();
@@ -702,14 +716,14 @@ impl MixedInput {
                 return separated;
             }
         }
-        let mut wubi: Vec<Arc<str>> = user;
+        let mut wubi: Vec<Arc<str>> = Vec::new();
         if !pinyin_only {
             wubi.extend(self.wubi_slot(&code).into_iter().map(|(text, _)| text));
             if let Some(words) = &self.frequency {
                 wubi.extend(words.code(&code).map(|line| Arc::from(line.text)));
             }
         }
-        let exact = !wubi.is_empty() || !homophones.is_empty();
+        let exact = !user.is_empty() || !wubi.is_empty() || !homophones.is_empty();
         // Only when the code is neither a Wubi code nor a pinyin word.
         let spelled = !exact && code.len() >= 4 && code.bytes().all(|b| b.is_ascii_lowercase());
         let (sentence, partial) = if spelled {
@@ -744,6 +758,7 @@ impl MixedInput {
             }
         };
         let pinyin: Vec<_> = homophones.into_iter().map(|(text, _, _)| text).collect();
+        push(user, user_source, true);
         if pinyin_first {
             push(pinyin, Source::Pinyin, true);
             push(wubi, Source::Wubi, true);
@@ -822,6 +837,24 @@ fn boundaries(code: &str, separator: char) -> Vec<usize> {
     }
     result.retain(|offset| *offset < letters);
     result
+}
+
+/// Parses user words (`word code` per line, whitespace-separated, `#` starts a comment) into
+/// `user`; a later line for the same word and code moves it to the front.
+fn parse_user_words(user: &mut UserWords, contents: &str) {
+    for line in contents.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(text), Some(code)) = (fields.next(), fields.next()) else {
+            continue;
+        };
+        let code = code.to_ascii_lowercase();
+        if text.starts_with('#') || !code.bytes().all(|b| b.is_ascii_lowercase()) {
+            continue;
+        }
+        let slot = user.entry(code).or_default();
+        slot.retain(|word| &**word != text);
+        slot.insert(0, text.into());
+    }
 }
 
 #[cfg(test)]

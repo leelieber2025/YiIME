@@ -41,6 +41,10 @@ class YiIMEInputController: IMKInputController {
     private var candidates: [String] = []
     private var shiftDown: Date?
     private var translating = false
+    /// Chinese text being translated: committed as is if the session ends before the result.
+    private var pendingSource = ""
+    /// Client of the current session (the one activateServer was called for).
+    private weak var currentClient: AnyObject?
 
     deinit { yiime_free(ime) }
 
@@ -150,6 +154,11 @@ class YiIMEInputController: IMKInputController {
         let source = takeString(yiime_take_text(ime))
         guard !source.isEmpty else { return }
         candidatesWindow?.hide()
+        // The result may arrive after the user switched apps or turned the input method off; it
+        // is committed only if this request is still current (see yiime_finish_request).
+        let request = yiime_begin_request(ime)
+        let requestClient = client as AnyObject
+        pendingSource = source
         translating = true
         client.setMarkedText(source + " …", selectionRange: NSRange(location: 0, length: 0),
                              replacementRange: NSRange(location: NSNotFound, length: NSNotFound))
@@ -161,19 +170,56 @@ class YiIMEInputController: IMKInputController {
             let text = ok ? (value["text"] as? String ?? source) : source
             if !ok { NSLog("YiIME: 翻译失败，上屏中文：%@", value["error"] as? String ?? "") }
             DispatchQueue.main.async {
+                guard yiime_finish_request(self.ime, request),
+                      self.currentClient == nil || self.currentClient === requestClient else {
+                    // Logged without the text.
+                    NSLog("YiIME: 翻译结果已丢弃（会话已结束或已切换应用）")
+                    return
+                }
                 self.translating = false
+                self.pendingSource = ""
                 self.commit(text, client: client)
             }
         }
     }
 
+    /// Ends a pending translation: its result will be dropped, and the Chinese text goes to
+    /// `client` (the app being left) so nothing typed is lost.
+    private func abandonTranslation(client: IMKTextInput?) {
+        guard translating else { return }
+        yiime_cancel_request(ime)
+        translating = false
+        let source = pendingSource
+        pendingSource = ""
+        if let client, !source.isEmpty {
+            commit(source, client: client)
+        }
+    }
+
+    override func activateServer(_ sender: Any!) {
+        super.activateServer(sender)
+        let client = sender.map { $0 as AnyObject }
+        if let client, client !== currentClient {
+            // Another client: a translation started elsewhere must not land here.
+            abandonTranslation(client: currentClient as? IMKTextInput)
+        }
+        currentClient = client
+    }
+
     override func commitComposition(_ sender: Any!) {
-        guard let client = sender as? IMKTextInput, yiime_active(ime) else { return }
+        guard let client = sender as? IMKTextInput else { return }
+        if translating {
+            abandonTranslation(client: client)
+            return
+        }
+        guard yiime_active(ime) else { return }
         commit(takeString(yiime_take_text(ime)), client: client)
     }
 
     override func deactivateServer(_ sender: Any!) {
         candidatesWindow?.hide()
+        abandonTranslation(client: sender as? IMKTextInput)
+        currentClient = nil
         super.deactivateServer(sender)
     }
 }

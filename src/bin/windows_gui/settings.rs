@@ -610,16 +610,21 @@ pub(super) unsafe extern "system" fn settings_proc(
                 }
                 SETTINGS_IMPORT => {
                     import_dictionary(hwnd);
+                    // This process's dictionaries at once; other YiIME processes (the shared
+                    // input box) reload the file when their next session or code starts.
+                    if let Some(state) = state_of(owner) {
+                        refresh_user_words(state);
+                    }
                 }
                 SETTINGS_USER_WORDS => {
                     // Open user words in Notepad (creating the file with a short header if
-                    // missing); changes apply the next time the box opens.
+                    // missing); saved changes apply from the next code typed.
                     if let Some(path) = user_words_path() {
                         if !path.exists() {
                             let _ = std::fs::create_dir_all(path.parent().unwrap_or(&path));
                             let _ = std::fs::write(
                                 &path,
-                                "# YiIME 用户词库：每行「词 编码」（空格或 Tab 分隔），排在该五笔编码的第一位。\r\n# 例如：\r\n# 中英翻译 khyc\r\n",
+                                "# YiIME 用户词库：每行「词 编码」（空格或 Tab 分隔），排在该编码（五笔或拼音）的第一位，保存后从下一次输入起生效。\r\n# 例如：\r\n# 中英翻译 khyc\r\n",
                             );
                         }
                         let _ = std::process::Command::new("notepad.exe").arg(&path).spawn();
@@ -648,7 +653,8 @@ pub(super) unsafe extern "system" fn settings_proc(
 }
 
 /// Picks an exported Sogou/QQ user dictionary (.txt) or a Sogou cell dictionary (.scel) and
-/// appends its words to user_words.txt; they apply the next time the box opens.
+/// appends its words to user_words.txt; they apply from the next code typed (every YiIME process
+/// reloads the file when it changes).
 unsafe fn import_dictionary(hwnd: HWND) {
     let mut buffer = vec![0u16; 1024];
     let filter = wide("词库文件 (*.txt;*.scel)\0*.txt;*.scel\0所有文件\0*.*\0");
@@ -684,7 +690,7 @@ unsafe fn import_dictionary(hwnd: HWND) {
         });
     let text = match result {
         Ok((added, total)) => {
-            format!("已导入 {added} 个新词（文件中共 {total} 个），下次打开输入框生效。")
+            format!("已导入 {added} 个新词（文件中共 {total} 个），立即生效（从下一次输入起）。")
         }
         Err(error) => format!("导入失败：{error}"),
     };

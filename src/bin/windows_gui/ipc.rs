@@ -1,15 +1,9 @@
 use super::*;
 
-/// Ends the session of `receiver` in the input box (`editor`) once the application owning that
-/// receiver exits (WM_TSF_EXIT with the receiver as wParam).
-pub(super) fn watch_tsf_owner(receiver: HWND, editor: HWND) {
-    let mut pid = 0;
-    unsafe {
-        GetWindowThreadProcessId(receiver, &mut pid);
-    }
-    if pid == 0 {
-        return;
-    }
+/// Ends the session of `receiver` in the input box (`editor`) once its owner process `pid`
+/// exits (WM_TSF_EXIT with the receiver as wParam and the pid as lParam, so the box can tell a
+/// stale notice for a reused window handle from its current host).
+pub(super) fn watch_tsf_owner(receiver: HWND, pid: u32, editor: HWND) {
     let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
     if process.is_null() {
         return;
@@ -20,7 +14,7 @@ pub(super) fn watch_tsf_owner(receiver: HWND, editor: HWND) {
     std::thread::spawn(move || unsafe {
         WaitForSingleObject(process as _, u32::MAX);
         CloseHandle(process as _);
-        PostMessageW(editor as HWND, WM_TSF_EXIT, receiver, 0);
+        PostMessageW(editor as HWND, WM_TSF_EXIT, receiver, pid as isize);
     });
 }
 pub(super) unsafe fn send_tsf_text(receiver: HWND, sender: HWND, text: &str) -> bool {
