@@ -136,6 +136,7 @@ const SETTINGS_GOOGLE_KEY: i32 = 225;
 const SETTINGS_AZURE_KEY: i32 = 226;
 const SETTINGS_AZURE_REGION: i32 = 227;
 const SETTINGS_DEEPL_KEY: i32 = 228;
+const SETTINGS_FALLBACK: i32 = 231;
 /// Height of the Translation Engine row at the top of the settings window; the other controls
 /// move down by this much.
 const ENGINE_SHIFT: i32 = 168;

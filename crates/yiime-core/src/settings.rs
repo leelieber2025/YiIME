@@ -210,9 +210,11 @@ impl Sealer for PlainSealer {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiSettings {
-    /// Translation engine; Azure by default (free Google until an Azure key is set). If it fails and an LLM is configured, the LLM is
-    /// used instead.
+    /// Translation engine; Azure by default (free Google until an Azure key is set).
     pub engine: Engine,
+    /// When the engine fails, try another service (the configured LLM, or free Google after
+    /// Azure). Off by default: text is only ever sent to the service the user picked.
+    pub allow_fallback: bool,
     pub url: String,
     pub model: String,
     pub key: String,
@@ -289,6 +291,7 @@ impl Default for ApiSettings {
     fn default() -> Self {
         Self {
             engine: Engine::default(),
+            allow_fallback: false,
             url: DEFAULT_URL.to_owned(),
             model: String::new(),
             key: String::new(),
@@ -327,6 +330,9 @@ impl ApiSettings {
             }
             if let Some(text) = value["engine"].as_str() {
                 settings.engine = Engine::from_id(text);
+            }
+            if let Some(on) = value["allow_fallback"].as_bool() {
+                settings.allow_fallback = on;
             }
         }
         let key = std::fs::read(dir.join(KEY_FILE))
@@ -406,6 +412,7 @@ impl ApiSettings {
                 "style": self.style.id(),
                 "custom": self.custom,
                 "engine": self.engine.id(),
+                "allow_fallback": self.allow_fallback,
                 "azure_region": self.azure_region.trim(),
             }))?,
         )
@@ -494,6 +501,7 @@ mod tests {
         assert_eq!(ApiSettings::load(&dir, &Xor), ApiSettings::default());
         let settings = ApiSettings {
             engine: Engine::Llm,
+            allow_fallback: true,
             url: "https://example.com/v1".into(),
             model: "m".into(),
             key: "secret".into(),

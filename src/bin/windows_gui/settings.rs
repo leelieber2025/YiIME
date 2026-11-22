@@ -312,7 +312,7 @@ pub(super) unsafe extern "system" fn settings_proc(
                 );
                 child = GetWindow(child, GW_HWNDNEXT);
             }
-            label(hwnd, "翻译引擎（失败时自动改用大模型）", 16, 12, 196);
+            label(hwnd, "翻译引擎", 16, 12, 196);
             let engine = control(
                 hwnd,
                 "COMBOBOX",
@@ -391,12 +391,25 @@ pub(super) unsafe extern "system" fn settings_proc(
                 24,
                 SETTINGS_DEEPL_KEY,
             );
+            let fallback = control(
+                hwnd,
+                "BUTTON",
+                "失败时允许改用其他翻译服务",
+                BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+                228,
+                146,
+                196,
+                24,
+                SETTINGS_FALLBACK,
+            );
+            SendMessageW(fallback, BM_SETCHECK, settings.allow_fallback as usize, 0);
             let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
             SetWindowPos(engine, HWND_TOP, 0, 0, 0, 0, flags);
             SetWindowPos(google_key, engine, 0, 0, 0, 0, flags);
             SetWindowPos(azure_key, google_key, 0, 0, 0, 0, flags);
             SetWindowPos(azure_region, azure_key, 0, 0, 0, 0, flags);
             SetWindowPos(deepl_key, azure_region, 0, 0, 0, 0, flags);
+            SetWindowPos(fallback, deepl_key, 0, 0, 0, 0, flags);
             0
         },
         WM_COMMAND => unsafe {
@@ -415,6 +428,12 @@ pub(super) unsafe extern "system" fn settings_proc(
                             .ok()
                             .and_then(|index| Engine::ALL.get(index).copied())
                             .unwrap_or_default(),
+                        allow_fallback: SendMessageW(
+                            GetDlgItem(hwnd, SETTINGS_FALLBACK),
+                            BM_GETCHECK,
+                            0,
+                            0,
+                        ) == 1,
                         google_key: field(SETTINGS_GOOGLE_KEY),
                         azure_key: field(SETTINGS_AZURE_KEY),
                         azure_region: field(SETTINGS_AZURE_REGION),

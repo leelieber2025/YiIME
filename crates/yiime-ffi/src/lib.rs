@@ -197,13 +197,14 @@ impl Ime {
 }
 
 /// Free Google by default; with `url`, `model` and `key` set, the LLM is the fallback when Google
-/// fails.
+/// fails (the caller passes them for exactly that, so fallback is allowed only then).
 pub fn translate_text(source: &str, url: &str, model: &str, key: &str) -> Result<String, String> {
     let mut settings = ApiSettings {
         engine: Engine::GoogleFree,
         ..ApiSettings::default()
     };
     if !url.is_empty() && !model.is_empty() && !key.is_empty() {
+        settings.allow_fallback = true;
         settings.url = url.to_owned();
         settings.model = model.to_owned();
         settings.key = key.to_owned();

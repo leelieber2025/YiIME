@@ -254,7 +254,10 @@ pub fn translate(settings: &ApiSettings, source: &str) -> Outcome {
         Engine::Azure if settings.azure_key.trim().is_empty() => Engine::GoogleFree,
         other => other,
     };
-    let skip_google = engine == Engine::GoogleFree && llm_ok && google_blocked();
+    // Using another service after a failure sends the text somewhere the user did not pick, so
+    // it only happens when the setting allows it (off by default).
+    let fallback = settings.allow_fallback;
+    let skip_google = fallback && engine == Engine::GoogleFree && llm_ok && google_blocked();
     let result = if skip_google {
         run(settings, Engine::Llm, source, &mut attempts)
     } else {
@@ -263,15 +266,17 @@ pub fn translate(settings: &ApiSettings, source: &str) -> Outcome {
             let limited = attempts.last().and_then(|a| a.failure.as_deref()) == Some("http 429");
             set_google_blocked(limited);
         }
+        let could_fall_back = (engine != Engine::Llm && llm_ok) || engine == Engine::Azure;
         match first {
-            Err(error) if engine != Engine::Llm && llm_ok => {
+            Err(error) if fallback && engine != Engine::Llm && llm_ok => {
                 run(settings, Engine::Llm, source, &mut attempts)
                     .map_err(|llm| format!("{error}；改用大模型也失败：{llm}"))
             }
-            Err(error) if engine == Engine::Azure && !google_blocked() => {
+            Err(error) if fallback && engine == Engine::Azure && !google_blocked() => {
                 run(settings, Engine::GoogleFree, source, &mut attempts)
                     .map_err(|google| format!("{error}；改用 Google 也失败：{google}"))
             }
+            Err(error) if could_fall_back => Err(format!("{error}{NO_FALLBACK_NOTE}")),
             other => other,
         }
     };
@@ -284,6 +289,9 @@ pub fn translate(settings: &ApiSettings, source: &str) -> Outcome {
     }
     Outcome { result, attempts }
 }
+
+/// Appended to errors when another service could have been tried but the setting is off.
+pub const NO_FALLBACK_NOTE: &str = "（未改用其他翻译服务；如需失败时自动改用，请在设置中开启）";
 
 fn run(
     settings: &ApiSettings,
@@ -308,12 +316,18 @@ fn run(
         Engine::GoogleFree => (
             host_of(GOOGLE_FREE_URL),
             String::new(),
-            google_free(source, &mut first_byte, started),
+            google_free(GOOGLE_FREE_URL, source, &mut first_byte, started),
         ),
         Engine::GoogleCloud => (
             host_of(GOOGLE_CLOUD_URL),
             String::new(),
-            google_cloud(source, settings.google_key.trim(), &mut first_byte, started),
+            google_cloud(
+                GOOGLE_CLOUD_URL,
+                source,
+                settings.google_key.trim(),
+                &mut first_byte,
+                started,
+            ),
         ),
         Engine::DeepL => {
             let url = deepl_url(settings.deepl_key.trim());
@@ -351,27 +365,76 @@ fn run(
     result.map_err(|fail| fail.message)
 }
 
-/// Free Google endpoint, answering `[[["dst","src",…],…],…]`; the pieces are joined.
+/// Longest piece sent to the free Google endpoint in one request. It only takes the text in the
+/// URL query, so longer drafts are split at sentence ends (URLs of tens of kilobytes are rejected).
+const GOOGLE_FREE_CHUNK: usize = 800;
+
+/// Splits `text` into pieces of at most `limit` characters, preferably after sentence-ending
+/// punctuation or a line break.
+fn chunks(text: &str, limit: usize) -> Vec<&str> {
+    let mut pieces = Vec::new();
+    let mut rest = text;
+    while rest.chars().count() > limit {
+        let mut cut = 0;
+        let mut last_break = None;
+        for (count, (index, ch)) in rest.char_indices().enumerate() {
+            if count >= limit {
+                break;
+            }
+            cut = index + ch.len_utf8();
+            if matches!(ch, '。' | '！' | '？' | '；' | '\n' | '.' | '!' | '?' | ';') {
+                last_break = Some(cut);
+            }
+        }
+        let cut = last_break.unwrap_or(cut);
+        pieces.push(&rest[..cut]);
+        rest = &rest[cut..];
+    }
+    if !rest.is_empty() || pieces.is_empty() {
+        pieces.push(rest);
+    }
+    pieces
+}
+
+/// Free Google endpoint, answering `[[["dst","src",…],…],…]`; the pieces are joined. Long text is
+/// sent in several requests (see [`GOOGLE_FREE_CHUNK`]).
 fn google_free(
+    url: &str,
     source: &str,
     first_byte: &mut Option<u128>,
     started: Instant,
 ) -> Result<String, Fail> {
-    let response = agent(false)
-        .get(GOOGLE_FREE_URL)
-        .timeout(GOOGLE_FREE_TIMEOUT)
-        .query("client", "gtx")
-        .query("sl", "zh-CN")
-        .query("tl", "en")
-        .query("dt", "t")
-        .query("q", source)
-        .call()
-        .map_err(http_error)?;
-    *first_byte = Some(started.elapsed().as_millis());
-    let json: Value = response
-        .into_json()
-        .map_err(|_| "Google 翻译返回格式不对")?;
-    Ok(parse_google_free(&json)?)
+    let mut out = String::new();
+    for piece in chunks(source, GOOGLE_FREE_CHUNK) {
+        if piece.trim().is_empty() {
+            continue;
+        }
+        let response = agent(false)
+            .get(url)
+            .timeout(GOOGLE_FREE_TIMEOUT)
+            .query("client", "gtx")
+            .query("sl", "zh-CN")
+            .query("tl", "en")
+            .query("dt", "t")
+            .query("q", piece)
+            .call()
+            .map_err(http_error)?;
+        if first_byte.is_none() {
+            *first_byte = Some(started.elapsed().as_millis());
+        }
+        let json: Value = response
+            .into_json()
+            .map_err(|_| "Google 翻译返回格式不对")?;
+        let text = parse_google_free(&json)?;
+        if !out.is_empty() && !out.ends_with(char::is_whitespace) {
+            out.push(if piece.starts_with('\n') { '\n' } else { ' ' });
+        }
+        out.push_str(&text);
+    }
+    if out.is_empty() {
+        return Err(Fail::new("empty", "译文为空"));
+    }
+    Ok(out)
 }
 
 fn parse_google_free(json: &Value) -> Result<String, String> {
@@ -468,8 +531,10 @@ fn parse_deepl(json: &Value) -> Result<String, String> {
         .ok_or_else(|| "DeepL 没有返回译文".into())
 }
 
-/// Google Cloud Translation v2 (`?key=`).
+/// Google Cloud Translation v2. The key goes in the `X-goog-api-key` header, not the URL, so it
+/// does not end up in proxy or server access logs.
 fn google_cloud(
+    url: &str,
     source: &str,
     key: &str,
     first_byte: &mut Option<u128>,
@@ -479,9 +544,9 @@ fn google_cloud(
         return Err(Fail::new("config", "缺少 Google Cloud 翻译的 API 密钥"));
     }
     let response = agent(false)
-        .post(GOOGLE_CLOUD_URL)
+        .post(url)
         .timeout(GOOGLE_CLOUD_TIMEOUT)
-        .query("key", key)
+        .set("X-goog-api-key", key)
         .send_json(json!({"q": source, "source": "zh-CN", "target": "en", "format": "text"}))
         .map_err(http_error)?;
     *first_byte = Some(started.elapsed().as_millis());
@@ -1013,7 +1078,26 @@ mod tests {
     }
 
     #[test]
-    fn failed_primary_engine_falls_back_to_configured_llm() {
+    fn failed_primary_engine_falls_back_to_configured_llm_only_when_allowed() {
+        // Off by default: the DeepL error is reported and nothing else is contacted.
+        let settings = ApiSettings {
+            engine: Engine::DeepL,
+            deepl_key: String::new(),
+            url: "http://127.0.0.1:9/v1/chat/completions".into(),
+            model: "fallback".into(),
+            key: "key".into(),
+            ..ApiSettings::default()
+        };
+        assert!(!settings.allow_fallback);
+        let outcome = translate(&settings, "不回退测试");
+        assert_eq!(outcome.attempts.len(), 1);
+        assert_eq!(outcome.attempts[0].engine, Engine::DeepL);
+        let error = outcome.result.unwrap_err();
+        assert!(
+            error.contains("DeepL") && error.contains(NO_FALLBACK_NOTE),
+            "{error}"
+        );
+        // Allowed: the configured LLM takes over.
         let (url, server) = fake_llm(1);
         let settings = ApiSettings {
             engine: Engine::DeepL,
@@ -1021,6 +1105,7 @@ mod tests {
             url,
             model: "fallback".into(),
             key: "key".into(),
+            allow_fallback: true,
             ..ApiSettings::default()
         };
         let outcome = translate(&settings, "回退测试");
@@ -1029,6 +1114,103 @@ mod tests {
         assert_eq!(outcome.attempts.len(), 2);
         assert_eq!(outcome.attempts[0].engine, Engine::DeepL);
         assert_eq!(outcome.attempts[1].engine, Engine::Llm);
+    }
+
+    /// Local server answering `count` requests with `reply`; returns each raw request.
+    fn capture(
+        count: usize,
+        reply: &'static str,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/translate", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut data = Vec::new();
+                let mut chunk = [0; 65536];
+                loop {
+                    let size = stream.read(&mut chunk).unwrap();
+                    data.extend_from_slice(&chunk[..size]);
+                    let text = String::from_utf8_lossy(&data).to_string();
+                    if let Some((head, body)) = text.split_once("\r\n\r\n") {
+                        let length = head
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|n| n.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        if body.len() >= length {
+                            break;
+                        }
+                    }
+                    if size == 0 {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&data).into_owned());
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{reply}",
+                    reply.len()
+                )
+                .unwrap();
+            }
+            requests
+        });
+        (url, server)
+    }
+
+    #[test]
+    fn google_cloud_key_goes_in_a_header_not_the_url() {
+        let (url, server) = capture(1, r#"{"data":{"translations":[{"translatedText":"Hi"}]}}"#);
+        let text = google_cloud(&url, "你好", "cloud-secret", &mut None, Instant::now()).unwrap();
+        assert_eq!(text, "Hi");
+        let request = server.join().unwrap().remove(0);
+        let (head, body) = request.split_once("\r\n\r\n").unwrap();
+        let request_line = head.lines().next().unwrap();
+        assert!(
+            request_line.starts_with("POST /translate "),
+            "{request_line}"
+        );
+        assert!(!request_line.contains("cloud-secret") && !request_line.contains("key="));
+        assert!(
+            head.lines()
+                .any(|line| line.eq_ignore_ascii_case("x-goog-api-key: cloud-secret")),
+            "{head}"
+        );
+        assert!(body.contains("你好") && !body.contains("cloud-secret"));
+    }
+
+    #[test]
+    fn long_text_for_free_google_is_split_into_requests() {
+        let sentence = "这是一个用来测试分段的句子。";
+        let long = sentence.repeat(200); // 2,800 characters
+        let pieces = chunks(&long, GOOGLE_FREE_CHUNK);
+        assert!(pieces.len() >= 4);
+        assert!(
+            pieces
+                .iter()
+                .all(|p| p.chars().count() <= GOOGLE_FREE_CHUNK)
+        );
+        assert!(pieces.iter().all(|p| p.ends_with('。')));
+        assert_eq!(pieces.concat(), long);
+        assert_eq!(chunks("短句", GOOGLE_FREE_CHUNK), ["短句"]);
+        // No punctuation: hard split at the limit.
+        let plain = "字".repeat(1700);
+        assert_eq!(chunks(&plain, GOOGLE_FREE_CHUNK).len(), 3);
+        let (url, server) = capture(
+            pieces.len(),
+            r#"[[["Part.","x",null,null,10]],null,"zh-CN"]"#,
+        );
+        let text = google_free(&url, &long, &mut None, Instant::now()).unwrap();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), pieces.len());
+        assert!(requests.iter().all(|r| r.len() < 16_000));
+        assert_eq!(text, vec!["Part."; pieces.len()].join(" "));
     }
 
     #[test]
