@@ -25,6 +25,7 @@ fn options(fuzzy: bool) -> ComposeOptions {
         learn: false,
         fuzzy,
         pinyin_first: false,
+        common_only: false,
     }
 }
 

@@ -23,6 +23,8 @@ pub struct ComposeOptions {
     pub fuzzy: bool,
     /// Rank exact pinyin before exact Wubi and disable Wubi auto-commit rules.
     pub pinyin_first: bool,
+    /// Hide rare characters and low-frequency initials matches (on by default in the IME).
+    pub common_only: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -68,12 +70,13 @@ impl Composer {
         let mut candidates = if code.is_empty() {
             Vec::new()
         } else {
-            input.candidates_with_options(
+            input.candidates_filtered(
                 &code,
                 size * CANDIDATE_PAGES,
                 size,
                 options.fuzzy,
                 options.pinyin_first,
+                options.common_only,
             )
         };
         self.hints.clear();

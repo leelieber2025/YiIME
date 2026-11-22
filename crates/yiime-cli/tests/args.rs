@@ -32,3 +32,18 @@ fn no_words_query_still_works() {
     let (code, _) = query(&["nihao", "--no-words", "--tsv"]);
     assert_eq!(code, 0);
 }
+
+#[test]
+fn common_characters_by_default_and_all_chars_option() {
+    let run = |extra: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_yiime"))
+            .args(["query", "yxyy", "--no-words", "--tsv"])
+            .args(extra)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    assert!(!run(&[]).contains('𧦮'));
+    assert!(run(&["--all-chars"]).contains('𧦮'));
+}

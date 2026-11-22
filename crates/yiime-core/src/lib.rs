@@ -31,7 +31,7 @@ mod text;
 mod translate;
 
 #[cfg(feature = "engine")]
-pub use dict::{Candidate, MixedInput, Source};
+pub use dict::{COMMON_FREQUENCY_FLOOR, Candidate, MixedInput, Source, is_common_text};
 #[cfg(feature = "engine")]
 pub use draft::Draft;
 #[cfg(feature = "engine")]

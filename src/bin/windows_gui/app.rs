@@ -83,7 +83,7 @@ const HISTORY_CLOSE: i32 = 305;
 const HISTORY_STATUS: i32 = 306;
 const TRAY_HISTORY: usize = 4;
 /// Settings-window switches: (control ID, label, option).
-const OPTION_BOXES: [(i32, &str, Flag); 11] = [
+const OPTION_BOXES: [(i32, &str, Flag); 12] = [
     (210, "中文标点（Ctrl+. 切换）", Flag::PunctEnglish),
     (211, "繁体输出（Ctrl+Shift+F）", Flag::Traditional),
     (212, "四码唯一时自动上屏", Flag::AutoCommit4),
@@ -95,6 +95,7 @@ const OPTION_BOXES: [(i32, &str, Flag); 11] = [
     (218, "， 。 也翻页（组字时）", Flag::CommaPeriodPaging),
     (219, "引号括号自动配对", Flag::AutoPair),
     (229, "拼音优先（关闭五笔顶字）", Flag::PinyinFirst),
+    (230, "只显示常用字（隐藏生僻字）", Flag::CommonOnly),
 ];
 /// Each extra row of switches moves the controls below it down.
 const OPTION_SHIFT: i32 = (OPTION_BOXES.len() as i32 + 1) / 2 * 26 - 3 * 26;
@@ -370,6 +371,7 @@ fn compose_options() -> ComposeOptions {
         learn: option(Flag::Learn),
         fuzzy: option(Flag::FuzzyPinyin),
         pinyin_first: option(Flag::PinyinFirst),
+        common_only: option(Flag::CommonOnly),
     }
 }
 fn history_path() -> Option<PathBuf> {

@@ -26,6 +26,7 @@ const OPTIONS: ComposeOptions = ComposeOptions {
     learn: false,
     fuzzy: false,
     pinyin_first: false,
+    common_only: false,
 };
 const RULES: LetterRules = LetterRules {
     push_fifth: true,

@@ -89,6 +89,24 @@ fn pinyin_spelling(code: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Words below this frequency are left out of initials (`bjdx`) matches and single-character
+/// pinyin homophones when only common characters are shown: they are mostly classical idioms and
+/// variant characters (伯喈倒屣, 鞎).
+pub const COMMON_FREQUENCY_FLOOR: u64 = 10;
+
+/// Whether every character of `text` is commonly displayable: no characters outside the Basic
+/// Multilingual Plane (CJK extensions B+, often shown as boxes), CJK Extension A, compatibility
+/// ideographs or private-use characters.
+pub fn is_common_text(text: &str) -> bool {
+    text.chars().all(|ch| {
+        let code = ch as u32;
+        code <= 0xFFFF
+            && !(0x3400..=0x4DBF).contains(&code)
+            && !(0xE000..=0xF8FF).contains(&code)
+            && !(0xF900..=0xFAFF).contains(&code)
+    })
+}
+
 /// First letter of each syllable; zh/ch/sh become Z/C/S.
 fn syllable_initials(syllables: &str) -> String {
     syllables
@@ -323,7 +341,7 @@ impl MixedInput {
 
     /// Words for pinyin initials (at least two), with exactly that many syllables, sorted by
     /// frequency.
-    fn abbreviation(&self, code: &str, limit: usize) -> Vec<Arc<str>> {
+    fn abbreviation(&self, code: &str, limit: usize, min_weight: u64) -> Vec<Arc<str>> {
         if code.len() < 2 || code.len() > 12 || !code.bytes().all(|b| b.is_ascii_lowercase()) {
             return Vec::new();
         }
@@ -359,6 +377,7 @@ impl MixedInput {
                 }
             }
         }
+        found.retain(|(_, weight)| *weight >= min_weight);
         found.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         let mut seen = HashSet::new();
         found
@@ -581,6 +600,21 @@ impl MixedInput {
         fuzzy: bool,
         pinyin_first: bool,
     ) -> Vec<Candidate> {
+        self.candidates_filtered(raw, limit, page_size, fuzzy, pinyin_first, false)
+    }
+
+    /// Like [`Self::candidates_with_options`]; `common_only` leaves out rare characters (see
+    /// [`is_common_text`]) and initials or single-character pinyin matches below
+    /// [`COMMON_FREQUENCY_FLOOR`].
+    pub fn candidates_filtered(
+        &self,
+        raw: &str,
+        limit: usize,
+        page_size: usize,
+        fuzzy: bool,
+        pinyin_first: bool,
+        common_only: bool,
+    ) -> Vec<Candidate> {
         let code = raw.to_ascii_lowercase().replace([' ', '\''], "");
         if code.is_empty() {
             return Vec::new();
@@ -590,7 +624,13 @@ impl MixedInput {
         let py = spelling.as_str();
         // A `'` separator only exists in pinyin, so such a code never matches Wubi.
         let pinyin_only = raw.contains('\'');
-        let homophones = self.homophones(py);
+        let mut homophones = self.homophones(py);
+        if common_only {
+            homophones.retain(|(text, weight, _)| {
+                is_common_text(text)
+                    && (*weight >= COMMON_FREQUENCY_FLOOR || text.chars().nth(1).is_some())
+            });
+        }
         let wanted = if raw.contains('\'') {
             boundaries(&raw.to_ascii_lowercase().replace(' ', ""), '\'')
         } else {
@@ -641,6 +681,9 @@ impl MixedInput {
         let mut seen = HashSet::new();
         let mut push = |texts: Vec<Arc<str>>, source, complete| {
             for text in texts {
+                if common_only && !is_common_text(&text) {
+                    continue;
+                }
                 if result.len() < limit && seen.insert(text.clone()) {
                     result.push(Candidate {
                         text: text.to_string(),
@@ -682,7 +725,15 @@ impl MixedInput {
             limit
         };
         push(
-            self.abbreviation(&code, abbreviation_limit),
+            self.abbreviation(
+                &code,
+                abbreviation_limit,
+                if common_only {
+                    COMMON_FREQUENCY_FLOOR
+                } else {
+                    0
+                },
+            ),
             Source::Abbreviation,
             true,
         );
@@ -853,6 +904,40 @@ mod tests {
         assert_eq!(precompiled.abbreviations, built.abbreviations);
         // Any other content falls back to building the index at load time.
         assert!(crate::table::decode_frost(FROST_INDEX, b"x\tx\t1\tx\n").is_none());
+    }
+
+    #[test]
+    fn common_only_hides_rare_characters_and_low_frequency_matches() {
+        let wubi = "...\n𧦮\tyxyy\t9\n高级语言\tyxyy\t5\n㐂\tabcd\t9\n";
+        let pinyin = "...\n很\then\t160208\n鞎\then\t3\n拫\then\t2\n";
+        let words = "北京大学\tbei jing da xue\t2010\tuydi\n伯喈倒屣\tbo jie dao xi\t0\twkwn\n";
+        let input = MixedInput::from_rime(wubi, pinyin).with_frequency_words(words.to_owned());
+        let texts = |code: &str, common: bool| -> Vec<String> {
+            input
+                .candidates_filtered(code, 9, 9, false, false, common)
+                .into_iter()
+                .map(|c| c.text)
+                .collect()
+        };
+        assert_eq!(texts("yxyy", false), ["𧦮", "高级语言"]);
+        assert_eq!(texts("yxyy", true), ["高级语言"]);
+        assert_eq!(texts("hen", false), ["很", "鞎", "拫"]);
+        assert_eq!(texts("hen", true), ["很"]);
+        assert_eq!(texts("bjdx", false), ["北京大学", "伯喈倒屣"]);
+        assert_eq!(texts("bjdx", true), ["北京大学"]);
+        assert!(texts("abcd", true).is_empty());
+        assert!(is_common_text("中文，ok〇"));
+        assert!(!is_common_text("𢝧") && !is_common_text("㐂"));
+        // The real dictionaries: lve no longer offers the Ext-B 𨋨 prefix, bjdx only 北京大学.
+        let full = MixedInput::bundled();
+        let real = |code: &str| -> Vec<String> {
+            full.candidates_filtered(code, 90, 9, false, false, true)
+                .into_iter()
+                .map(|c| c.text)
+                .collect()
+        };
+        assert!(real("nve").iter().all(|text| is_common_text(text)));
+        assert!(real("lve").iter().all(|text| is_common_text(text)));
     }
 
     #[test]

@@ -43,10 +43,13 @@ pub enum Flag {
     BracketCharPick,
     /// Auto-close Chinese quotes, brackets and title marks (off by default).
     AutoPair,
+    /// Show only common characters: no CJK extension/compatibility characters, no rare initials
+    /// matches (on by default).
+    CommonOnly,
 }
 
 impl Flag {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::PlainMode,
         Self::PunctEnglish,
         Self::Traditional,
@@ -60,6 +63,7 @@ impl Flag {
         Self::CommaPeriodPaging,
         Self::BracketCharPick,
         Self::AutoPair,
+        Self::CommonOnly,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -76,6 +80,7 @@ impl Flag {
             Self::CommaPeriodPaging => "CommaPeriodPaging",
             Self::BracketCharPick => "BracketCharPick",
             Self::AutoPair => "AutoPair",
+            Self::CommonOnly => "CommonOnly",
         }
     }
     pub fn default_on(self) -> bool {
@@ -86,6 +91,7 @@ impl Flag {
                 | Self::SemicolonSelect
                 | Self::HistoryEnabled
                 | Self::BracketCharPick
+                | Self::CommonOnly
         )
     }
 }
@@ -450,7 +456,7 @@ mod tests {
             defaults,
             [
                 false, false, false, true, true, true, false, true, false, false, false, true,
-                false
+                false, true
             ]
         );
         assert_eq!(options.toggle(Flag::Learn), Some(true));
