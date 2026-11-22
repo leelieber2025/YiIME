@@ -58,15 +58,8 @@ unsafe fn receiver_proc_impl(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> 
         unsafe {
             GetWindowThreadProcessId(w as HWND, &mut sender_pid);
         }
-        if sender_pid == 0
-            || unsafe {
-                (&(*pointer))
-                    .editor
-                    .borrow()
-                    .as_ref()
-                    .map(std::process::Child::id)
-            } != Some(sender_pid)
-        {
+        // Only the editor service this instance started or verified (see find_editor_service).
+        if sender_pid == 0 || unsafe { (&(*pointer)).editor_pid.get() } != sender_pid {
             return 0;
         }
         let packet = unsafe { &*(l as *const COPYDATASTRUCT) };

@@ -44,12 +44,16 @@ use windows::core::{
     BOOL, BSTR, GUID, HRESULT, IUnknown, IUnknownImpl, Interface, Ref, Result, implement,
 };
 use windows_registry::{CLASSES_ROOT, CURRENT_USER, LOCAL_MACHINE};
+use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
 };
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringW;
-use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::System::Threading::{
+    GetCurrentThreadId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW,
+};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetFocus, GetKeyState, VK_CAPITAL, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
@@ -62,8 +66,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WNDCLASSW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, FindWindowW, MF_CHECKED, MF_SEPARATOR, MF_STRING,
-    TPM_BOTTOMALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, FindWindowExW, FindWindowW, MF_CHECKED,
+    MF_SEPARATOR, MF_STRING, TPM_BOTTOMALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenuEx,
 };
 use yiime_core::{Flag, OptionStore, Options, Quotes, full_width, us_key_char};
 
@@ -487,6 +492,53 @@ fn companion_exe() -> Option<std::path::PathBuf> {
         .map(|dir| std::path::PathBuf::from(dir).join("InputTranslation-Portable.exe"))
         .filter(|path| path.is_file())
 }
+/// Process id owning `window` (0 if none).
+fn window_pid(window: HWND) -> u32 {
+    let mut pid = 0;
+    unsafe {
+        GetWindowThreadProcessId(window, &mut pid);
+    }
+    pid
+}
+/// Full path of a process's executable.
+fn process_image(pid: u32) -> Option<std::path::PathBuf> {
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let mut buffer = [0u16; 1024];
+        let mut len = buffer.len() as u32;
+        let ok =
+            QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, buffer.as_mut_ptr(), &mut len)
+                != 0;
+        CloseHandle(process);
+        ok.then(|| std::path::PathBuf::from(String::from_utf16_lossy(&buffer[..len as usize])))
+    }
+}
+/// A running TSF-mode input box (the shared editor service) started from `exe`: its window and
+/// process id. Windows of other executables (another version, or anything imitating the title)
+/// are ignored.
+fn find_editor_service(exe: &std::path::Path) -> Option<(HWND, u32)> {
+    let class = wide("InputTranslationWindow");
+    let title = wide("YiIME 译 · TSF");
+    let expected = exe.to_string_lossy().to_lowercase();
+    let mut window: HWND = null_mut();
+    loop {
+        window = unsafe { FindWindowExW(null_mut(), window, class.as_ptr(), title.as_ptr()) };
+        if window.is_null() {
+            return None;
+        }
+        let pid = window_pid(window);
+        if pid != 0
+            && pid != std::process::id()
+            && process_image(pid)
+                .is_some_and(|image| image.to_string_lossy().to_lowercase() == expected)
+        {
+            return Some((window, pid));
+        }
+    }
+}
 /// Asks the tray instance to open settings (WM_APP+5) or history (WM_APP+6), starting the EXE with
 /// an argument if the tray is not running.
 fn open_tray_window(history: bool) {
@@ -553,7 +605,10 @@ struct TextService {
     client_id: Cell<u32>,
     receiver: Cell<HWND>,
     editor_open: Cell<bool>,
+    /// The editor process this instance started (None when it uses a service found running).
     editor: RefCell<Option<std::process::Child>>,
+    /// Process id of the editor service in use: commits are accepted only from it.
+    editor_pid: Cell<u32>,
     editor_window: Cell<HWND>,
     pending_keys: RefCell<String>,
     first_key: Cell<Option<char>>,
@@ -585,6 +640,7 @@ impl TextService {
             receiver: Cell::new(null_mut()),
             editor_open: Cell::new(false),
             editor: RefCell::new(None),
+            editor_pid: Cell::new(0),
             editor_window: Cell::new(null_mut()),
             pending_keys: RefCell::new(String::new()),
             first_key: Cell::new(None),
@@ -608,7 +664,11 @@ impl TextService {
             .borrow_mut()
             .as_mut()
             .is_some_and(|child| child.try_wait().ok().flatten().is_some());
-        if exited {
+        // A shared service started by another application may have exited (idle timeout).
+        let window = self.editor_window.get();
+        let gone =
+            self.editor.borrow().is_none() && !window.is_null() && unsafe { IsWindow(window) } == 0;
+        if exited || gone {
             self.reset_editor();
         }
     }
@@ -616,6 +676,7 @@ impl TextService {
         self.kill_timers();
         self.editor_open.set(false);
         self.editor.borrow_mut().take();
+        self.editor_pid.set(0);
         self.editor_window.set(null_mut());
         self.pending_keys.borrow_mut().clear();
         self.first_key.set(None);
@@ -640,9 +701,10 @@ impl TextService {
     /// Lets the editor bring its box to the foreground (only the current foreground process, the
     /// host, can grant this).
     fn allow_editor_foreground(&self) {
-        if let Some(child) = self.editor.borrow().as_ref() {
+        let pid = self.editor_pid.get();
+        if pid != 0 {
             unsafe {
-                let _ = AllowSetForegroundWindow(child.id());
+                let _ = AllowSetForegroundWindow(pid);
             }
         }
     }
@@ -919,16 +981,30 @@ impl TextService {
     }
     fn open_editor(&self, context: ITfContext, first_key: u8) -> bool {
         let target = unsafe { GetForegroundWindow() } as usize;
-        let window = self.editor_window.get();
         // Keys buffered for the previous session do not carry over.
         self.pending_keys.borrow_mut().clear();
         let caret = self.caret_rect(&context);
-        if !window.is_null() && unsafe { IsWindow(window) } != 0 {
-            if let Some(child) = self.editor.borrow().as_ref() {
-                unsafe {
-                    AllowSetForegroundWindow(child.id());
-                }
+        // The input box is one resident service shared by all applications: reuse the one this
+        // instance already talks to, else one found running (same EXE), else start it.
+        let Some(editor) = companion_exe() else {
+            return false;
+        };
+        let mut window = self.editor_window.get();
+        if window.is_null()
+            || unsafe { IsWindow(window) } == 0
+            || window_pid(window) != self.editor_pid.get()
+        {
+            window = null_mut();
+            if self.editor.borrow().is_none()
+                && let Some((found, pid)) = find_editor_service(&editor)
+            {
+                self.editor_pid.set(pid);
+                self.editor_window.set(found);
+                window = found;
             }
+        }
+        if !window.is_null() {
+            self.allow_editor_foreground();
             *self.context.borrow_mut() = Some(context.clone());
             self.first_key.set(
                 first_key
@@ -938,7 +1014,8 @@ impl TextService {
             self.editor_open.set(true);
             self.editor_window.set(null_mut());
             // Send the cursor rectangle synchronously first (an empty packet if unavailable, so the
-            // editor positions itself), then activate asynchronously.
+            // editor positions itself); it also makes this receiver the service's current one.
+            // Then activate asynchronously.
             let mut rect = caret.map(|rect| [rect.left, rect.top, rect.right, rect.bottom]);
             let packet = COPYDATASTRUCT {
                 dwData: 3,
@@ -948,7 +1025,7 @@ impl TextService {
                     .map_or(null_mut(), |rect| rect.as_mut_ptr() as _),
             };
             let mut result = 0usize;
-            unsafe {
+            let accepted = unsafe {
                 SendMessageTimeoutW(
                     window,
                     WM_COPYDATA,
@@ -957,9 +1034,12 @@ impl TextService {
                     SMTO_ABORTIFHUNG,
                     100,
                     &mut result,
-                );
-            }
-            if unsafe { PostMessageW(window, WM_APP + 2, target, first_key as isize) } != 0 {
+                ) != 0
+                    && result != 0
+            };
+            if accepted
+                && unsafe { PostMessageW(window, WM_APP + 2, target, first_key as isize) } != 0
+            {
                 self.start_ready_timer();
                 return true;
             }
@@ -974,22 +1054,6 @@ impl TextService {
         let Some(directory) = std::path::Path::new(&path).parent() else {
             return false;
         };
-        // Prefer the editor next to this DLL (same version); if an old version directory's EXE has
-        // been removed, fall back to the current directory recorded by the installer
-        // (HKLM\\Software\\InputTranslation\\CurrentDir).
-        let mut editor = directory.join("InputTranslation-Portable.exe");
-        if !editor.is_file() {
-            let Some(current) = LOCAL_MACHINE
-                .open("Software\\InputTranslation")
-                .and_then(|key| key.get_string("CurrentDir"))
-                .ok()
-                .map(|dir| std::path::PathBuf::from(dir).join("InputTranslation-Portable.exe"))
-                .filter(|path| path.is_file())
-            else {
-                return false;
-            };
-            editor = current;
-        }
         let directory = editor.parent().unwrap_or(directory).to_path_buf();
         let mut command = std::process::Command::new(editor);
         command
@@ -1026,6 +1090,7 @@ impl TextService {
                     .is_ascii_alphabetic()
                     .then(|| (first_key as char).to_ascii_lowercase()),
             );
+            self.editor_pid.set(child.id());
             *self.editor.borrow_mut() = Some(child);
             self.allow_editor_foreground();
             self.editor_open.set(true);
@@ -1264,13 +1329,13 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
     }
     fn Deactivate(&self) -> Result<()> {
         com_guard("Deactivate", || {
+            // End this application's session in the shared service; the service stays for the
+            // other applications (and exits by itself when idle).
             let editor_window = self.editor_window.get();
             if !editor_window.is_null() {
                 unsafe {
-                    PostMessageW(editor_window, WM_APP + 3, 0, 0);
+                    PostMessageW(editor_window, WM_APP + 3, self.receiver.get() as usize, 0);
                 }
-            } else if let Some(child) = self.editor.borrow_mut().as_mut() {
-                let _ = child.kill();
             }
             if let Some((context, cookie)) = self.edit_sink.borrow_mut().take()
                 && let Ok(source) = context.cast::<ITfSource>()

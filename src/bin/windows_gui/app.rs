@@ -12,6 +12,7 @@ mod tray;
 use history::{history_proc, open_history};
 use settings::{open_settings, settings_proc};
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -114,6 +115,12 @@ const TRAY_TRANSLATE: usize = 5;
 /// Polls the mode (also changed by IME shortcuts and the taskbar button) to refresh the tray
 /// tooltip, and retries switching to the large lexicon if it arrived mid-composition.
 const TRAY_TIMER: usize = 7;
+/// The resident TSF service exits after this long without a session (it restarts on demand in
+/// well under 0.1 s thanks to the precompiled dictionary index).
+const IDLE_TIMER: usize = 8;
+const IDLE_EXIT_MS: u32 = 30 * 60 * 1000;
+/// Window class of the TSF DLL's message-only receiver windows.
+const TSF_RECEIVER_CLASS: &str = "InputTranslationTsfReceiver";
 /// Registry key shared with the TSF DLL.
 const STATE_KEY: &str = "Software\\InputTranslation";
 /// A translation worker finished: drain `translation_rx`.
@@ -220,7 +227,13 @@ struct State {
     translation_tx: Sender<TranslationResult>,
     translation_rx: Receiver<TranslationResult>,
     suppress_deactivate: Cell<bool>,
-    tsf_receiver: HWND,
+    /// TSF receiver window of the current session. The TSF-mode box is one resident service
+    /// shared by every application: each session may come from another application's receiver.
+    tsf_receiver: Cell<HWND>,
+    /// Started by the TSF DLL (`--tsf-hwnd`): serves TSF sessions instead of the tray.
+    tsf_service: bool,
+    /// Receivers whose host process is being watched (see [`watch_tsf_owner`]).
+    watched_receivers: RefCell<HashSet<usize>>,
     finished: Cell<bool>,
     /// The plain-mode shortcut was pressed in the box: swallow the WM_CHAR it produces.
     swallow_char: Cell<bool>,
@@ -861,6 +874,9 @@ unsafe fn show_box(hwnd: HWND, state: &State) {
 /// Starts an input: remember the target window and cursor and show the box there. A draft left
 /// by clicking away is kept.
 unsafe fn activate(hwnd: HWND, state: &State, target: HWND, anchor: Option<RECT>, code: String) {
+    unsafe {
+        KillTimer(hwnd, IDLE_TIMER);
+    }
     state.target.set(target);
     state.finished.set(false);
     state.pending.set(false);
@@ -891,6 +907,9 @@ unsafe fn hide_box(hwnd: HWND, state: &State) {
     state.suppress_deactivate.set(true);
     unsafe {
         ShowWindow(hwnd, SW_HIDE);
+        if state.tsf_service {
+            SetTimer(hwnd, IDLE_TIMER, IDLE_EXIT_MS, None);
+        }
     }
     state.suppress_deactivate.set(false);
 }
@@ -940,12 +959,45 @@ unsafe fn app_icon(size: i32) -> HICON {
         }
     }
 }
+/// Whether `hwnd` is a TSF receiver window (the class registered by the TSF DLL). The DLL in turn
+/// accepts commits only from the process it found or started as the service.
+fn is_tsf_receiver(hwnd: HWND) -> bool {
+    let mut name = [0u16; 64];
+    let len = unsafe { GetClassNameW(hwnd, name.as_mut_ptr(), name.len() as i32) };
+    len > 0 && String::from_utf16_lossy(&name[..len as usize]) == TSF_RECEIVER_CLASS
+}
+/// Watches the process owning `receiver` once, so its session ends when it exits.
+fn watch_receiver(hwnd: HWND, state: &State, receiver: HWND) {
+    if state
+        .watched_receivers
+        .borrow_mut()
+        .insert(receiver as usize)
+    {
+        watch_tsf_owner(receiver, hwnd);
+    }
+}
+/// Another application starts a session: end the current one (telling its DLL), drop its draft
+/// (text never moves between applications) and serve `receiver` from now on.
+unsafe fn switch_receiver(hwnd: HWND, state: &State, receiver: HWND) {
+    unsafe {
+        if IsWindowVisible(hwnd) != 0 {
+            deactivate(hwnd, state);
+        } else {
+            finish_tsf(hwnd, state);
+        }
+        clear_box(hwnd, state);
+    }
+    state.finished.set(true);
+    state.tsf_receiver.set(receiver);
+    watch_receiver(hwnd, state, receiver);
+}
 /// Tells the TSF DLL this input ended without inserting text.
 unsafe fn finish_tsf(hwnd: HWND, state: &State) -> bool {
-    if state.tsf_receiver.is_null() || state.finished.get() {
+    let receiver = state.tsf_receiver.get();
+    if receiver.is_null() || state.finished.get() {
         return true;
     }
-    let ok = unsafe { send_tsf_text(state.tsf_receiver, hwnd, "") };
+    let ok = unsafe { send_tsf_text(receiver, hwnd, "") };
     if ok {
         state.finished.set(true);
     }
@@ -1062,8 +1114,8 @@ unsafe fn commit_to_target(hwnd: HWND, state: &State, text: &str) {
         Err("无法切回原应用")
     } else if unsafe { !target_ready(target) } {
         Err("原应用尚未取得输入焦点")
-    } else if !state.tsf_receiver.is_null() {
-        if unsafe { send_tsf_text(state.tsf_receiver, hwnd, &line) } {
+    } else if !state.tsf_receiver.get().is_null() {
+        if unsafe { send_tsf_text(state.tsf_receiver.get(), hwnd, &line) } {
             state.finished.set(true);
             Ok(())
         } else {
@@ -1213,17 +1265,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         WM_TSF_ACTIVATE => {
             // lParam = 1: the IME's history shortcut; open the box and load the newest entry.
             if let Some(state) = state
-                && !state.tsf_receiver.is_null()
+                && !state.tsf_receiver.get().is_null()
                 && l == 1
             {
                 let anchor = state.pending_anchor.take();
                 unsafe {
                     activate(hwnd, state, w as HWND, anchor, String::new());
                     recall_latest(hwnd, state);
-                    notify_tsf_ready(state.tsf_receiver, hwnd);
+                    notify_tsf_ready(state.tsf_receiver.get(), hwnd);
                 }
             } else if let Some(state) = state
-                && !state.tsf_receiver.is_null()
+                && !state.tsf_receiver.get().is_null()
                 && (0x41..=0x5a).contains(&(l as usize))
             {
                 let anchor = state.pending_anchor.take();
@@ -1235,7 +1287,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                         anchor,
                         (l as u8 as char).to_ascii_lowercase().to_string(),
                     );
-                    notify_tsf_ready(state.tsf_receiver, hwnd);
+                    notify_tsf_ready(state.tsf_receiver.get(), hwnd);
                 }
             }
             0
@@ -1244,10 +1296,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             let Some(state) = state else {
                 return 0;
             };
-            if l == 0 || state.tsf_receiver.is_null() || w as HWND != state.tsf_receiver {
+            if l == 0 || !state.tsf_service {
                 return 0;
             }
             let packet = &*(l as *const COPYDATASTRUCT);
+            // A session from another application's receiver starts with its caret packet
+            // (dwData 3); everything else must come from the current session's receiver.
+            if w as HWND != state.tsf_receiver.get() {
+                if packet.dwData != 3 || !is_tsf_receiver(w as HWND) {
+                    return 0;
+                }
+                switch_receiver(hwnd, state, w as HWND);
+            }
             match packet.dwData {
                 // Keystrokes buffered during startup or activation (letters), merged into the
                 // current code.
@@ -1303,11 +1363,29 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             }
             0
         }
+        // The application owning receiver `w` deactivated the IME or exited: end its session.
+        // The service itself stays resident for other applications (until IDLE_TIMER).
         WM_TSF_EXIT => {
-            if let Some(state) = state {
+            if let Some(state) = state
+                && w != 0
+                && w as HWND == state.tsf_receiver.get()
+            {
                 state.finished.set(true);
+                state.tsf_receiver.set(null_mut());
+                unsafe {
+                    clear_box(hwnd, state);
+                    hide_box(hwnd, state);
+                }
             }
-            unsafe { DestroyWindow(hwnd) };
+            0
+        }
+        WM_TIMER if w == IDLE_TIMER => {
+            if let Some(state) = state
+                && unsafe { IsWindowVisible(hwnd) } == 0
+                && state.settings_window.get().is_null()
+            {
+                unsafe { DestroyWindow(hwnd) };
+            }
             0
         }
         WM_TRANSLATED => {
@@ -1368,8 +1446,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 Shell_NotifyIconW(NIM_DELETE, &data);
                 let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State;
                 if !ptr.is_null() {
-                    if !(*ptr).tsf_receiver.is_null() && !(*ptr).finished.get() {
-                        send_tsf_text((*ptr).tsf_receiver, hwnd, "");
+                    if !(*ptr).tsf_receiver.get().is_null() && !(*ptr).finished.get() {
+                        send_tsf_text((*ptr).tsf_receiver.get(), hwnd, "");
                     }
                     SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
                     let state = Box::from_raw(ptr);
@@ -1464,7 +1542,9 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
             translation_tx,
             translation_rx,
             suppress_deactivate: Cell::new(false),
-            tsf_receiver,
+            tsf_receiver: Cell::new(tsf_receiver),
+            tsf_service: !tsf_receiver.is_null(),
+            watched_receivers: RefCell::new(HashSet::new()),
             finished: Cell::new(false),
             swallow_char: Cell::new(false),
             last_plain: Cell::new(plain_mode()),
@@ -1622,8 +1702,14 @@ pub fn run() {
                 .find(|pair| pair[0] == name)
                 .map(|pair| pair[1].as_str())
         };
-        if !state.tsf_receiver.is_null() {
-            watch_tsf_owner(state.tsf_receiver, hwnd);
+        let receiver = state.tsf_receiver.get();
+        if !receiver.is_null() && IsWindow(receiver) == 0 {
+            // The application that asked for this service is already gone: just stay resident.
+            state.tsf_receiver.set(null_mut());
+            state.finished.set(true);
+            SetTimer(hwnd, IDLE_TIMER, IDLE_EXIT_MS, None);
+        } else if !receiver.is_null() {
+            watch_receiver(hwnd, state, receiver);
             let initial: String = argument("--initial")
                 .unwrap_or("")
                 .chars()
@@ -1636,7 +1722,7 @@ pub fn run() {
             if args.iter().any(|arg| arg == "--recall") {
                 recall_latest(hwnd, state);
             }
-            notify_tsf_ready(state.tsf_receiver, hwnd);
+            notify_tsf_ready(receiver, hwnd);
         } else if wants_history {
             open_history();
         } else if wants_settings || state.settings.borrow().validate().is_err() {

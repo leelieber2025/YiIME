@@ -1,6 +1,7 @@
 use super::*;
 
-/// Closes the input box (`editor`) once the application that owns the TSF receiver exits.
+/// Ends the session of `receiver` in the input box (`editor`) once the application owning that
+/// receiver exits (WM_TSF_EXIT with the receiver as wParam).
 pub(super) fn watch_tsf_owner(receiver: HWND, editor: HWND) {
     let mut pid = 0;
     unsafe {
@@ -15,10 +16,11 @@ pub(super) fn watch_tsf_owner(receiver: HWND, editor: HWND) {
     }
     let process = process as usize;
     let editor = editor as usize;
+    let receiver = receiver as usize;
     std::thread::spawn(move || unsafe {
         WaitForSingleObject(process as _, u32::MAX);
         CloseHandle(process as _);
-        PostMessageW(editor as HWND, WM_TSF_EXIT, 0, 0);
+        PostMessageW(editor as HWND, WM_TSF_EXIT, receiver, 0);
     });
 }
 pub(super) unsafe fn send_tsf_text(receiver: HWND, sender: HWND, text: &str) -> bool {
