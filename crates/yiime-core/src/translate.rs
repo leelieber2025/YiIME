@@ -127,6 +127,26 @@ fn agent(bypass_proxy: bool) -> &'static ureq::Agent {
     &agents[bypass_proxy as usize]
 }
 
+/// Windows reports `ERROR_SEM_TIMEOUT` as "semaphore timeout period", which does not contain
+/// the words "timed out".
+fn is_timeout(transport: &ureq::Transport) -> bool {
+    let rendered = transport.to_string().to_ascii_lowercase();
+    if rendered.contains("timed out") || rendered.contains("timeout") {
+        return true;
+    }
+    let mut source = std::error::Error::source(transport);
+    while let Some(err) = source {
+        if err
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::TimedOut)
+        {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
 fn host_of(endpoint: &str) -> String {
     url::Url::parse(endpoint)
         .ok()
@@ -174,8 +194,7 @@ fn http_error(error: ureq::Error) -> Fail {
         ureq::Error::Transport(transport) => {
             // `Display` includes the request URL (the free Google query carries the source
             // text), so the user sees only the kind and the URL-free message.
-            let text = transport.to_string();
-            if text.contains("timed out") || text.contains("Timeout") {
+            if is_timeout(&transport) {
                 Fail::new("timeout", "请求超时")
             } else {
                 let detail = transport
