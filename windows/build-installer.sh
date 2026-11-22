@@ -17,6 +17,8 @@ if command -v wine >/dev/null && [ "${OS:-}" != "Windows_NT" ]; then
 else
     run=("$iscc")
     script="windows/installer/yiime.iss"
+    # Git Bash (MSYS) would rewrite ISCC's /Q, /D… and /S… switches into Windows paths.
+    export MSYS2_ARG_CONV_EXCL='*'
 fi
 # ISCC_SIGNTOOL: optional sign command for Inno Setup ending in $f (e.g. `signtool.exe sign /fd
 # SHA256 /f cert.pfx /p … /tr http://timestamp.digicert.com /td SHA256 $f`); ISCC then signs the
