@@ -3,6 +3,7 @@
 [![CI](https://github.com/leelieber2025/YiIME/actions/workflows/ci.yml/badge.svg)](https://github.com/leelieber2025/YiIME/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/leelieber2025/YiIME?include_prereleases)](https://github.com/leelieber2025/YiIME/releases)
 [![License](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.24430891.svg)](https://doi.org/10.5281/zenodo.24430891)
 
 五笔/拼音输入法，自带“中文 → 英文”翻译：在任意应用里用中文打字，按 Enter 把译文直接上屏；也可以只打中文、不翻译。
 
@@ -103,6 +104,22 @@ macOS（开发中）：在 Mac 上运行 `bash macos/build.sh 0.1.0`，生成 `d
 - macOS 版：签名与公证、真机验证、设置界面，然后发布；
 - Linux 输入法（Fcitx5）；
 - 核心库保持平台无关，各平台只做输入法框架接入。
+
+## 引用
+
+如果 YiIME 对你的工作有帮助，请引用：
+
+> Zhao Li. *YiIME 译*. Zenodo. https://doi.org/10.5281/zenodo.24430891
+
+```bibtex
+@software{li_yiime,
+  author    = {Li, Zhao},
+  title     = {YiIME 译},
+  publisher = {Zenodo},
+  doi       = {10.5281/zenodo.24430891},
+  url       = {https://doi.org/10.5281/zenodo.24430891}
+}
+```
 
 ## 许可与致谢
 
