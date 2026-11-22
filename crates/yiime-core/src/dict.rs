@@ -1,11 +1,17 @@
-pub(crate) use crate::table::folded_initials;
 use crate::table::{RawTable, Side, Table, encode, merge_extra, parse_dictionary};
+pub(crate) use crate::table::{folded_initials, normalize_frequency_pinyin};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 /// Bundled dictionaries precompiled by `build.rs` (see `table.rs`).
 #[cfg(feature = "bundled")]
 static BUNDLED_INDEX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bundled.idx"));
+/// Index of the rime-frost lexicon shipped in data/frost, precompiled by `build.rs`; used only when
+/// the loaded file is byte-identical, otherwise the index is built at load time.
+#[cfg(feature = "bundled")]
+static FROST_INDEX: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/frost.idx"));
+#[cfg(not(feature = "bundled"))]
+static FROST_INDEX: &[u8] = &[];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -151,6 +157,8 @@ struct FrequencyWords {
     lines: Vec<(u32, u32)>,
     by_pinyin: Vec<u32>,
     by_code: Vec<u32>,
+    /// Precompiled initials order (when the file is the one shipped with this build).
+    abbreviations: Option<Vec<u32>>,
 }
 
 struct FrequencyLine<'a> {
@@ -161,53 +169,28 @@ struct FrequencyLine<'a> {
 }
 
 impl FrequencyWords {
-    fn new(text: String) -> Self {
-        let text = normalize_frequency_pinyin(text);
-        let mut lines = Vec::new();
-        let mut offset = 0usize;
-        for line in text.split_inclusive('\n') {
-            let body = line.trim_end_matches(['\r', '\n']);
-            if !body.starts_with('#')
-                && body.split('\t').count() >= 4
-                && text.len() < u32::MAX as usize
-            {
-                lines.push((offset as u32, (offset + body.len()) as u32));
-            }
-            offset += line.len();
-        }
-        let mut words = Self {
+    fn new(raw: String) -> Self {
+        let precompiled = crate::table::decode_frost(FROST_INDEX, raw.as_bytes());
+        let text = normalize_frequency_pinyin(raw);
+        let index = precompiled.unwrap_or_else(|| crate::table::frost_index(&text, false));
+        Self {
             text,
-            lines,
-            by_pinyin: Vec::new(),
-            by_code: Vec::new(),
-        };
-        // Sort by frequency first, then stably by key, so each key lists its most frequent words
-        // first.
-        let mut by_weight: Vec<u32> = (0..words.lines.len() as u32).collect();
-        by_weight.sort_by_cached_key(|i| std::cmp::Reverse(words.line(*i).weight));
-        let mut by_pinyin = by_weight.clone();
-        by_pinyin.sort_by_cached_key(|i| pinyin_key(words.line(*i).pinyin).collect::<Vec<u8>>());
-        let mut by_code = by_weight;
-        by_code.sort_by_cached_key(|i| words.line(*i).code.to_owned());
-        words.by_pinyin = by_pinyin;
-        words.by_code = by_code;
-        words
-    }
-
-    fn by_weight_order(&self) -> Vec<u32> {
-        let mut order: Vec<u32> = (0..self.lines.len() as u32).collect();
-        order.sort_by_cached_key(|i| std::cmp::Reverse(self.line(*i).weight));
-        order
+            lines: index.lines,
+            by_pinyin: index.by_pinyin,
+            by_code: index.by_code,
+            abbreviations: index.abbreviations,
+        }
     }
 
     fn line(&self, index: u32) -> FrequencyLine<'_> {
         let (start, end) = self.lines[index as usize];
-        let mut fields = self.text[start as usize..end as usize].split('\t');
+        let (text, pinyin, weight, code) =
+            crate::table::frost_fields(&self.text[start as usize..end as usize]);
         FrequencyLine {
-            text: fields.next().unwrap_or(""),
-            pinyin: fields.next().unwrap_or(""),
-            weight: fields.next().and_then(|w| w.parse().ok()).unwrap_or(0),
-            code: fields.next().unwrap_or(""),
+            text,
+            pinyin,
+            weight,
+            code,
         }
     }
 
@@ -238,40 +221,6 @@ impl FrequencyWords {
             .map(|i| self.line(*i))
             .take_while(move |line| line.code == code)
     }
-}
-
-/// Rewrites `lve`/`nve` syllables in the pinyin column to `lue`/`nue` in place (same length).
-fn normalize_frequency_pinyin(text: String) -> String {
-    if !text.contains("ve") {
-        return text;
-    }
-    let mut bytes = text.into_bytes();
-    let mut start = 0;
-    while start < bytes.len() {
-        let end = bytes[start..]
-            .iter()
-            .position(|b| *b == b'\n')
-            .map_or(bytes.len(), |i| start + i);
-        let line = &mut bytes[start..end];
-        if let Some(first_tab) = line.iter().position(|b| *b == b'\t') {
-            let field_end = line[first_tab + 1..]
-                .iter()
-                .position(|b| *b == b'\t')
-                .map_or(line.len(), |i| first_tab + 1 + i);
-            let field = &mut line[first_tab + 1..field_end];
-            let mut i = 0;
-            while i + 3 <= field.len() {
-                let bounded = (i == 0 || field[i - 1] == b' ')
-                    && (i + 3 == field.len() || field[i + 3] == b' ');
-                if bounded && (&field[i..i + 3] == b"lve" || &field[i..i + 3] == b"nve") {
-                    field[i + 1] = b'u';
-                }
-                i += 1;
-            }
-        }
-        start = end + 1;
-    }
-    String::from_utf8(bytes).unwrap_or_default()
 }
 
 /// Pinyin key: the syllables without spaces.
@@ -322,17 +271,9 @@ impl MixedInput {
                 .frequency
                 .as_ref()
                 .map(|words| {
-                    // Frequency order first, so the stable sort keeps the most frequent words first
-                    // within each key.
-                    let mut order: Vec<u32> = words
-                        .by_weight_order()
-                        .into_iter()
-                        .filter(|i| words.line(*i).pinyin.contains(' '))
-                        .collect();
-                    order.sort_by_cached_key(|i| {
-                        folded_initials(words.line(*i).pinyin).collect::<Vec<u8>>()
-                    });
-                    order
+                    words.abbreviations.clone().unwrap_or_else(|| {
+                        crate::table::frost_abbreviations(&words.text, &words.lines)
+                    })
                 })
                 .unwrap_or_default();
             Abbreviations { frost }
@@ -895,6 +836,23 @@ mod tests {
             normalize_frequency_pinyin("略\tlve\t1\tx\n".into()),
             "略\tlue\t1\tx\n"
         );
+    }
+
+    #[test]
+    fn precompiled_frost_index_matches_runtime_build() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../data/frost/InputTranslation-words.txt"
+        ))
+        .unwrap();
+        let precompiled = crate::table::decode_frost(FROST_INDEX, raw.as_bytes()).unwrap();
+        let built = crate::table::frost_index(&normalize_frequency_pinyin(raw.clone()), true);
+        assert_eq!(precompiled.lines, built.lines);
+        assert_eq!(precompiled.by_pinyin, built.by_pinyin);
+        assert_eq!(precompiled.by_code, built.by_code);
+        assert_eq!(precompiled.abbreviations, built.abbreviations);
+        // Any other content falls back to building the index at load time.
+        assert!(crate::table::decode_frost(FROST_INDEX, b"x\tx\t1\tx\n").is_none());
     }
 
     #[test]

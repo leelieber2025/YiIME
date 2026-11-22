@@ -15,11 +15,27 @@ fn main() {
     println!("cargo:rerun-if-changed=src/table.rs");
     let out = std::path::PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR"));
     let target = out.join("bundled.idx");
+    let frost_target = out.join("frost.idx");
     if std::env::var_os("CARGO_FEATURE_BUNDLED").is_none() {
-        // Still create the file so `include_bytes!` paths stay valid if features change.
+        // Still create the files so `include_bytes!` paths stay valid if features change.
         std::fs::write(&target, b"").expect("write index");
+        std::fs::write(&frost_target, b"").expect("write index");
         return;
     }
+    // The large lexicon is shipped as a separate file and still read at run time, but its sort
+    // orders are precompiled here; they are used only if the file read at run time is identical.
+    let frost_path = root.join("frost/InputTranslation-words.txt");
+    println!("cargo:rerun-if-changed={}", frost_path.display());
+    let frost = match std::fs::read(&frost_path) {
+        Ok(raw) => {
+            let hash = table::fnv1a(&raw);
+            let len = raw.len();
+            let text = table::normalize_frequency_pinyin(String::from_utf8(raw).expect("UTF-8"));
+            table::encode_frost(hash, len, &table::frost_index(&text, true))
+        }
+        Err(_) => Vec::new(),
+    };
+    std::fs::write(&frost_target, frost).expect("write index");
     let read = |path: &std::path::Path| {
         std::fs::read_to_string(path).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
     };

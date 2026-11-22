@@ -462,3 +462,206 @@ fn read_u32(data: &[u8], at: usize) -> u32 {
     word.copy_from_slice(&data[at..at + 4]);
     u32::from_le_bytes(word)
 }
+
+// ---- Large lexicon (rime-frost, `word<TAB>pinyin<TAB>frequency<TAB>Wubi code` per line) ----
+
+/// Rewrites `lve`/`nve` syllables in the pinyin column to `lue`/`nue` in place (same length).
+pub fn normalize_frequency_pinyin(text: String) -> String {
+    if !text.contains("ve") {
+        return text;
+    }
+    let mut bytes = text.into_bytes();
+    let mut start = 0;
+    while start < bytes.len() {
+        let end = bytes[start..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(bytes.len(), |i| start + i);
+        let line = &mut bytes[start..end];
+        if let Some(first_tab) = line.iter().position(|b| *b == b'\t') {
+            let field_end = line[first_tab + 1..]
+                .iter()
+                .position(|b| *b == b'\t')
+                .map_or(line.len(), |i| first_tab + 1 + i);
+            let field = &mut line[first_tab + 1..field_end];
+            let mut i = 0;
+            while i + 3 <= field.len() {
+                let bounded = (i == 0 || field[i - 1] == b' ')
+                    && (i + 3 == field.len() || field[i + 3] == b' ');
+                if bounded && (&field[i..i + 3] == b"lve" || &field[i..i + 3] == b"nve") {
+                    field[i + 1] = b'u';
+                }
+                i += 1;
+            }
+        }
+        start = end + 1;
+    }
+    String::from_utf8(bytes).unwrap_or_default()
+}
+
+/// 64-bit FNV-1a, to recognise the lexicon file the index was precompiled for.
+pub fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in bytes {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+/// Fields of one lexicon line: (word, pinyin, frequency, Wubi code).
+pub fn frost_fields(line: &str) -> (&str, &str, u64, &str) {
+    let mut fields = line.split('\t');
+    (
+        fields.next().unwrap_or(""),
+        fields.next().unwrap_or(""),
+        fields.next().and_then(|w| w.parse().ok()).unwrap_or(0),
+        fields.next().unwrap_or(""),
+    )
+}
+
+/// Line ranges plus line numbers sorted by pinyin key (without spaces), by Wubi code and by
+/// folded initials of multi-syllable words, most frequent first within a key.
+pub struct FrostIndex {
+    pub lines: Vec<(u32, u32)>,
+    pub by_pinyin: Vec<u32>,
+    pub by_code: Vec<u32>,
+    /// Built on demand at run time (None) or precompiled.
+    pub abbreviations: Option<Vec<u32>>,
+}
+
+/// Line ranges of the valid (non-comment, four-field) lines of normalised lexicon text.
+pub fn frost_lines(text: &str) -> Vec<(u32, u32)> {
+    let mut lines = Vec::new();
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        let body = line.trim_end_matches(['\r', '\n']);
+        if !body.starts_with('#') && body.split('\t').count() >= 4 && text.len() < u32::MAX as usize
+        {
+            lines.push((offset as u32, (offset + body.len()) as u32));
+        }
+        offset += line.len();
+    }
+    lines
+}
+
+fn frost_line<'a>(
+    text: &'a str,
+    lines: &[(u32, u32)],
+    index: u32,
+) -> (&'a str, &'a str, u64, &'a str) {
+    let (start, end) = lines[index as usize];
+    frost_fields(&text[start as usize..end as usize])
+}
+
+/// Line numbers by descending frequency (stable).
+pub fn frost_by_weight(text: &str, lines: &[(u32, u32)]) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..lines.len() as u32).collect();
+    order.sort_by_cached_key(|i| std::cmp::Reverse(frost_line(text, lines, *i).2));
+    order
+}
+
+/// Initials order of multi-syllable words (see [`FrostIndex::abbreviations`]).
+pub fn frost_abbreviations(text: &str, lines: &[(u32, u32)]) -> Vec<u32> {
+    // Frequency order first, so the stable sort keeps the most frequent words first within
+    // each key.
+    let mut order: Vec<u32> = frost_by_weight(text, lines)
+        .into_iter()
+        .filter(|i| frost_line(text, lines, *i).1.contains(' '))
+        .collect();
+    order.sort_by_cached_key(|i| {
+        folded_initials(frost_line(text, lines, *i).1).collect::<Vec<u8>>()
+    });
+    order
+}
+
+/// Builds the index of normalised lexicon text (abbreviations only when `with_abbreviations`).
+pub fn frost_index(text: &str, with_abbreviations: bool) -> FrostIndex {
+    let lines = frost_lines(text);
+    // Sort by frequency first, then stably by key, so each key lists its most frequent words
+    // first.
+    let by_weight = frost_by_weight(text, &lines);
+    let mut by_pinyin = by_weight.clone();
+    by_pinyin.sort_by_cached_key(|i| {
+        frost_line(text, &lines, *i)
+            .1
+            .bytes()
+            .filter(|b| *b != b' ')
+            .collect::<Vec<u8>>()
+    });
+    let mut by_code = by_weight;
+    by_code.sort_by_cached_key(|i| frost_line(text, &lines, *i).3.to_owned());
+    let abbreviations = with_abbreviations.then(|| frost_abbreviations(text, &lines));
+    FrostIndex {
+        lines,
+        by_pinyin,
+        by_code,
+        abbreviations,
+    }
+}
+
+pub const FROST_MAGIC: &[u8; 8] = b"YIMEFRS1";
+
+/// Serialises a precompiled lexicon index for the raw file with hash `hash` and length `len`.
+pub fn encode_frost(hash: u64, len: usize, index: &FrostIndex) -> Vec<u8> {
+    let mut out = FROST_MAGIC.to_vec();
+    out.extend_from_slice(&hash.to_le_bytes());
+    out.extend_from_slice(&(len as u64).to_le_bytes());
+    let abbreviations = index.abbreviations.as_deref().unwrap_or(&[]);
+    for count in [
+        index.lines.len(),
+        index.by_pinyin.len(),
+        index.by_code.len(),
+        abbreviations.len(),
+    ] {
+        push_u32(&mut out, count as u32);
+    }
+    for (start, end) in &index.lines {
+        push_u32(&mut out, *start);
+        push_u32(&mut out, *end);
+    }
+    for list in [&index.by_pinyin[..], &index.by_code[..], abbreviations] {
+        for value in list {
+            push_u32(&mut out, *value);
+        }
+    }
+    out
+}
+
+/// The precompiled index if it was built for exactly this raw file content.
+pub fn decode_frost(blob: &[u8], raw: &[u8]) -> Option<FrostIndex> {
+    if blob.len() < 40 || &blob[..8] != FROST_MAGIC {
+        return None;
+    }
+    let u64_at = |at: usize| {
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&blob[at..at + 8]);
+        u64::from_le_bytes(word)
+    };
+    if u64_at(16) != raw.len() as u64 || u64_at(8) != fnv1a(raw) {
+        return None;
+    }
+    let counts: Vec<usize> = (0..4)
+        .map(|i| read_u32(blob, 24 + i * 4) as usize)
+        .collect();
+    if blob.len() != 40 + (counts[0] * 2 + counts[1] + counts[2] + counts[3]) * 4 {
+        return None;
+    }
+    let mut at = 40;
+    let mut take = |count: usize| {
+        let list: Vec<u32> = (0..count).map(|i| read_u32(blob, at + i * 4)).collect();
+        at += count * 4;
+        list
+    };
+    let flat = take(counts[0] * 2);
+    let lines = flat.chunks(2).map(|pair| (pair[0], pair[1])).collect();
+    let by_pinyin = take(counts[1]);
+    let by_code = take(counts[2]);
+    let abbreviations = take(counts[3]);
+    Some(FrostIndex {
+        lines,
+        by_pinyin,
+        by_code,
+        abbreviations: Some(abbreviations),
+    })
+}
