@@ -77,7 +77,7 @@ yiime translate 你好世界     # 用免费 Google 翻译测试
 Windows 版需要 Rust（版本见 `rust-toolchain.toml`）和 MinGW-w64 交叉编译器，在 Linux 上构建：
 
 ```bash
-rustup target add x86_64-pc-windows-gnu
+rustup target add x86_64-pc-windows-gnu   # windows/build.sh 也会自动安装；rust-toolchain.toml 不再强制
 sudo apt-get install gcc-mingw-w64-x86-64-posix binutils-mingw-w64-x86-64
 bash windows/build.sh                   # 生成 dist/ 下的 EXE、DLL 和 zip
 ISCC=/path/to/ISCC.exe bash windows/build-installer.sh   # 用 Inno Setup 6（Linux 上经 wine）生成安装包

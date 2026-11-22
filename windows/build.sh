@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# The Windows target is no longer listed in rust-toolchain.toml; install it on demand.
+if command -v rustup >/dev/null; then
+    rustup target list --installed | grep -qx x86_64-pc-windows-gnu || rustup target add x86_64-pc-windows-gnu
+fi
 : "${CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER:=x86_64-w64-mingw32-gcc}"
 : "${CC_x86_64_pc_windows_gnu:=x86_64-w64-mingw32-gcc}"
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER CC_x86_64_pc_windows_gnu
