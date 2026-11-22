@@ -105,6 +105,9 @@ const LLM_TIMEOUT: Duration = Duration::from_secs(20);
 const GOOGLE_FREE_URL: &str = "https://translate.googleapis.com/translate_a/single";
 const AZURE_TIMEOUT: Duration = Duration::from_secs(6);
 const AZURE_URL: &str = "https://api.cognitive.microsofttranslator.com/translate";
+const DEEPL_TIMEOUT: Duration = Duration::from_secs(8);
+const DEEPL_FREE_URL: &str = "https://api-free.deepl.com/v2/translate";
+const DEEPL_PRO_URL: &str = "https://api.deepl.com/v2/translate";
 const GOOGLE_CLOUD_URL: &str = "https://translation.googleapis.com/language/translate/v2";
 
 /// Shared HTTP clients (with and without proxy) so connections are reused and DNS/TCP/TLS happen
@@ -138,7 +141,12 @@ fn http_error(error: ureq::Error) -> Fail {
             let explanation = response.into_string().unwrap_or_default();
             let message = serde_json::from_str::<Value>(&explanation)
                 .ok()
-                .and_then(|json| json["error"]["message"].as_str().map(str::to_owned))
+                .and_then(|json| {
+                    json["error"]["message"]
+                        .as_str()
+                        .or_else(|| json["message"].as_str())
+                        .map(str::to_owned)
+                })
                 .unwrap_or_else(|| {
                     // HTML error pages (Google rate limiting) do not fit in the status line.
                     if explanation.trim_start().starts_with('<') {
@@ -157,6 +165,8 @@ fn http_error(error: ureq::Error) -> Fail {
                     &category,
                     format!("HTTP 429（请求太频繁，被限流）{message}"),
                 )
+            } else if code == 456 {
+                Fail::new(&category, format!("HTTP 456（翻译额度已用完）{message}"))
             } else {
                 Fail::new(&category, format!("HTTP {code}{message}"))
             }
@@ -286,6 +296,14 @@ fn run(
             String::new(),
             google_cloud(source, settings.google_key.trim(), &mut first_byte, started),
         ),
+        Engine::DeepL => {
+            let url = deepl_url(settings.deepl_key.trim());
+            (
+                host_of(url),
+                String::new(),
+                deepl(source, settings.deepl_key.trim(), &mut first_byte, started),
+            )
+        }
         Engine::Llm => (
             host_of(settings.url.trim()),
             settings.model.trim().to_owned(),
@@ -386,6 +404,48 @@ fn parse_azure(json: &Value) -> Result<String, String> {
         .map(|text| text.trim().to_owned())
         .filter(|text| !text.is_empty())
         .ok_or_else(|| "Azure 翻译没有返回译文".into())
+}
+
+/// Free-plan keys end with `:fx` and must use the free host; other keys use Pro.
+fn deepl_url(key: &str) -> &'static str {
+    if key.ends_with(":fx") {
+        DEEPL_FREE_URL
+    } else {
+        DEEPL_PRO_URL
+    }
+}
+
+/// DeepL `/v2/translate`, Chinese to American English.
+fn deepl(
+    source: &str,
+    key: &str,
+    first_byte: &mut Option<u128>,
+    started: Instant,
+) -> Result<String, Fail> {
+    if key.is_empty() {
+        return Err(Fail::new("config", "缺少 DeepL 的 API 密钥"));
+    }
+    let response = agent(false)
+        .post(deepl_url(key))
+        .timeout(DEEPL_TIMEOUT)
+        .set("Authorization", &format!("DeepL-Auth-Key {key}"))
+        .send_json(json!({
+            "text": [source],
+            "source_lang": "ZH",
+            "target_lang": "EN-US",
+        }))
+        .map_err(http_error)?;
+    *first_byte = Some(started.elapsed().as_millis());
+    let json: Value = response.into_json().map_err(|_| "DeepL 返回格式不对")?;
+    parse_deepl(&json).map_err(|message| Fail::new("empty", message))
+}
+
+fn parse_deepl(json: &Value) -> Result<String, String> {
+    json["translations"][0]["text"]
+        .as_str()
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .ok_or_else(|| "DeepL 没有返回译文".into())
 }
 
 /// Google Cloud Translation v2 (`?key=`).
@@ -573,7 +633,10 @@ pub fn prewarm(settings: &ApiSettings) {
         Engine::Azure => targets.push((AZURE_URL.to_owned(), false)),
         Engine::GoogleFree => targets.push((GOOGLE_FREE_URL.to_owned(), false)),
         Engine::GoogleCloud => targets.push((GOOGLE_CLOUD_URL.to_owned(), false)),
-        Engine::Llm => {}
+        Engine::DeepL if !settings.deepl_key.trim().is_empty() => {
+            targets.push((deepl_url(settings.deepl_key.trim()).to_owned(), false))
+        }
+        Engine::DeepL | Engine::Llm => {}
     }
     if settings.validate_llm().is_ok() {
         let url = settings.url.trim().to_owned();
@@ -745,6 +808,14 @@ mod tests {
         .unwrap();
         assert_eq!(parse_google_free(&json), Ok("Hello, world".to_owned()));
         assert!(parse_google_free(&Value::Null).is_err());
+        let deepl: Value = serde_json::from_str(
+            r#"{"translations":[{"detected_source_language":"ZH","text":" Hello "}]}"#,
+        )
+        .unwrap();
+        assert_eq!(parse_deepl(&deepl), Ok("Hello".to_owned()));
+        assert!(parse_deepl(&json!({"translations":[{"text":"  "}]})).is_err());
+        assert_eq!(deepl_url("xxxxxxxx:fx"), DEEPL_FREE_URL);
+        assert_eq!(deepl_url("xxxxxxxx"), DEEPL_PRO_URL);
         let attempt = Attempt {
             engine: Engine::Llm,
             model: "m".into(),

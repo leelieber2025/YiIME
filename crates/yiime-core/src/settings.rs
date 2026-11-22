@@ -214,12 +214,17 @@ pub struct ApiSettings {
     /// Azure Translator key (stored encrypted in [`AZURE_KEY_FILE`]) and resource region.
     pub azure_key: String,
     pub azure_region: String,
+    /// DeepL API key (stored encrypted in [`DEEPL_KEY_FILE`]). A key ending in `:fx` uses the free
+    /// endpoint.
+    pub deepl_key: String,
 }
 
 /// Encrypted Google Cloud key file (separate from the LLM key).
 pub const GOOGLE_KEY_FILE: &str = "google.dpapi";
 /// Encrypted Azure Translator key file.
 pub const AZURE_KEY_FILE: &str = "azure.dpapi";
+/// Encrypted DeepL API key file.
+pub const DEEPL_KEY_FILE: &str = "deepl.dpapi";
 
 /// Translation engine; `id` is what settings.json stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -231,17 +236,26 @@ pub enum Engine {
     GoogleFree,
     /// Google Cloud Translation v2 (API key required).
     GoogleCloud,
+    /// DeepL API (`EN-US`). A key ending in `:fx` uses the free endpoint.
+    DeepL,
     /// OpenAI-compatible chat completions API (supports translation style and custom instructions).
     Llm,
 }
 
 impl Engine {
-    pub const ALL: [Self; 4] = [Self::Azure, Self::GoogleFree, Self::GoogleCloud, Self::Llm];
+    pub const ALL: [Self; 5] = [
+        Self::Azure,
+        Self::GoogleFree,
+        Self::GoogleCloud,
+        Self::DeepL,
+        Self::Llm,
+    ];
     pub fn id(self) -> &'static str {
         match self {
             Self::Azure => "azure",
             Self::GoogleFree => "google_free",
             Self::GoogleCloud => "google_cloud",
+            Self::DeepL => "deepl",
             Self::Llm => "llm",
         }
     }
@@ -256,6 +270,7 @@ impl Engine {
             Self::Azure => "Azure 翻译（F0 免费，默认）",
             Self::GoogleFree => "Google 翻译（免费）",
             Self::GoogleCloud => "Google Cloud 翻译（需密钥）",
+            Self::DeepL => "DeepL（美式英文，需密钥）",
             Self::Llm => "大模型（OpenAI 兼容）",
         }
     }
@@ -273,6 +288,7 @@ impl Default for ApiSettings {
             google_key: String::new(),
             azure_key: String::new(),
             azure_region: String::new(),
+            deepl_key: String::new(),
         }
     }
 }
@@ -325,6 +341,13 @@ impl ApiSettings {
         if let Some(text) = azure {
             settings.azure_key = text;
         }
+        let deepl = std::fs::read(dir.join(DEEPL_KEY_FILE))
+            .ok()
+            .and_then(|bytes| sealer.open(&bytes))
+            .and_then(|clear| String::from_utf8(clear).ok());
+        if let Some(text) = deepl {
+            settings.deepl_key = text;
+        }
         settings
     }
     pub fn save(&self, dir: &Path, sealer: &dyn Sealer) -> std::io::Result<()> {
@@ -355,6 +378,17 @@ impl ApiSettings {
                 .ok_or_else(|| std::io::Error::other("密钥加密失败"))?;
             std::fs::write(azure, sealed)?;
         }
+        let deepl = dir.join(DEEPL_KEY_FILE);
+        if self.deepl_key.trim().is_empty() {
+            if deepl.exists() {
+                std::fs::remove_file(&deepl)?;
+            }
+        } else {
+            let sealed = sealer
+                .seal(self.deepl_key.trim().as_bytes())
+                .ok_or_else(|| std::io::Error::other("密钥加密失败"))?;
+            std::fs::write(deepl, sealed)?;
+        }
         std::fs::write(
             dir.join(SETTINGS_FILE),
             serde_json::to_vec(&serde_json::json!({
@@ -376,6 +410,10 @@ impl ApiSettings {
                 Err("请先在“设置”中填写 Google Cloud 翻译的 API 密钥")
             }
             Engine::GoogleCloud => Ok(()),
+            Engine::DeepL if self.deepl_key.trim().is_empty() => {
+                Err("请先在“设置”中填写 DeepL 的 API 密钥")
+            }
+            Engine::DeepL => Ok(()),
             Engine::Llm => self.validate_llm(),
         }
     }
@@ -454,9 +492,11 @@ mod tests {
             google_key: "gkey".into(),
             azure_key: "akey".into(),
             azure_region: "eastus".into(),
+            deepl_key: "dkey:fx".into(),
         };
         settings.save(&dir, &Xor).unwrap();
         assert_ne!(std::fs::read(dir.join(AZURE_KEY_FILE)).unwrap(), b"akey");
+        assert_ne!(std::fs::read(dir.join(DEEPL_KEY_FILE)).unwrap(), b"dkey:fx");
         let raw = std::fs::read(dir.join(KEY_FILE)).unwrap();
         assert_ne!(raw, b"secret");
         let json = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
@@ -482,8 +522,21 @@ mod tests {
         assert!(json.contains("\"engine\":\"llm\""));
         let mut cleared = settings.clone();
         cleared.google_key.clear();
+        cleared.deepl_key.clear();
         cleared.save(&dir, &Xor).unwrap();
         assert!(!dir.join(GOOGLE_KEY_FILE).exists());
+        assert!(!dir.join(DEEPL_KEY_FILE).exists());
+        let deepl = ApiSettings {
+            engine: Engine::DeepL,
+            ..ApiSettings::default()
+        };
+        assert!(deepl.validate().is_err());
+        let deepl = ApiSettings {
+            engine: Engine::DeepL,
+            deepl_key: "k".into(),
+            ..ApiSettings::default()
+        };
+        assert!(deepl.validate().is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

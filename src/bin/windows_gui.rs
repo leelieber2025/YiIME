@@ -129,9 +129,10 @@ mod app {
     const SETTINGS_GOOGLE_KEY: i32 = 225;
     const SETTINGS_AZURE_KEY: i32 = 226;
     const SETTINGS_AZURE_REGION: i32 = 227;
+    const SETTINGS_DEEPL_KEY: i32 = 228;
     /// Height of the Translation Engine row at the top of the settings window; the other controls
     /// move down by this much.
-    const ENGINE_SHIFT: i32 = 112;
+    const ENGINE_SHIFT: i32 = 168;
     /// Longest custom LLM instruction kept from the settings window, in characters.
     const MAX_CUSTOM_LEN: usize = 500;
     const PAD: i32 = 6;
@@ -2380,7 +2381,7 @@ mod app {
                 SendMessageW(combo, CB_SETCURSEL, selected, 0);
                 label(
                     hwnd,
-                    "自定义要求（可选，追加到翻译提示词，例如“使用英式拼写”）",
+                    "自定义要求（可选，追加到翻译提示词，例如“保留产品名不翻译”）",
                     16,
                     182,
                     408,
@@ -2609,11 +2610,30 @@ mod app {
                     24,
                     SETTINGS_AZURE_REGION,
                 );
+                label(
+                    hwnd,
+                    "DeepL 密钥（加密保存；以 :fx 结尾为免费版，译文为美式英文）",
+                    16,
+                    124,
+                    408,
+                );
+                let deepl_key = control(
+                    hwnd,
+                    "EDIT",
+                    &settings.deepl_key,
+                    ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+                    16,
+                    146,
+                    196,
+                    24,
+                    SETTINGS_DEEPL_KEY,
+                );
                 let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
                 SetWindowPos(engine, HWND_TOP, 0, 0, 0, 0, flags);
                 SetWindowPos(google_key, engine, 0, 0, 0, 0, flags);
                 SetWindowPos(azure_key, google_key, 0, 0, 0, 0, flags);
                 SetWindowPos(azure_region, azure_key, 0, 0, 0, 0, flags);
+                SetWindowPos(deepl_key, azure_region, 0, 0, 0, 0, flags);
                 0
             },
             WM_COMMAND => unsafe {
@@ -2636,6 +2656,7 @@ mod app {
                             google_key: field(SETTINGS_GOOGLE_KEY),
                             azure_key: field(SETTINGS_AZURE_KEY),
                             azure_region: field(SETTINGS_AZURE_REGION),
+                            deepl_key: field(SETTINGS_DEEPL_KEY),
                             url: field(SETTINGS_URL),
                             model: field(SETTINGS_MODEL),
                             key: field(SETTINGS_KEY),
