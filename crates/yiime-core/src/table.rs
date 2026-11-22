@@ -38,6 +38,28 @@ pub struct RawEntry {
 
 pub type RawTable = BTreeMap<String, Vec<RawEntry>>;
 
+/// `lve`/`nve` (and `lv`-`e` written as one syllable) are the keyboard spellings of lüe/nüe. Rime
+/// writes them `lue`/`nue`, rime-frost `lve`/`nve`; both are stored as `lue`/`nue`.
+pub fn normalize_syllable(syllable: &str) -> &str {
+    match syllable {
+        "lve" => "lue",
+        "nve" => "nue",
+        other => other,
+    }
+}
+
+/// Normalizes the space-separated syllables of a pinyin entry (see [`normalize_syllable`]).
+pub fn normalize_syllables(syllables: &str) -> String {
+    if !syllables.contains("ve") {
+        return syllables.to_owned();
+    }
+    syllables
+        .split(' ')
+        .map(normalize_syllable)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Rime dictionary text, one `word<TAB>code<TAB>frequency` per line after the `...` line.
 pub fn parse_dictionary(contents: &str, pinyin: bool) -> RawTable {
     let mut result: RawTable = BTreeMap::new();
@@ -65,7 +87,8 @@ pub fn parse_dictionary(contents: &str, pinyin: bool) -> RawTable {
             0
         };
         let (key, syllables) = if pinyin {
-            (code.replace(' ', ""), code.to_owned())
+            let syllables = normalize_syllables(code);
+            (syllables.replace(' ', ""), syllables)
         } else {
             (code.to_owned(), String::new())
         };

@@ -73,6 +73,16 @@ fn partition(count: usize, before: impl Fn(usize) -> bool) -> usize {
     low
 }
 
+/// Pinyin spelling of a code for lookups: `lve`/`nve` → `lue`/`nue` (Wubi lookups keep the code as
+/// typed).
+fn pinyin_spelling(code: &str) -> std::borrow::Cow<'_, str> {
+    if code.contains("ve") {
+        std::borrow::Cow::Owned(code.replace("lve", "lue").replace("nve", "nue"))
+    } else {
+        std::borrow::Cow::Borrowed(code)
+    }
+}
+
 /// First letter of each syllable; zh/ch/sh become Z/C/S.
 fn syllable_initials(syllables: &str) -> String {
     syllables
@@ -152,6 +162,7 @@ struct FrequencyLine<'a> {
 
 impl FrequencyWords {
     fn new(text: String) -> Self {
+        let text = normalize_frequency_pinyin(text);
         let mut lines = Vec::new();
         let mut offset = 0usize;
         for line in text.split_inclusive('\n') {
@@ -227,6 +238,40 @@ impl FrequencyWords {
             .map(|i| self.line(*i))
             .take_while(move |line| line.code == code)
     }
+}
+
+/// Rewrites `lve`/`nve` syllables in the pinyin column to `lue`/`nue` in place (same length).
+fn normalize_frequency_pinyin(text: String) -> String {
+    if !text.contains("ve") {
+        return text;
+    }
+    let mut bytes = text.into_bytes();
+    let mut start = 0;
+    while start < bytes.len() {
+        let end = bytes[start..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(bytes.len(), |i| start + i);
+        let line = &mut bytes[start..end];
+        if let Some(first_tab) = line.iter().position(|b| *b == b'\t') {
+            let field_end = line[first_tab + 1..]
+                .iter()
+                .position(|b| *b == b'\t')
+                .map_or(line.len(), |i| first_tab + 1 + i);
+            let field = &mut line[first_tab + 1..field_end];
+            let mut i = 0;
+            while i + 3 <= field.len() {
+                let bounded = (i == 0 || field[i - 1] == b' ')
+                    && (i + 3 == field.len() || field[i + 3] == b' ');
+                if bounded && (&field[i..i + 3] == b"lve" || &field[i..i + 3] == b"nve") {
+                    field[i + 1] = b'u';
+                }
+                i += 1;
+            }
+        }
+        start = end + 1;
+    }
+    String::from_utf8(bytes).unwrap_or_default()
 }
 
 /// Pinyin key: the syllables without spaces.
@@ -505,6 +550,7 @@ impl MixedInput {
 
     /// Whether some pinyin starts with `code`, i.e. typing on may still give pinyin.
     pub fn pinyin_continues(&self, code: &str) -> bool {
+        let code = &*pinyin_spelling(code);
         let next = self.table.lower_bound(Side::Pinyin, code);
         (next < self.table.key_count(Side::Pinyin)
             && self.table.key(Side::Pinyin, next).starts_with(code))
@@ -598,7 +644,12 @@ impl MixedInput {
         if code.is_empty() {
             return Vec::new();
         }
-        let homophones = self.homophones(&code);
+        // Pinyin lookups read lve/nve as lüe/nüe; Wubi lookups keep the code as typed.
+        let spelling = pinyin_spelling(&code).into_owned();
+        let py = spelling.as_str();
+        // A `'` separator only exists in pinyin, so such a code never matches Wubi.
+        let pinyin_only = raw.contains('\'');
+        let homophones = self.homophones(py);
         let wanted = if raw.contains('\'') {
             boundaries(&raw.to_ascii_lowercase().replace(' ', ""), '\'')
         } else {
@@ -625,19 +676,18 @@ impl MixedInput {
                 return separated;
             }
         }
-        let mut wubi: Vec<Arc<str>> = self
-            .wubi_slot(&code)
-            .into_iter()
-            .map(|(text, _)| text)
-            .collect();
-        if let Some(words) = &self.frequency {
-            wubi.extend(words.code(&code).map(|line| Arc::from(line.text)));
+        let mut wubi: Vec<Arc<str>> = Vec::new();
+        if !pinyin_only {
+            wubi.extend(self.wubi_slot(&code).into_iter().map(|(text, _)| text));
+            if let Some(words) = &self.frequency {
+                wubi.extend(words.code(&code).map(|line| Arc::from(line.text)));
+            }
         }
         let exact = !wubi.is_empty() || !homophones.is_empty();
         // Only when the code is neither a Wubi code nor a pinyin word.
         let spelled = !exact && code.len() >= 4 && code.bytes().all(|b| b.is_ascii_lowercase());
         let (sentence, partial) = if spelled {
-            self.segment_fallback(&code, &wanted, page_size.max(1) * 2)
+            self.segment_fallback(py, &wanted, page_size.max(1) * 2)
         } else {
             (None, Vec::new())
         };
@@ -673,12 +723,12 @@ impl MixedInput {
             push(pinyin, Source::Pinyin, true);
         }
         if fuzzy {
-            push(self.fuzzy(&code, &wanted, limit), Source::Pinyin, true);
+            push(self.fuzzy(py, &wanted, limit), Source::Pinyin, true);
         }
         // Typo correction first (`zhonggou` → 中国).
         if spelled {
             push(
-                self.corrections(&code, &wanted, limit),
+                self.corrections(py, &wanted, limit),
                 Source::Corrected,
                 true,
             );
@@ -697,17 +747,17 @@ impl MixedInput {
         );
         if spelled && wanted.is_empty() {
             push(
-                self.mixed_abbreviation(&code, limit),
+                self.mixed_abbreviation(py, limit),
                 Source::Abbreviation,
                 true,
             );
         }
         push(sentence.into_iter().collect(), Source::Pinyin, true);
         push(partial, Source::Partial, true);
-        if code.contains('z') && code.len() <= 4 {
+        if !pinyin_only && code.contains('z') && code.len() <= 4 {
             push(self.wildcard(&code, limit), Source::Wildcard, true);
         }
-        if code.len() < 4 && !self.table.contains_key(Side::Pinyin, &code) {
+        if !pinyin_only && code.len() < 4 && !self.table.contains_key(Side::Pinyin, py) {
             let mut prefixes = self.wubi_with_prefix(&code, |key| key != code);
             prefixes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             push(
@@ -805,6 +855,46 @@ mod tests {
             );
         }
         assert_eq!(bundled.wubi_hint("的").as_deref(), Some("r/rqyy"));
+    }
+
+    #[test]
+    fn lve_nve_spell_lue_nue_and_apostrophe_is_pinyin_only() {
+        let wubi = "...\n男女朋友\tlvel\t9\n恨\tnve\t9\n略\tlttm\t1\n";
+        let pinyin = "...\n略\tlue\t100\n虐\tnue\t50\n绿\tlv\t80\n";
+        let words = "略微\tlve wei\t3330\tlttm\n女儿\tnv er\t10\tvvqt\n";
+        let input = MixedInput::from_rime(wubi, pinyin).with_frequency_words(words.to_owned());
+        let texts = |code: &str| -> Vec<String> {
+            input
+                .candidates(code, 9)
+                .into_iter()
+                .map(|c| c.text)
+                .collect()
+        };
+        // lve/lue and nve/nue give the same pinyin; the Wubi code `nve` still comes first.
+        assert_eq!(texts("lve")[0], "略");
+        assert_eq!(texts("lue")[0], "略");
+        assert_eq!(texts("nve"), ["恨", "虐"]);
+        assert_eq!(texts("lvewei")[0], "略微");
+        assert_eq!(texts("luewei")[0], "略微");
+        assert!(input.pinyin_continues("lve"));
+        // With `'` nothing comes from Wubi (no `男女朋友` prefix match, no `恨`).
+        assert_eq!(texts("lv'e"), ["略"]);
+        assert_eq!(texts("n've"), ["虐"]);
+        assert!(!texts("nv'e").contains(&"恨".to_owned()));
+        // The real dictionaries: lve/nve no longer fall through to Wubi words.
+        let full = MixedInput::bundled();
+        assert_eq!(full.candidates("lve", 9)[0].text, "略");
+        assert!(
+            full.candidates("lve", 9)
+                .iter()
+                .all(|c| c.text != "男女朋友")
+        );
+        assert_eq!(full.candidates("nve", 9)[0].text, "恨");
+        assert!(full.candidates("nve", 9).iter().any(|c| c.text == "虐"));
+        assert_eq!(
+            normalize_frequency_pinyin("略\tlve\t1\tx\n".into()),
+            "略\tlue\t1\tx\n"
+        );
     }
 
     #[test]
