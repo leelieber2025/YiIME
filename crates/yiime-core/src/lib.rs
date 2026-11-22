@@ -46,7 +46,10 @@ pub use inline::{
     SHIFT_TAP_MAX, ShiftTap, is_literal_in_english, is_numpad_digit, is_shift_key, literal_code,
 };
 #[cfg(feature = "engine")]
-pub use learn::{LEARNED_FILE, Learned};
+pub use learn::{
+    HALF_LIFE_DAYS, LEARNED_FILE, LEGACY_LEARNED_FILE, Learned, MAX_ENTRIES, PROMOTE_SCORE,
+    write_atomically,
+};
 pub use settings::{
     AZURE_KEY_FILE, ApiSettings, DEFAULT_HISTORY_KEY, DEFAULT_URL, Engine, Flag, GOOGLE_KEY_FILE,
     KEY_FILE, MemoryStore, OptionStore, Options, PAGE_SIZE, PAGE_SIZE_RANGE, PlainSealer,

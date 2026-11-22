@@ -214,7 +214,7 @@ struct State {
     swallow_char: Cell<bool>,
     /// Mode last shown in the tray tooltip.
     last_plain: Cell<bool>,
-    /// Learned picks, saved in %APPDATA%\\InputTranslation\\learned.txt.
+    /// Learned picks, saved DPAPI-encrypted in %APPDATA%\\InputTranslation\\learned.dat.
     learned: RefCell<Learned>,
     quotes: Cell<Quotes>,
     /// The draft was recalled with the history shortcut: handle it in translation mode (plain
@@ -871,6 +871,10 @@ unsafe fn activate(hwnd: HWND, state: &State, target: HWND, anchor: Option<RECT>
     }
 }
 unsafe fn hide_box(hwnd: HWND, state: &State) {
+    // Session over: write learning changes that were held back while typing.
+    if let Ok(mut learned) = state.learned.try_borrow_mut() {
+        learned.flush();
+    }
     state.suppress_deactivate.set(true);
     unsafe {
         ShowWindow(hwnd, SW_HIDE);
@@ -1451,7 +1455,7 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
             finished: Cell::new(false),
             swallow_char: Cell::new(false),
             last_plain: Cell::new(plain_mode()),
-            learned: RefCell::new(Learned::load(learned_path())),
+            learned: RefCell::new(Learned::load(learned_path(), Box::new(Dpapi))),
             quotes: Cell::new(Quotes::default()),
             english: Cell::new(false),
             shift_tap: Cell::new(yiime_core::ShiftTap::default()),
