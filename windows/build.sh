@@ -16,4 +16,8 @@ export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$registry_root=/c
 # does not strip unused code per function, making the DLL several times larger.
 cargo build --release --target x86_64-pc-windows-gnu -p input_translation
 cargo build --release --target x86_64-pc-windows-gnu -p input_translation_tsf
+# Opt-in Authenticode signing before packaging (hashes, version directory and ZIPs then cover the
+# signed files); a no-op without WINDOWS_SIGN_PFX / WINDOWS_SIGN_PFX_BASE64.
+bash windows/sign.sh target/x86_64-pc-windows-gnu/release/windows_gui.exe \
+    target/x86_64-pc-windows-gnu/release/input_translation_tsf.dll
 python3 windows/package.py

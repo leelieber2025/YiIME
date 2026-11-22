@@ -18,6 +18,21 @@ else
     run=("$iscc")
     script="windows/installer/yiime.iss"
 fi
-"${run[@]}" /Q "/DAppVersion=$version" "/DVersionDir=$version_dir" "$script"
+# ISCC_SIGNTOOL: optional sign command for Inno Setup ending in $f (e.g. `signtool.exe sign /fd
+# SHA256 /f cert.pfx /p … /tr http://timestamp.digicert.com /td SHA256 $f`); ISCC then signs the
+# setup and the uninstaller inside it.
+sign_args=()
+if [ -n "${ISCC_SIGNTOOL:-}" ]; then
+    sign_args=("/DSignTool=yiime" "/Syiime=$ISCC_SIGNTOOL")
+fi
+"${run[@]}" /Q "/DAppVersion=$version" "/DVersionDir=$version_dir" "${sign_args[@]}" "$script"
+# Otherwise sign the finished installer (opt-in; no-op without a certificate, see SIGNING.md).
+if [ -z "${ISCC_SIGNTOOL:-}" ]; then
+    if [ "${OS:-}" = "Windows_NT" ]; then
+        pwsh -NoProfile -File windows/sign.ps1 "dist/YiIME-$version-setup.exe"
+    else
+        bash windows/sign.sh "dist/YiIME-$version-setup.exe"
+    fi
+fi
 echo "版本目录：$version_dir"
 ls -l "dist/YiIME-$version-setup.exe"

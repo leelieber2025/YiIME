@@ -58,6 +58,13 @@ Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
 SetupLogging=yes
+; Optional code signing on Windows: ISCC /DSignTool=yiime /Syiime="signtool.exe sign /fd SHA256 ...
+; $f" signs the setup and its uninstaller (see SIGNING.md). Without it the installer is built
+; unsigned and windows/build-installer.sh may sign it afterwards.
+#ifdef SignTool
+SignTool={#SignTool}
+SignedUninstaller=yes
+#endif
 
 [Languages]
 Name: "chs"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"

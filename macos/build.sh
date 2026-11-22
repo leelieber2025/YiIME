@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# Build YiIME.app on macOS (arm64 + x86_64 universal binary, ad-hoc signed) and the unsigned
-# installation package dist/YiIME-<version>-macos.pkg (installed to /Library/Input Methods).
+# Build YiIME.app on macOS (arm64 + x86_64 universal binary) and the installation package
+# dist/YiIME-<version>-macos.pkg (installed to /Library/Input Methods).
+#
+# Signing is opt-in: by default the app is ad-hoc signed and the package unsigned. With
+#   MACOS_SIGN_IDENTITY="Developer ID Application: …"      the app is signed with the hardened
+#                                                          runtime and a secure timestamp, and
+#   MACOS_INSTALLER_IDENTITY="Developer ID Installer: …"   the package is signed;
+# then macos/notarize.sh notarizes and staples it. See SIGNING.md.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 version="$(tools/version.sh)"
@@ -36,11 +42,20 @@ for dir in wubi pinyin wubi_extra opencc frost; do
     find "data/$dir" -maxdepth 1 \( -name 'LICENSE*' -o -name AUTHORS \) -exec cp {} "$app/Contents/Resources/data/$dir/" \;
 done
 plutil -lint "$app/Contents/Info.plist"
-codesign --force --deep --sign - "$app"
-codesign --verify --verbose "$app"
+if [ -n "${MACOS_SIGN_IDENTITY:-}" ]; then
+    codesign --force --deep --options runtime --timestamp --sign "$MACOS_SIGN_IDENTITY" "$app"
+else
+    codesign --force --deep --sign - "$app"
+fi
+codesign --verify --strict --verbose "$app"
 lipo -info "$app/Contents/MacOS/YiIME"
 pkgbuild --root "$out/root" --identifier com.yiime.inputmethod.YiIME.pkg --version "$version" \
     --install-location "/Library/Input Methods" --scripts macos/pkg-scripts "$out/YiIME-component.pkg"
-productbuild --package "$out/YiIME-component.pkg" "dist/YiIME-$version-macos.pkg"
+if [ -n "${MACOS_INSTALLER_IDENTITY:-}" ]; then
+    productbuild --sign "$MACOS_INSTALLER_IDENTITY" --timestamp \
+        --package "$out/YiIME-component.pkg" "dist/YiIME-$version-macos.pkg"
+else
+    productbuild --package "$out/YiIME-component.pkg" "dist/YiIME-$version-macos.pkg"
+fi
 rm "$out/YiIME-component.pkg"
 ls -l "dist/YiIME-$version-macos.pkg"
