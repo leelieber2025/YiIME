@@ -4,11 +4,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 version="$(tools/version.sh)"
-for file in dist/input_translation_tsf.dll dist/InputTranslation-Portable.exe dist/BUILDINFO.txt; do
+for file in dist/yiime_tsf.dll dist/YiIME.exe dist/BUILDINFO.txt; do
     [ -f "$file" ] || { echo "缺少 $file，请先运行 windows/build.sh" >&2; exit 1; }
 done
 hash12() { sha256sum "$1" | cut -c1-12 | tr a-f A-F; }
-version_dir="$(hash12 dist/input_translation_tsf.dll)-$(hash12 dist/InputTranslation-Portable.exe)"
+version_dir="$(hash12 dist/yiime_tsf.dll)-$(hash12 dist/YiIME.exe)"
 iscc="${ISCC:-ISCC.exe}"
 if command -v wine >/dev/null && [ "${OS:-}" != "Windows_NT" ]; then
     export WINEDEBUG="${WINEDEBUG:--all}"

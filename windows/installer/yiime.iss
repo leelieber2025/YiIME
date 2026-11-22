@@ -1,18 +1,19 @@
 ﻿; YiIME Windows installer (Inno Setup 6).
 ;
-; Same layout as Install-InputTranslation.ps1: Program Files\InputTranslation\<version dir>\, where
+; Same layout as Install-YiIME.ps1: Program Files\YiIME\<version dir>\ (an existing 0.1.x install
+; keeps Program Files\InputTranslation, the directory Inno Setup remembers for this AppId), where
 ; the version dir is the first 12 hex digits of the DLL and EXE SHA-256 (so reinstalling the same
 ; build is a no-op). The IME DLL is loaded into every process with a text box and cannot be
 ; overwritten while locked, so each version gets its own directory and the new DLL is registered
 ; (CLSID InprocServer32 points to it); old DLLs keep serving until their applications restart and
-; find the new EXE via HKLM\Software\InputTranslation\CurrentDir.
+; find the new EXE via HKLM\Software\YiIME\CurrentDir.
 ;
 ; Install: ① copy files; ② grant ALL APPLICATION PACKAGES read+execute (UWP/AppContainer apps need
 ; it to load the DLL); ③ regsvr32 (restore the old registration and fail on error); ④ add the IME to
 ; the original user's Chinese input list; ⑤ Start menu (settings, history, guide, uninstall); ⑥
 ; launch the tray as the original user. Uninstall reverses this: stop our processes, unregister,
-; remove from the input list, delete files. %APPDATA%\InputTranslation and
-; HKCU\Software\InputTranslation (settings, keys, history, learned picks) are kept.
+; remove from the input list, delete files. %APPDATA%\YiIME and HKCU\Software\YiIME (settings,
+; keys, history, learned data; migrated from the 0.1.x InputTranslation names by the EXE) are kept.
 ;
 ; Build with windows/build-installer.sh (after windows/build.sh), which passes /DAppVersion=…
 ; /DVersionDir=<DLL hash 12>-<EXE hash 12>.
@@ -25,8 +26,11 @@
 #endif
 #define AppName "YiIME 译"
 #define Repo "..\.."
-#define Exe "InputTranslation-Portable.exe"
-#define Dll "input_translation_tsf.dll"
+#define Exe "YiIME.exe"
+#define Dll "yiime_tsf.dll"
+; File names of 0.1.x, still present in old version directories.
+#define LegacyExe "InputTranslation-Portable.exe"
+#define LegacyDll "input_translation_tsf.dll"
 
 [Setup]
 AppId={{6E0C2B7A-3F1D-4E59-9A84-1C7B5D2E8F43}
@@ -36,7 +40,7 @@ AppVerName={#AppName} {#AppVersion}
 AppPublisher=YiIME
 VersionInfoVersion={#AppVersion}
 VersionInfoDescription={#AppName} 安装程序
-DefaultDirName={autopf}\InputTranslation
+DefaultDirName={autopf}\YiIME
 DisableDirPage=yes
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
@@ -81,7 +85,7 @@ Name: "{app}\{#VersionDir}"
 Source: "{#Repo}\dist\{#Dll}"; DestDir: "{app}\{#VersionDir}"; Flags: onlyifdoesntexist uninsrestartdelete
 Source: "{#Repo}\dist\{#Exe}"; DestDir: "{app}\{#VersionDir}"; Flags: onlyifdoesntexist
 ; Large lexicon (derived from rime-frost, GPL-3.0), read from the EXE directory at runtime.
-Source: "{#Repo}\data\frost\InputTranslation-words.txt"; DestDir: "{app}\{#VersionDir}"; Flags: ignoreversion
+Source: "{#Repo}\data\frost\YiIME-words.txt"; DestDir: "{app}\{#VersionDir}"; Flags: ignoreversion
 Source: "{#Repo}\windows\installer\Add-YiIMETip.ps1"; DestDir: "{app}\{#VersionDir}"; Flags: ignoreversion
 Source: "{#Repo}\windows\TSF-使用说明.txt"; DestDir: "{app}\{#VersionDir}"; Flags: ignoreversion
 Source: "{#Repo}\dist\BUILDINFO.txt"; DestDir: "{app}\{#VersionDir}"; Flags: ignoreversion
@@ -99,29 +103,29 @@ Source: "{#Repo}\data\opencc\LICENSE"; DestDir: "{app}\{#VersionDir}\data\opencc
 [Registry]
 ; Current version directory, for an old DLL (still loaded somewhere) that cannot find the EXE next
 ; to it.
-Root: HKLM; Subkey: "Software\InputTranslation"; ValueType: string; ValueName: "CurrentDir"; ValueData: "{app}\{#VersionDir}"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\YiIME"; ValueType: string; ValueName: "CurrentDir"; ValueData: "{app}\{#VersionDir}"; Flags: uninsdeletekey
 
 [Icons]
-Name: "{group}\YiIME 译 设置"; Filename: "{app}\{#VersionDir}\{#Exe}"; Parameters: "--settings"; WorkingDir: "{app}\{#VersionDir}"; Comment: "Translation API, mode and shortcut key settings"
-Name: "{group}\YiIME 译 输入记忆"; Filename: "{app}\{#VersionDir}\{#Exe}"; Parameters: "--history"; WorkingDir: "{app}\{#VersionDir}"; Comment: "View translated Chinese and translations"
-Name: "{group}\YiIME 译 使用说明"; Filename: "{app}\{#VersionDir}\TSF-Instructions for use.txt"
+Name: "{group}\YiIME 译 设置"; Filename: "{app}\{#VersionDir}\{#Exe}"; Parameters: "--settings"; WorkingDir: "{app}\{#VersionDir}"; Comment: "翻译 API、模式与快捷键设置"
+Name: "{group}\YiIME 译 输入记忆"; Filename: "{app}\{#VersionDir}\{#Exe}"; Parameters: "--history"; WorkingDir: "{app}\{#VersionDir}"; Comment: "查看翻译过的中文与译文"
+Name: "{group}\YiIME 译 使用说明"; Filename: "{app}\{#VersionDir}\TSF-使用说明.txt"
 Name: "{group}\卸载 YiIME 译"; Filename: "{uninstallexe}"
 
 [InstallDelete]
-; Shortcut left by the script install (Install-InputTranslation.ps1) in the runner's Start
+; Shortcut left by the script install (Install-YiIME.ps1) in the runner's Start
 ; Menu\Programs.
-Type: files; Name: "{userprograms}\YiIME settings.lnk"
-Type: files; Name: "{userprograms}\Chinese and English input settings.lnk"
+Type: files; Name: "{userprograms}\YiIME 设置.lnk"
+Type: files; Name: "{userprograms}\中英输入 设置.lnk"
 
 [Run]
 ; ② *S-1-15-2-1 = ALL APPLICATION PACKAGES (by SID, regardless of system language).
-Filename: "{sys}\icacls.exe"; Parameters: """{app}"" /grant *S-1-15-2-1:(OI)(CI)RX /T /C /Q"; Flags: runhidden waituntilterminated; StatusMsg: "Configure application container permissions..."
+Filename: "{sys}\icacls.exe"; Parameters: """{app}"" /grant *S-1-15-2-1:(OI)(CI)RX /T /C /Q"; Flags: runhidden waituntilterminated; StatusMsg: "正在设置应用容器访问权限…"
 ; ④ The input list is per user: add it for the user who started the installer, not the elevated
 ; admin account.
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\{#VersionDir}\Add-YiIMETip.ps1"" -Add"; Flags: runasoriginaluser runhidden waituntilterminated; StatusMsg: "Add the current user's input method list..."
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""{app}\{#VersionDir}\Add-YiIMETip.ps1"" -Add"; Flags: runasoriginaluser runhidden waituntilterminated; StatusMsg: "正在加入当前用户的输入法列表…"
 ; ⑥ The tray runs as the original user (and re-checks the input list with InstallLayoutOrTip on
 ; start).
-Filename: "{app}\{#VersionDir}\{#Exe}"; WorkingDir: "{app}\{#VersionDir}"; Description: "Start YiIME translation immediately (tray)"; Flags: runasoriginaluser nowait postinstall
+Filename: "{app}\{#VersionDir}\{#Exe}"; WorkingDir: "{app}\{#VersionDir}"; Description: "立即启动 YiIME 译（托盘）"; Flags: runasoriginaluser nowait postinstall
 
 [UninstallRun]
 ; Stop all EXEs (tray and input boxes) in this install directory, unregister, then remove the IME
@@ -159,7 +163,7 @@ var
   ResultCode: Integer;
   Script: String;
 begin
-  Script := 'Get-CimInstance Win32_Process -Filter \"Name=''{#Exe}''\" -ErrorAction SilentlyContinue | ' +
+  Script := 'Get-CimInstance Win32_Process -Filter \"Name=''{#Exe}'' OR Name=''{#LegacyExe}''\" -ErrorAction SilentlyContinue | ' +
     'Where-Object { $_.CommandLine -notmatch ''--tsf-hwnd'' -and $_.ExecutablePath -like ''' + ExpandConstant('{app}') + '\*'' } | ' +
     'ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }';
   Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
@@ -206,7 +210,9 @@ begin
           and (CompareText(Found.Name, '{#VersionDir}') <> 0) then
         begin
           Dir := Base + '\' + Found.Name;
-          if (not FileExists(Dir + '\{#Dll}')) or DeleteFile(Dir + '\{#Dll}') then
+          { 0.1.x 目录里的 DLL 叫 {#LegacyDll}：同样先删 DLL，删不掉说明仍被加载。 }
+          if ((not FileExists(Dir + '\{#Dll}')) or DeleteFile(Dir + '\{#Dll}'))
+            and ((not FileExists(Dir + '\{#LegacyDll}')) or DeleteFile(Dir + '\{#LegacyDll}')) then
           begin
             if DelTree(Dir, True, True, True) then
               Log('已删除旧版本目录 ' + Dir)

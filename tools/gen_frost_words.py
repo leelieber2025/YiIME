@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""生成运行时词库 data/frost/InputTranslation-words.txt（GPL-3.0，单独文件，不编进 EXE）。
+"""生成运行时词库 data/frost/YiIME-words.txt（GPL-3.0，单独文件，不编进 EXE）。
 
 来源：gaboolic/rime-frost（GPL-3.0）cn_dicts/base.dict.yaml、cn_dicts/ext.dict.yaml、
 cn_dicts_cell/idiom.dict.yaml 中的多字词，按词频取前 CAP 个。
@@ -92,7 +92,7 @@ def main():
     must_set = {text for text, _ in must}
     rest = [item for item in ordered if item[0] not in must_set][: max(cap - len(must), 0)]
     ranked = sorted(must + rest, key=lambda kv: (-kv[1][1], kv[0]))
-    out = ROOT / "data/frost/InputTranslation-words.txt"
+    out = ROOT / "data/frost/YiIME-words.txt"
     out.parent.mkdir(parents=True, exist_ok=True)
     with out.open("w", encoding="utf-8", newline="\n") as handle:
         handle.write("# 词<TAB>拼音<TAB>词频<TAB>五笔86词码。来源 gaboolic/rime-frost（GPL-3.0），见 data/README.md。\n")

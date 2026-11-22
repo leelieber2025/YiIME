@@ -6,14 +6,11 @@ use yiime_core::MixedInput;
 /// The large lexicon next to the EXE (installed) or in data\frost (portable).
 pub(super) fn frequency_words_path() -> Option<PathBuf> {
     let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    [
-        dir.join("InputTranslation-words.txt"),
-        dir.join("data")
-            .join("frost")
-            .join("InputTranslation-words.txt"),
-    ]
-    .into_iter()
-    .find(|path| path.is_file())
+    // YiIME-words.txt since 0.2; the old name is still accepted.
+    ["YiIME-words.txt", "InputTranslation-words.txt"]
+        .into_iter()
+        .flat_map(|name| [dir.join(name), dir.join("data").join("frost").join(name)])
+        .find(|path| path.is_file())
 }
 
 /// Builds the bundled dictionaries plus the large lexicon off the UI thread, publishes the

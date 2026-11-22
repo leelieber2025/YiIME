@@ -1,10 +1,10 @@
 [package]
-name = "input_translation"
+name = "yiime-app"
 version.workspace = true
 license = "GPL-3.0-only"
 edition = "2024"
 rust-version = "1.88"
-default-run = "input_translation"
+default-run = "yiime-app"
 
 [workspace.package]
 version = "0.1.5"

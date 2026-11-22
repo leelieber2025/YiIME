@@ -10,7 +10,7 @@ use yiime_core::*;
 
 const WORDS: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../data/frost/InputTranslation-words.txt"
+    "/../../data/frost/YiIME-words.txt"
 );
 
 fn input() -> &'static MixedInput {

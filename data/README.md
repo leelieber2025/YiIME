@@ -10,7 +10,7 @@
   - [`KyleBing/rime-wubi86-jidian`](https://github.com/KyleBing/rime-wubi86-jidian) `wubi86_jidian.dict.yaml` 中 rime 五笔词库没有的条目，快照 `4d08110b8080f6577dad733ada7e5ae5c5e878fd`，MIT，许可见 `wubi_extra/LICENSE-rime-wubi86-jidian`。
   补充词条词频低于 rime 五笔词库原有条目，同一编码下原有字词排在前面。
 
-- `frost/InputTranslation-words.txt`：大词库（30 万条多字词，含 32876 条四字成语），由 [`tools/gen_frost_words.py`](../tools/gen_frost_words.py) 从 [`gaboolic/rime-frost`](https://github.com/gaboolic/rime-frost)（白霜拼音）快照 `0ba3f340b9a638cef41bfb377b2d376f73e3711d` 的 `cn_dicts/base.dict.yaml`、`cn_dicts/ext.dict.yaml`、`cn_dicts_cell/idiom.dict.yaml` 生成：取多字词的拼音与词频，四字成语全部保留，其余按词频取满 30 万条；五笔 86 词码优先直接采用白霜自带五笔词库 `cn_dicts_wb/words.dict.yaml`（同一快照，GPL-3.0）的现成编码（102621 条），其余 197379 条按上面同样的标准取码规则计算。
+- `frost/YiIME-words.txt`：大词库（30 万条多字词，含 32876 条四字成语），由 [`tools/gen_frost_words.py`](../tools/gen_frost_words.py) 从 [`gaboolic/rime-frost`](https://github.com/gaboolic/rime-frost)（白霜拼音）快照 `0ba3f340b9a638cef41bfb377b2d376f73e3711d` 的 `cn_dicts/base.dict.yaml`、`cn_dicts/ext.dict.yaml`、`cn_dicts_cell/idiom.dict.yaml` 生成：取多字词的拼音与词频，四字成语全部保留，其余按词频取满 30 万条；五笔 86 词码优先直接采用白霜自带五笔词库 `cn_dicts_wb/words.dict.yaml`（同一快照，GPL-3.0）的现成编码（102621 条），其余 197379 条按上面同样的标准取码规则计算。
   **许可：GPL-3.0**（见 `frost/LICENSE`）。该文件作为独立数据文件随包发布，由程序在运行时读取，不编译进 EXE；修改或再分发该文件须遵守 GPL-3.0（附带许可证并提供本说明中的来源）。删除该文件程序仍可正常使用（只是少了大词库）。
 
 - `opencc/STCharacters.txt`、`opencc/STPhrases.txt`：简→繁转换表（繁体输出用，编进程序），来自 [`BYVoid/OpenCC`](https://github.com/BYVoid/OpenCC) 快照 `fae2a0a911c30764e669a7d8b0591cd8e852934a`，Apache-2.0，许可见 `opencc/LICENSE`。词组优先、单字兜底，多个繁体写法时取第一个。

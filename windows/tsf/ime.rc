@@ -25,9 +25,9 @@ BEGIN
       VALUE "CompanyName", "YiIME"
       VALUE "FileDescription", "YiIME TSF input method"
       VALUE "FileVersion", YIIME_VERSION
-      VALUE "InternalName", "input_translation_tsf.dll"
+      VALUE "InternalName", "yiime_tsf.dll"
       VALUE "LegalCopyright", "GPL-3.0"
-      VALUE "OriginalFilename", "input_translation_tsf.dll"
+      VALUE "OriginalFilename", "yiime_tsf.dll"
       VALUE "ProductName", "YiIME"
       VALUE "ProductVersion", YIIME_VERSION
     END

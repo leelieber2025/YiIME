@@ -36,7 +36,8 @@ use windows_sys::Win32::Security::Cryptography::{
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Registry::{
-    HKEY_CURRENT_USER, REG_DWORD, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ, RegGetValueW,
+    HKEY_CURRENT_USER, KEY_ALL_ACCESS, KEY_READ, REG_DWORD, REG_SZ, RRF_RT_REG_DWORD,
+    RRF_RT_REG_SZ, RegCloseKey, RegCopyTreeW, RegCreateKeyExW, RegGetValueW, RegOpenKeyExW,
     RegSetKeyValueW,
 };
 use windows_sys::Win32::System::Threading::{
@@ -122,7 +123,10 @@ const IDLE_EXIT_MS: u32 = 30 * 60 * 1000;
 /// Window class of the TSF DLL's message-only receiver windows.
 const TSF_RECEIVER_CLASS: &str = "InputTranslationTsfReceiver";
 /// Registry key shared with the TSF DLL.
-const STATE_KEY: &str = "Software\\InputTranslation";
+const STATE_KEY: &str = "Software\\YiIME";
+/// Settings key and %APPDATA% folder used by 0.1.x; migrated once (see [`migrate_settings`]).
+const LEGACY_STATE_KEY: &str = "Software\\InputTranslation";
+const LEGACY_SETTINGS_DIR: &str = "InputTranslation";
 /// A translation worker finished: drain `translation_rx`.
 const WM_TRANSLATED: u32 = WM_APP + 1;
 const WM_TSF_ACTIVATE: u32 = WM_APP + 2;
@@ -239,7 +243,7 @@ struct State {
     swallow_char: Cell<bool>,
     /// Mode last shown in the tray tooltip.
     last_plain: Cell<bool>,
-    /// Learned picks, saved DPAPI-encrypted in %APPDATA%\\InputTranslation\\learned.dat.
+    /// Learned picks, saved DPAPI-encrypted in %APPDATA%\\YiIME\\learned.dat.
     learned: RefCell<Learned>,
     quotes: Cell<Quotes>,
     /// The draft was recalled with the history shortcut: handle it in translation mode (plain
@@ -300,7 +304,7 @@ fn ensure_tip_in_language_list() {
         let _ = std::fs::write(&marker, b"1");
     }
 }
-/// Settings switches in HKCU\\Software\\InputTranslation (shared with the TSF DLL).
+/// Settings switches in HKCU\\Software\\YiIME (shared with the TSF DLL).
 struct Registry;
 impl OptionStore for Registry {
     fn get_u32(&self, name: &str) -> Option<u32> {
@@ -597,8 +601,73 @@ fn is_plain_toggle(vk: u16) -> bool {
     let down = |key: u16| unsafe { GetKeyState(key as i32) } < 0;
     vk == wanted && down(VK_CONTROL) == ctrl && down(VK_SHIFT) == shift && down(VK_MENU) == alt
 }
+/// %APPDATA%\\YiIME; the 0.1.x folder %APPDATA%\\InputTranslation while it could not be moved yet.
 fn settings_dir() -> Option<PathBuf> {
-    std::env::var_os("APPDATA").map(|path| PathBuf::from(path).join("InputTranslation"))
+    let appdata = PathBuf::from(std::env::var_os("APPDATA")?);
+    let dir = appdata.join("YiIME");
+    let legacy = appdata.join(LEGACY_SETTINGS_DIR);
+    Some(if !dir.exists() && legacy.is_dir() {
+        legacy
+    } else {
+        dir
+    })
+}
+/// Moves 0.1.x settings to the YiIME names once: %APPDATA%\\InputTranslation → %APPDATA%\\YiIME
+/// (API settings, encrypted keys, history, learned data, user words; DPAPI blobs are not tied to
+/// the path) and HKCU\\Software\\InputTranslation → HKCU\\Software\\YiIME (copied; the TSF DLL
+/// does the same on activation, and old DLLs still loaded somewhere keep the old key).
+fn migrate_settings() {
+    if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
+        let dir = appdata.join("YiIME");
+        let legacy = appdata.join(LEGACY_SETTINGS_DIR);
+        if !dir.exists() && legacy.is_dir() {
+            // Fails while another 0.1.x process holds a file open; settings_dir() then keeps using
+            // the old folder and the move is retried on the next start.
+            let _ = std::fs::rename(&legacy, &dir);
+        }
+    }
+    unsafe {
+        let mut existing = null_mut();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            wide(STATE_KEY).as_ptr(),
+            0,
+            KEY_READ,
+            &mut existing,
+        ) == 0
+        {
+            RegCloseKey(existing);
+            return;
+        }
+        let mut old = null_mut();
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            wide(LEGACY_STATE_KEY).as_ptr(),
+            0,
+            KEY_READ,
+            &mut old,
+        ) != 0
+        {
+            return;
+        }
+        let mut new = null_mut();
+        if RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            wide(STATE_KEY).as_ptr(),
+            0,
+            null(),
+            0,
+            KEY_ALL_ACCESS,
+            null(),
+            &mut new,
+            null_mut(),
+        ) == 0
+        {
+            RegCopyTreeW(old, null(), new);
+            RegCloseKey(new);
+        }
+        RegCloseKey(old);
+    }
 }
 /// Per-user DPAPI encryption for API keys and history.
 struct Dpapi;
@@ -1480,7 +1549,7 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
     let tsf_receiver = handle("--tsf-hwnd");
     let target = handle("--target-hwnd");
     let input = MixedInput::bundled();
-    // User words: %APPDATA%\\InputTranslation\\user_words.txt, `word code` per line, ranked
+    // User words: %APPDATA%\\YiIME\\user_words.txt, `word code` per line, ranked
     // first under that code.
     let user_words = user_words_path().and_then(|path| std::fs::read_to_string(path).ok());
     let input = match &user_words {
@@ -1617,6 +1686,8 @@ pub fn run() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|arg| arg == "--self-test") {
         SELF_TEST.store(true, Ordering::Relaxed);
+    } else {
+        migrate_settings();
     }
     let tsf_mode = args.iter().any(|arg| arg == "--tsf-hwnd");
     let wants_settings = args.iter().any(|arg| arg == "--settings");

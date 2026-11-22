@@ -1,11 +1,12 @@
 [package]
-name = "input_translation_tsf"
+name = "yiime-tsf"
 version.workspace = true
 license = "GPL-3.0-only"
 edition = "2024"
 rust-version = "1.88"
 
 [lib]
+name = "yiime_tsf"
 crate-type = ["cdylib"]
 
 [build-dependencies]

@@ -5,7 +5,9 @@ $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw '请以管理员身份运行 PowerShell，再执行此脚本。'
 }
-$base = Join-Path $env:ProgramFiles 'InputTranslation'
+$base = Join-Path $env:ProgramFiles 'YiIME'
+# Install directory, settings key and folder of 0.1.x (before the rename to YiIME); removed too.
+$legacyBase = Join-Path $env:ProgramFiles 'InputTranslation'
 $registryPath = 'Registry::HKEY_CLASSES_ROOT\CLSID\{A72091C2-7459-4C47-85F4-4626AE42A6C8}\InprocServer32'
 $dll = if (Test-Path $registryPath) { (Get-Item $registryPath).GetValue('') } else { $null }
 if ($dll -and (Test-Path $dll)) {
@@ -33,41 +35,52 @@ foreach ($name in @('YiIME 设置.lnk', '中英输入 设置.lnk')) {
     if (Test-Path $shortcut) { Remove-Item $shortcut -Force }
 }
 # Stop our own editor/tray processes (only EXEs in the install directory) so files can be deleted.
-Get-Process -Name 'InputTranslation-Portable' -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -and $_.Path.StartsWith($base, [StringComparison]::OrdinalIgnoreCase) } |
+Get-Process -Name 'YiIME', 'InputTranslation-Portable' -ErrorAction SilentlyContinue |
+    Where-Object { $_.Path -and ($_.Path.StartsWith($base, [StringComparison]::OrdinalIgnoreCase) -or
+                                 $_.Path.StartsWith($legacyBase, [StringComparison]::OrdinalIgnoreCase)) } |
     Stop-Process -Force -ErrorAction SilentlyContinue
-Remove-Item 'HKLM:\Software\InputTranslation' -Recurse -Force -ErrorAction SilentlyContinue
-if (Test-Path $base) {
+Remove-Item 'HKLM:\Software\YiIME', 'HKLM:\Software\InputTranslation' -Recurse -Force -ErrorAction SilentlyContinue
+$locked = @()
+$found = $false
+foreach ($root in @($base, $legacyBase)) {
+    if (-not (Test-Path $root)) { continue }
+    $found = $true
     # Delete version directories one at a time, DLL first. If the DLL is still loaded, keep the
     # whole directory rather than leave a DLL without its EXE.
-    $locked = @()
-    foreach ($dir in Get-ChildItem $base -Directory) {
+    $rootLocked = @()
+    foreach ($dir in Get-ChildItem $root -Directory) {
         try {
-            $dirDll = Join-Path $dir.FullName 'input_translation_tsf.dll'
-            if (Test-Path $dirDll) { Remove-Item $dirDll -Force -ErrorAction Stop }
+            foreach ($name in @('yiime_tsf.dll', 'input_translation_tsf.dll')) {
+                $dirDll = Join-Path $dir.FullName $name
+                if (Test-Path $dirDll) { Remove-Item $dirDll -Force -ErrorAction Stop }
+            }
             Remove-Item $dir.FullName -Recurse -Force -ErrorAction Stop
         } catch {
-            $locked += $dir.FullName
+            $rootLocked += $dir.FullName
         }
     }
-    if ($locked.Count -eq 0) {
-        Remove-Item $base -Force -Recurse -ErrorAction SilentlyContinue
-        Write-Host '已注销并删除输入法。'
-    } else {
-        Write-Warning '输入法已注销，但以下目录的 DLL 正被应用占用。请注销 Windows 后删除：'
-        $locked | ForEach-Object { Write-Warning $_ }
-    }
-} else {
-    Write-Host '输入法已注销；安装目录不存在。'
+    if ($rootLocked.Count -eq 0) { Remove-Item $root -Force -Recurse -ErrorAction SilentlyContinue }
+    $locked += $rootLocked
 }
-$settings = Join-Path $env:APPDATA 'InputTranslation'
-Remove-Item (Join-Path $settings 'ime-list-added') -Force -ErrorAction SilentlyContinue
+if (-not $found) {
+    Write-Host '输入法已注销；安装目录不存在。'
+} elseif ($locked.Count -eq 0) {
+    Write-Host '已注销并删除输入法。'
+} else {
+    Write-Warning '输入法已注销，但以下目录的 DLL 正被应用占用。请注销 Windows 后删除：'
+    $locked | ForEach-Object { Write-Warning $_ }
+}
+$settings = Join-Path $env:APPDATA 'YiIME'
+$legacySettings = Join-Path $env:APPDATA 'InputTranslation'
+Remove-Item (Join-Path $settings 'ime-list-added'), (Join-Path $legacySettings 'ime-list-added') -Force -ErrorAction SilentlyContinue
 if ($RemoveSettings) {
-    if (Test-Path $settings) { Remove-Item $settings -Force -Recurse }
-    # Mode, shortcuts, punctuation/Traditional and other switches live in
-    # HKCU\Software\InputTranslation.
-    Remove-Item 'HKCU:\Software\InputTranslation' -Recurse -Force -ErrorAction SilentlyContinue
+    foreach ($dir in @($settings, $legacySettings)) {
+        if (Test-Path $dir) { Remove-Item $dir -Force -Recurse }
+    }
+    # Mode, shortcuts, punctuation/Traditional and other switches live in HKCU\Software\YiIME
+    # (HKCU\Software\InputTranslation in 0.1.x).
+    Remove-Item 'HKCU:\Software\YiIME', 'HKCU:\Software\InputTranslation' -Recurse -Force -ErrorAction SilentlyContinue
     Write-Host '当前用户的 API 配置、加密密钥、输入记忆、词库学习记录和输入法开关已删除。'
-} elseif (Test-Path $settings) {
-    Write-Host "当前用户的 API 配置（含输入记忆）仍保留在 $settings；如需连同 HKCU\Software\InputTranslation 一并删除，请加 -RemoveSettings 参数。"
+} elseif ((Test-Path $settings) -or (Test-Path $legacySettings)) {
+    Write-Host "当前用户的 API 配置（含输入记忆）仍保留在 $settings；如需连同 HKCU\Software\YiIME 一并删除，请加 -RemoveSettings 参数。"
 }

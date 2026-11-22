@@ -32,7 +32,7 @@ jobs:
       - name: Check signatures
         if: env.WINDOWS_SIGN_PFX_BASE64 != ''
         run: |
-          for file in dist/InputTranslation-Portable.exe dist/input_translation_tsf.dll; do
+          for file in dist/YiIME.exe dist/yiime_tsf.dll; do
               osslsigncode extract-signature -in "$file" -out /dev/null || { echo "$file 未签名" >&2; exit 1; }
           done
       - uses: actions/upload-artifact@v4

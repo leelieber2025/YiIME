@@ -8,7 +8,7 @@ macOS 也会拒绝打开未公证的安装包。签名完全是**可选**的：�
 
 | 平台 | 文件 | 工具 |
 | --- | --- | --- |
-| Windows | `InputTranslation-Portable.exe`（输入框/托盘）、`input_translation_tsf.dll`（TSF 输入法 DLL，装进每个有文本框的进程） | `windows/sign.sh`（Linux，osslsigncode）或 `windows/sign.ps1`（Windows，signtool），由 `windows/build.sh` 在打包**之前**调用，所以 ZIP、BUILDINFO 里的哈希和安装目录名都对应签名后的文件 |
+| Windows | `YiIME.exe`（输入框/托盘）、`yiime_tsf.dll`（TSF 输入法 DLL，装进每个有文本框的进程） | `windows/sign.sh`（Linux，osslsigncode）或 `windows/sign.ps1`（Windows，signtool），由 `windows/build.sh` 在打包**之前**调用，所以 ZIP、BUILDINFO 里的哈希和安装目录名都对应签名后的文件 |
 | Windows | `YiIME-x.y.z-setup.exe` 及其中的卸载程序 | `windows/build-installer.sh`：设置 `ISCC_SIGNTOOL` 时由 Inno Setup 同时签安装程序和卸载程序；否则安装包生成后用上面的脚本签名 |
 | macOS | `YiIME.app`（Developer ID Application，hardened runtime + 时间戳）、`YiIME-x.y.z-macos.pkg`（Developer ID Installer），然后公证并装订 | `macos/build.sh`（`MACOS_SIGN_IDENTITY`、`MACOS_INSTALLER_IDENTITY`）+ `macos/notarize.sh` |
 
@@ -66,10 +66,10 @@ bash macos/build.sh && bash macos/notarize.sh
 
 ```powershell
 signtool verify /pa /v YiIME-x.y.z-setup.exe
-Get-AuthenticodeSignature .\InputTranslation-Portable.exe
+Get-AuthenticodeSignature .\YiIME.exe
 ```
 
 ```bash
-osslsigncode verify -in InputTranslation-Portable.exe
+osslsigncode verify -in YiIME.exe
 pkgutil --check-signature YiIME-x.y.z-macos.pkg && spctl --assess --type install -v YiIME-x.y.z-macos.pkg
 ```

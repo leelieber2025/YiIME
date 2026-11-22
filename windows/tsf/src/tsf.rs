@@ -91,7 +91,7 @@ const TOGGLE_CHORD: TF_PRESERVEDKEY = TF_PRESERVEDKEY {
     uModifiers: TF_MOD_CONTROL,
 };
 /// Preserved key for toggling plain Wubi mode (no translation); the chord comes from
-/// HKCU\\Software\\InputTranslation\\PlainToggleKey.
+/// HKCU\\Software\\YiIME\\PlainToggleKey.
 const PLAIN_KEY: GUID = GUID::from_u128(0x6b1f2d0e_93c4_4e1a_9f6d_2a7c51e0b8d3);
 /// Ctrl+.: Chinese/English punctuation; Ctrl+Shift+F: Simplified/Traditional output (as in
 /// Microsoft Wubi).
@@ -110,7 +110,14 @@ const TRAD_CHORD: TF_PRESERVEDKEY = TF_PRESERVEDKEY {
     uVKey: b'F' as u32,
     uModifiers: TF_MOD_CONTROL | TF_MOD_SHIFT,
 };
-const STATE_KEY: &str = "Software\\InputTranslation";
+/// Settings key shared with the EXE (HKCU) and the installer's state key (HKLM, CurrentDir).
+const STATE_KEY: &str = "Software\\YiIME";
+/// Key used by 0.1.x: settings are copied from it once (see [`migrate_settings_key`]); old DLLs
+/// still loaded somewhere keep reading it.
+const LEGACY_STATE_KEY: &str = "Software\\InputTranslation";
+/// The input-box/tray EXE, and its name in 0.1.x.
+const EDITOR_EXE: &str = "YiIME.exe";
+const LEGACY_EDITOR_EXE: &str = "InputTranslation-Portable.exe";
 const LANG_ZH_CN: u16 = 0x0804;
 const DESCRIPTION: &str = "YiIME 译（五笔）";
 const WINDOW_CLASS: &str = "InputTranslationTsfReceiver";
@@ -144,8 +151,30 @@ fn running_in_editor() -> bool {
             && len < buffer.len()
             && std::path::Path::new(&String::from_utf16_lossy(&buffer[..len]))
                 .file_name()
-                .is_some_and(|name| name.eq_ignore_ascii_case("InputTranslation-Portable.exe"))
+                .is_some_and(|name| {
+                    name.eq_ignore_ascii_case(EDITOR_EXE)
+                        || name.eq_ignore_ascii_case(LEGACY_EDITOR_EXE)
+                })
     })
+}
+
+/// Copies the switches from `HKCU\Software\InputTranslation` (0.1.x) to
+/// `HKCU\Software\YiIME` the first time; the EXE does the same, whichever runs first.
+fn migrate_settings_key() {
+    if CURRENT_USER.open(STATE_KEY).is_ok() {
+        return;
+    }
+    let Ok(old) = CURRENT_USER.open(LEGACY_STATE_KEY) else {
+        return;
+    };
+    let Ok(new) = CURRENT_USER.create(STATE_KEY) else {
+        return;
+    };
+    if let Ok(values) = old.values() {
+        for (name, value) in values {
+            let _ = new.set_value(&name, &value);
+        }
+    }
 }
 
 fn com_scope(f: impl FnOnce() -> Result<()>) -> Result<()> {
@@ -309,9 +338,7 @@ impl ITfEditSession_Impl for ScopeCheck_Impl {
                 // would never activate here.
                 drop(ManuallyDrop::into_inner(selection.range));
                 unsafe {
-                    OutputDebugStringW(
-                        wide("InputTranslation: 读取选区失败，按非密码输入框处理").as_ptr(),
-                    );
+                    OutputDebugStringW(wide("YiIME: 读取选区失败，按非密码输入框处理").as_ptr());
                 }
                 self.result.set(Some(false));
                 return Ok(());
@@ -479,17 +506,15 @@ fn set_conversion_mode(manager: &ITfThreadMgr, client_id: u32, mode: i32) {
 /// installer.
 fn companion_exe() -> Option<std::path::PathBuf> {
     let path = module_path().ok()?;
-    let editor = std::path::Path::new(&path)
-        .parent()?
-        .join("InputTranslation-Portable.exe");
+    let editor = std::path::Path::new(&path).parent()?.join(EDITOR_EXE);
     if editor.is_file() {
         return Some(editor);
     }
     LOCAL_MACHINE
-        .open("Software\\InputTranslation")
+        .open(STATE_KEY)
         .and_then(|key| key.get_string("CurrentDir"))
         .ok()
-        .map(|dir| std::path::PathBuf::from(dir).join("InputTranslation-Portable.exe"))
+        .map(|dir| std::path::PathBuf::from(dir).join(EDITOR_EXE))
         .filter(|path| path.is_file())
 }
 /// Process id owning `window` (0 if none).
@@ -1229,9 +1254,12 @@ impl TextService_Impl {
             let len = unsafe { GetModuleFileNameW(None, &mut path) } as usize;
             let host = String::from_utf16_lossy(&path[..len.min(path.len())]);
             unsafe {
-                OutputDebugStringW(wide(&format!(
-                    "InputTranslation: InputScope 查询失败；此输入框中输入法暂不可用。宿主：{host}"
-                )).as_ptr());
+                OutputDebugStringW(
+                    wide(&format!(
+                        "YiIME: InputScope 查询失败；此输入框中输入法暂不可用。宿主：{host}"
+                    ))
+                    .as_ptr(),
+                );
             }
         }
         let mut attached = self.edit_sink.borrow_mut();
@@ -1259,6 +1287,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             // Do the fallible cast before creating the receiver window that holds the self pointer, so
             // a failure leaves no dangling pointer.
             let keystroke: ITfKeystrokeMgr = manager.cast()?;
+            migrate_settings_key();
             let receiver = unsafe { receiver::create_receiver(self as *const _ as *mut c_void) };
             if receiver.is_null() {
                 return E_FAIL.ok();
@@ -1289,7 +1318,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             } {
                 unsafe {
                     OutputDebugStringW(
-                        wide(&format!("InputTranslation: Ctrl+Space 注册失败：{error}")).as_ptr(),
+                        wide(&format!("YiIME: Ctrl+Space 注册失败：{error}")).as_ptr(),
                     );
                 }
             }

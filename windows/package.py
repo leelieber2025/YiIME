@@ -29,7 +29,7 @@ data_files = [root / "data/README.md",
               root / "data/wubi_extra/wubi86_extra.dict.yaml",
               root / "data/wubi_extra/LICENSE-rime-wubi86-jidian",
               root / "data/wubi_extra/LICENSE-chinese-xinhua",
-              root / "data/frost/InputTranslation-words.txt", root / "data/frost/LICENSE",
+              root / "data/frost/YiIME-words.txt", root / "data/frost/LICENSE",
               root / "data/opencc/LICENSE", root / "data/opencc/STCharacters.txt",
               root / "data/opencc/STPhrases.txt"]
 source_paths += data_files
@@ -46,10 +46,10 @@ dist = root / "dist"
 if dist.exists():
     rmtree(dist)
 dist.mkdir(exist_ok=True)
-exe = dist / "InputTranslation-Portable.exe"
-dll = dist / "input_translation_tsf.dll"
+exe = dist / "YiIME.exe"
+dll = dist / "yiime_tsf.dll"
 exe.write_bytes((root / "target/x86_64-pc-windows-gnu/release/windows_gui.exe").read_bytes())
-dll.write_bytes((root / "target/x86_64-pc-windows-gnu/release/input_translation_tsf.dll").read_bytes())
+dll.write_bytes((root / "target/x86_64-pc-windows-gnu/release/yiime_tsf.dll").read_bytes())
 info = (
     f"Source SHA-256: {source_hash.hexdigest()}\n"
     f"EXE SHA-256: {sha256(exe.read_bytes()).hexdigest()}\n"
@@ -66,11 +66,12 @@ info = (
     f"RUSTFLAGS template: {remapped_flags}\n"
 )
 (dist / "BUILDINFO.txt").write_text(info, encoding="utf-8")
+version = subprocess.check_output(["bash", str(root / "tools/version.sh")], text=True).strip()
 licenses = [data_files[index] for index in (0, 2, 3, 5, 6, 8, 9, 10, 11, 12)]
 for name, files in {
-    "InputTranslation-Portable.zip": [exe, root / "windows/使用说明.txt", dist / "BUILDINFO.txt", *licenses],
-    "InputTranslation-TSF-test.zip": [exe, dll, root / "windows/Install-InputTranslation.ps1",
-                                      root / "windows/Uninstall-InputTranslation.ps1",
+    f"YiIME-{version}-portable.zip": [exe, root / "windows/使用说明.txt", dist / "BUILDINFO.txt", *licenses],
+    f"YiIME-{version}-tsf-test.zip": [exe, dll, root / "windows/Install-YiIME.ps1",
+                                      root / "windows/Uninstall-YiIME.ps1",
                                       root / "windows/TSF-使用说明.txt", dist / "BUILDINFO.txt", *licenses],
 }.items():
     with ZipFile(dist / name, "w", ZIP_DEFLATED) as archive:

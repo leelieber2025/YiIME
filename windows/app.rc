@@ -17,9 +17,9 @@ BEGIN
       VALUE "CompanyName", "YiIME"
       VALUE "FileDescription", "YiIME input box and settings"
       VALUE "FileVersion", YIIME_VERSION
-      VALUE "InternalName", "InputTranslation-Portable.exe"
+      VALUE "InternalName", "YiIME.exe"
       VALUE "LegalCopyright", "GPL-3.0"
-      VALUE "OriginalFilename", "InputTranslation-Portable.exe"
+      VALUE "OriginalFilename", "YiIME.exe"
       VALUE "ProductName", "YiIME"
       VALUE "ProductVersion", YIIME_VERSION
     END

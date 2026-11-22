@@ -14,10 +14,10 @@ export RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=$registry_root=/c
 # Two separate builds: features are unified within one cargo call, so the TSF DLL would pull in all
 # default yiime-core features (dictionaries, OpenCC tables, translation client), and windows-gnu
 # does not strip unused code per function, making the DLL several times larger.
-cargo build --release --target x86_64-pc-windows-gnu -p input_translation
-cargo build --release --target x86_64-pc-windows-gnu -p input_translation_tsf
+cargo build --release --target x86_64-pc-windows-gnu -p yiime-app
+cargo build --release --target x86_64-pc-windows-gnu -p yiime-tsf
 # Opt-in Authenticode signing before packaging (hashes, version directory and ZIPs then cover the
 # signed files); a no-op without WINDOWS_SIGN_PFX / WINDOWS_SIGN_PFX_BASE64.
 bash windows/sign.sh target/x86_64-pc-windows-gnu/release/windows_gui.exe \
-    target/x86_64-pc-windows-gnu/release/input_translation_tsf.dll
+    target/x86_64-pc-windows-gnu/release/yiime_tsf.dll
 python3 windows/package.py

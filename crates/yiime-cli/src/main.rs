@@ -10,12 +10,14 @@ use yiime_core::{
 const USAGE: &str = "用法：yiime translate <中文>…（免费 Google 翻译，打印每次请求的计时）
       yiime query <编码>… [--page-size N] [--pages N] [--traditional] [--fuzzy] [--pinyin-first] [--all-chars] [--shuangpin xiaohe|microsoft|ziranma] [--words 文件 | --no-words] [--tsv]
       yiime import <词库文件> [--into user_words.txt]（导入搜狗/QQ 导出的 txt 或搜狗 .scel；不加 --into 时打印到标准输出）
-  大词库默认查找顺序：--words、环境变量 YIIME_WORDS、程序旁的 InputTranslation-words.txt、
-  上级目录中的 data/frost/InputTranslation-words.txt 或 share/yiime/InputTranslation-words.txt。
+  大词库默认查找顺序：--words、环境变量 YIIME_WORDS、程序旁的 YiIME-words.txt、
+  上级目录中的 data/frost/YiIME-words.txt 或 share/yiime/YiIME-words.txt（旧名 InputTranslation-words.txt 也认）。
   --words 的路径不能以 - 开头（写成 ./-文件名）。
   默认与输入法一样只显示常用字（不出扩展区生僻字、低频简拼词）；--all-chars 显示全部。";
 
-const WORDS_FILE: &str = "InputTranslation-words.txt";
+const WORDS_FILE: &str = "YiIME-words.txt";
+/// Name before 0.2 (still found next to older installs).
+const LEGACY_WORDS_FILE: &str = "InputTranslation-words.txt";
 
 fn find_words() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("YIIME_WORDS") {
@@ -23,13 +25,17 @@ fn find_words() -> Option<PathBuf> {
     }
     let exe = std::env::current_exe().ok()?;
     exe.ancestors().skip(1).find_map(|dir| {
-        [
-            dir.join(WORDS_FILE),
-            dir.join("data").join("frost").join(WORDS_FILE),
-            dir.join("share").join("yiime").join(WORDS_FILE),
-        ]
-        .into_iter()
-        .find(|path| path.is_file())
+        [WORDS_FILE, LEGACY_WORDS_FILE]
+            .into_iter()
+            .find_map(|name| {
+                [
+                    dir.join(name),
+                    dir.join("data").join("frost").join(name),
+                    dir.join("share").join("yiime").join(name),
+                ]
+                .into_iter()
+                .find(|path| path.is_file())
+            })
     })
 }
 

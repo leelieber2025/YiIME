@@ -146,7 +146,7 @@ impl InputModeButton_Impl {
         refresh_sink(&self.sink);
     }
 }
-/// Settings switches in HKCU\\Software\\InputTranslation, shared with the input-box EXE (names and
+/// Settings switches in HKCU\\Software\\YiIME, shared with the input-box EXE (names and
 /// defaults defined in yiime-core).
 struct Registry;
 impl OptionStore for Registry {

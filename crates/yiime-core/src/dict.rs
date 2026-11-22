@@ -906,7 +906,7 @@ mod tests {
     fn precompiled_frost_index_matches_runtime_build() {
         let raw = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../data/frost/InputTranslation-words.txt"
+            "/../../data/frost/YiIME-words.txt"
         ))
         .unwrap();
         let precompiled = crate::table::decode_frost(FROST_INDEX, raw.as_bytes()).unwrap();

@@ -226,28 +226,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "input_translation"
-version = "0.1.5"
-dependencies = [
- "embed-resource",
- "serde_json",
- "windows-sys 0.61.2",
- "yiime-core",
-]
-
-[[package]]
-name = "input_translation_tsf"
-version = "0.1.5"
-dependencies = [
- "embed-resource",
- "windows",
- "windows-core",
- "windows-registry",
- "windows-sys 0.61.2",
- "yiime-core",
-]
-
-[[package]]
 name = "itoa"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -880,6 +858,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
+name = "yiime-app"
+version = "0.1.5"
+dependencies = [
+ "embed-resource",
+ "serde_json",
+ "windows-sys 0.61.2",
+ "yiime-core",
+]
+
+[[package]]
 name = "yiime-cli"
 version = "0.1.5"
 dependencies = [
@@ -900,6 +888,18 @@ name = "yiime-ffi"
 version = "0.1.5"
 dependencies = [
  "serde_json",
+ "yiime-core",
+]
+
+[[package]]
+name = "yiime-tsf"
+version = "0.1.5"
+dependencies = [
+ "embed-resource",
+ "windows",
+ "windows-core",
+ "windows-registry",
+ "windows-sys 0.61.2",
  "yiime-core",
 ]
 

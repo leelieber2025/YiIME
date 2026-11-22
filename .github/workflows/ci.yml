@@ -27,7 +27,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.88.0
-      - run: cargo +1.88.0 build -p input_translation -p input_translation_tsf --locked
+      - run: cargo +1.88.0 build -p yiime-app -p yiime-tsf --locked
   fmt:
     runs-on: ubuntu-latest
     steps:
@@ -66,7 +66,7 @@ jobs:
       - name: VERSIONINFO matches Cargo.toml
         run: |
           version="$(tools/version.sh)"
-          for file in dist/InputTranslation-Portable.exe dist/input_translation_tsf.dll; do
+          for file in dist/YiIME.exe dist/yiime_tsf.dll; do
               strings -el "$file" | grep -qx "$version" || { echo "$file 缺少版本 $version" >&2; exit 1; }
           done
       - uses: actions/upload-artifact@v4
@@ -87,8 +87,8 @@ jobs:
       # The release package is cross-built with MinGW in release-gnu; here build natively to test registration.
       - name: Build (native MSVC)
         run: |
-          cargo build --release -p input_translation
-          cargo build --release -p input_translation_tsf
+          cargo build --release -p yiime-app
+          cargo build --release -p yiime-tsf
       # Headless smoke test of the real input box: scripted keys go through the Win32 key handler
       # (yiime_core::classify_char + the edit control) and the draft is checked. No tray icon, no
       # registry writes; the process exits non-zero (and prints to stderr) on a mismatch.
@@ -102,7 +102,7 @@ jobs:
       - name: Register and unregister TSF
         shell: pwsh
         run: |
-          $dll = (Resolve-Path 'target\release\input_translation_tsf.dll').Path
+          $dll = (Resolve-Path 'target\release\yiime_tsf.dll').Path
           $regsvr32 = Join-Path $env:WINDIR 'System32\regsvr32.exe'
           $result = Start-Process $regsvr32 -ArgumentList @('/s', "`"$dll`"") -Wait -PassThru
           if ($result.ExitCode -ne 0) { throw "register failed: $($result.ExitCode)" }

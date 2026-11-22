@@ -5,7 +5,7 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw '请以管理员身份运行 PowerShell，再执行此脚本。'
 }
 $source = Split-Path -Parent $MyInvocation.MyCommand.Path
-$base = Join-Path $env:ProgramFiles 'InputTranslation'
+$base = Join-Path $env:ProgramFiles 'YiIME'
 $regsvr32 = Join-Path $env:WINDIR 'System32\regsvr32.exe'
 function Invoke-Regsvr32([string[]]$RegArgs) {
     $proc = Start-Process -FilePath $regsvr32 -ArgumentList $RegArgs -Wait -PassThru -WindowStyle Hidden
@@ -14,8 +14,8 @@ function Invoke-Regsvr32([string[]]$RegArgs) {
 $clsid = '{A72091C2-7459-4C47-85F4-4626AE42A6C8}'
 $registryPath = "Registry::HKEY_CLASSES_ROOT\CLSID\$clsid\InprocServer32"
 $oldDll = if (Test-Path $registryPath) { (Get-Item $registryPath).GetValue('') } else { $null }
-$sourceDll = Join-Path $source 'input_translation_tsf.dll'
-$sourceExe = Join-Path $source 'InputTranslation-Portable.exe'
+$sourceDll = Join-Path $source 'yiime_tsf.dll'
+$sourceExe = Join-Path $source 'YiIME.exe'
 if (-not (Test-Path $sourceDll) -or -not (Test-Path $sourceExe)) {
     throw '安装包缺少 DLL 或 EXE。'
 }
@@ -23,14 +23,14 @@ $version = (Get-FileHash $sourceDll -Algorithm SHA256).Hash.Substring(0, 12) + '
     (Get-FileHash $sourceExe -Algorithm SHA256).Hash.Substring(0, 12)
 $destination = Join-Path $base $version
 New-Item -ItemType Directory -Force -Path $destination | Out-Null
-$dll = Join-Path $destination 'input_translation_tsf.dll'
-$exe = Join-Path $destination 'InputTranslation-Portable.exe'
+$dll = Join-Path $destination 'yiime_tsf.dll'
+$exe = Join-Path $destination 'YiIME.exe'
 if (-not (Test-Path $dll)) { Copy-Item $sourceDll $dll }
 if (-not (Test-Path $exe)) { Copy-Item $sourceExe $exe }
 # The large lexicon (derived from rime-frost, GPL-3.0) is a separate file read by the EXE at
 # runtime; every install overwrites it.
-$sourceWords = Join-Path $source 'data\frost\InputTranslation-words.txt'
-if (Test-Path $sourceWords) { Copy-Item $sourceWords (Join-Path $destination 'InputTranslation-words.txt') -Force -ErrorAction SilentlyContinue }
+$sourceWords = Join-Path $source 'data\frost\YiIME-words.txt'
+if (Test-Path $sourceWords) { Copy-Item $sourceWords (Join-Path $destination 'YiIME-words.txt') -Force -ErrorAction SilentlyContinue }
 # Stage both files before touching the current registration. Loaded DLLs remain in their old version directory.
 if ($oldDll -and (Test-Path $oldDll) -and $oldDll -ne $dll) {
     $unregCode = Invoke-Regsvr32 @('/u', '/s', "`"$oldDll`"")
@@ -43,7 +43,7 @@ if ($registrationError -ne 0) {
 }
 # Record the current version directory, for an older DLL (still loaded by a running application)
 # that cannot find the EXE next to it.
-$stateKey = 'HKLM:\Software\InputTranslation'
+$stateKey = 'HKLM:\Software\YiIME'
 New-Item -Path $stateKey -Force | Out-Null
 Set-ItemProperty -Path $stateKey -Name 'CurrentDir' -Value $destination
 # Add the IME to the current user's Chinese input list; the taskbar switcher hides IMEs not in the
@@ -79,9 +79,11 @@ Write-Host '已创建开始菜单快捷方式「YiIME 设置」。'
 # Start the new tray as the current (non-admin) user: the input list written by the elevated process
 # sometimes misses the user session, so the tray re-checks it with InstallLayoutOrTip on start
 # (clearing the marker forces that).
-Remove-Item (Join-Path $env:APPDATA "InputTranslation\ime-list-added") -Force -ErrorAction SilentlyContinue
-Get-CimInstance Win32_Process -Filter "Name='InputTranslation-Portable.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -notmatch '--tsf-hwnd' -and $_.ExecutablePath -like "$base*" } |
+Remove-Item (Join-Path $env:APPDATA "YiIME\ime-list-added"), (Join-Path $env:APPDATA "InputTranslation\ime-list-added") -Force -ErrorAction SilentlyContinue
+# Trays of this version and of 0.1.x (InputTranslation-Portable.exe under Program Files\InputTranslation).
+$legacyBase = Join-Path $env:ProgramFiles 'InputTranslation'
+Get-CimInstance Win32_Process -Filter "Name='YiIME.exe' OR Name='InputTranslation-Portable.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -notmatch '--tsf-hwnd' -and ($_.ExecutablePath -like "$base*" -or $_.ExecutablePath -like "$legacyBase*") } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 try {
     Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList "`"$exe`""

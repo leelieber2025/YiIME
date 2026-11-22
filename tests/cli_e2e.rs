@@ -51,7 +51,7 @@ fn wubi_then_pinyin_then_translate_and_commit() {
         )
         .unwrap();
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_input_translation"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yiime-app"))
         .env("TRANSLATION_API_URL", format!(" http://{address} "))
         .env("TRANSLATION_MODEL", " test ")
         .env("TRANSLATION_API_KEY", " test ")
@@ -81,7 +81,7 @@ fn wubi_then_pinyin_then_translate_and_commit() {
 
 #[test]
 fn non_utf8_line_does_not_stop_the_cli() {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_input_translation"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yiime-app"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

@@ -8,7 +8,7 @@ arch="${1:-$(uname -m)}"
 name="yiime-$version-linux-$arch"
 stage="dist/$name"
 rm -rf "$stage" && mkdir -p "$stage/data"
-cp target/release/yiime data/frost/InputTranslation-words.txt LICENSE README.md "$stage/"
+cp target/release/yiime data/frost/YiIME-words.txt LICENSE README.md "$stage/"
 cp data/README.md "$stage/data/"
 for dir in wubi pinyin wubi_extra opencc frost; do
     mkdir -p "$stage/data/$dir"

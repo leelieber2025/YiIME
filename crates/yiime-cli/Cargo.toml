@@ -25,7 +25,7 @@ priority = "optional"
 extended-description = "YiIME command line: wubi/pinyin candidate lookup (yiime query) and Chinese-to-English translation test (yiime translate)."
 assets = [
     ["target/release/yiime", "usr/bin/", "755"],
-    ["../../data/frost/InputTranslation-words.txt", "usr/share/yiime/", "644"],
+    ["../../data/frost/YiIME-words.txt", "usr/share/yiime/", "644"],
     ["../../README.md", "usr/share/doc/yiime/README.md", "644"],
     ["../../data/README.md", "usr/share/doc/yiime/data/README.md", "644"],
     ["../../data/frost/LICENSE", "usr/share/doc/yiime/data/frost/LICENSE", "644"],

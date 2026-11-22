@@ -24,7 +24,7 @@ fn main() {
     }
     // The large lexicon is shipped as a separate file and still read at run time, but its sort
     // orders are precompiled here; they are used only if the file read at run time is identical.
-    let frost_path = root.join("frost/InputTranslation-words.txt");
+    let frost_path = root.join("frost/YiIME-words.txt");
     println!("cargo:rerun-if-changed={}", frost_path.display());
     let frost = match std::fs::read(&frost_path) {
         Ok(raw) => {
