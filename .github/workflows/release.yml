@@ -1,8 +1,9 @@
 name: Release build
 # Builds the release files for a version tag (or on demand) and uploads them as workflow
-# artifacts; publishing the GitHub release stays a manual step (see CHANGELOG.md, "Release
-# process"). Code signing is opt-in: every signing step is skipped cleanly when its secrets are not
-# configured, so forks and unsigned builds keep working. See SIGNING.md.
+# artifacts; publishing the GitHub release stays a manual step (see RELEASING.md: a release
+# candidate vX.Y.Z-rc.N first, then the stable vX.Y.Z). Code signing is opt-in: every signing
+# step is skipped cleanly when its secrets are not configured, so forks and unsigned builds keep
+# working. See SIGNING.md.
 on:
   push:
     tags: ['v*']

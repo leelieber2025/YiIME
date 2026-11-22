@@ -29,7 +29,7 @@ jobs:
           version="$(tools/version.sh)"
           app="dist/macos/root/YiIME.app"
           test -f "dist/YiIME-$version-macos-beta.pkg"
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "$version"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")" = "${version%%-*}"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")" = 'com.yiime.inputmethod.YiIME'
           test "$(/usr/libexec/PlistBuddy -c 'Print :InputMethodServerControllerClass' "$app/Contents/Info.plist")" = 'YiIMEInputController'
           test "$(/usr/libexec/PlistBuddy -c 'Print :ComponentInputModeDict:tsInputModeListKey:com.yiime.inputmethod.YiIME.Hans:TISInputSourceID' "$app/Contents/Info.plist")" = 'com.yiime.inputmethod.YiIME.Hans'

@@ -65,7 +65,8 @@ jobs:
           PY
       - name: VERSIONINFO matches Cargo.toml
         run: |
-          version="$(tools/version.sh)"
+          # VERSIONINFO is numeric: a release candidate (0.2.0-rc.1) carries 0.2.0.
+          version="$(tools/version.sh)"; version="${version%%-*}"
           for file in dist/YiIME.exe dist/yiime_tsf.dll; do
               strings -el "$file" | grep -qx "$version" || { echo "$file 缺少版本 $version" >&2; exit 1; }
           done

@@ -10,6 +10,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 version="$(tools/version.sh)"
+# Bundle versions must be numeric: a release candidate (0.2.0-rc.1) uses 0.2.0 inside the
+# bundle and keeps the full version in the file name.
+bundle_version="${version%%-*}"
 out=dist/macos
 rm -rf "$out" && mkdir -p "$out"
 export MACOSX_DEPLOYMENT_TARGET=11.0
@@ -27,7 +30,7 @@ done
 app="$out/root/YiIME.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 lipo -create "$out/YiIME-arm64" "$out/YiIME-x86_64" -output "$app/Contents/MacOS/YiIME"
-sed "s/@VERSION@/$version/g" macos/YiIME/Info.plist > "$app/Contents/Info.plist"
+sed "s/@VERSION@/$bundle_version/g" macos/YiIME/Info.plist > "$app/Contents/Info.plist"
 cp macos/YiIME/icon.tiff "$app/Contents/Resources/"
 for lang in en zh-Hans; do
     mkdir -p "$app/Contents/Resources/$lang.lproj"
@@ -49,7 +52,7 @@ else
 fi
 codesign --verify --strict --verbose "$app"
 lipo -info "$app/Contents/MacOS/YiIME"
-pkgbuild --root "$out/root" --identifier com.yiime.inputmethod.YiIME.pkg --version "$version" \
+pkgbuild --root "$out/root" --identifier com.yiime.inputmethod.YiIME.pkg --version "$bundle_version" \
     --install-location "/Library/Input Methods" --scripts macos/pkg-scripts "$out/YiIME-component.pkg"
 if [ -n "${MACOS_INSTALLER_IDENTITY:-}" ]; then
     productbuild --sign "$MACOS_INSTALLER_IDENTITY" --timestamp \
