@@ -27,7 +27,7 @@ sign_args=()
 if [ -n "${ISCC_SIGNTOOL:-}" ]; then
     sign_args=("/DSignTool=yiime" "/Syiime=$ISCC_SIGNTOOL")
 fi
-"${run[@]}" /Q "/DAppVersion=$version" "/DVersionDir=$version_dir" "${sign_args[@]}" "$script"
+"${run[@]}" /Q "/DAppVersion=$version" "/DVersionNumber=${version%%-*}" "/DVersionDir=$version_dir" "${sign_args[@]}" "$script"
 # Otherwise sign the finished installer (opt-in; no-op without a certificate, see SIGNING.md).
 if [ -z "${ISCC_SIGNTOOL:-}" ]; then
     if [ "${OS:-}" = "Windows_NT" ]; then

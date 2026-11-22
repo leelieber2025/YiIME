@@ -21,6 +21,10 @@
 #ifndef AppVersion
   #error 请用 windows/build-installer.sh 构建（需要 /DAppVersion=...）
 #endif
+; VERSIONINFO must be numeric: a release candidate (0.2.0-rc.1) carries 0.2.0.
+#ifndef VersionNumber
+  #define VersionNumber AppVersion
+#endif
 #ifndef VersionDir
   #error 请用 windows/build-installer.sh 构建（需要 /DVersionDir=...）
 #endif
@@ -38,7 +42,7 @@ AppName={#AppName}
 AppVersion={#AppVersion}
 AppVerName={#AppName} {#AppVersion}
 AppPublisher=YiIME
-VersionInfoVersion={#AppVersion}
+VersionInfoVersion={#VersionNumber}
 VersionInfoDescription={#AppName} 安装程序
 DefaultDirName={autopf}\YiIME
 DisableDirPage=yes
