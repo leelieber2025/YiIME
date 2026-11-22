@@ -15,3 +15,8 @@
 
 - `opencc/STCharacters.txt`、`opencc/STPhrases.txt`：简→繁转换表（繁体输出用，编进程序），来自 [`BYVoid/OpenCC`](https://github.com/BYVoid/OpenCC) 快照 `fae2a0a911c30764e669a7d8b0591cd8e852934a`，Apache-2.0，许可见 `opencc/LICENSE`。词组优先、单字兜底，多个繁体写法时取第一个。
 
+
+## gb2312
+
+`gb2312/hanzi.txt`：GB/T 2312-1980 的 6763 个汉字（按码点排序），由 Python 标准库的 `gb2312` 编码表生成，
+用于“只显示常用字”时把 GB 2312 之外的单字（多为繁体、异体字）排到后面。字符集标准本身不涉及版权。

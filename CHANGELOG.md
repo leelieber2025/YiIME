@@ -6,13 +6,16 @@
 
 ## [Unreleased]
 
-升级后请重启电脑。从 0.1.x 升级时设置会自动迁移（见“变更”）。
+## [0.2.0-rc.1] - 2026-11-22
+
+候选版本（预发布）。升级后请重启电脑。从 0.1.x 升级时设置会自动迁移（见“变更”）。
 
 ### 新增
 
 - **双拼**：小鹤、微软、自然码双拼（设置 →“输入方案”，可与五笔混输）；命令行 `--shuangpin`。
 - **导入搜狗/QQ 词库**：设置里“导入搜狗/QQ 词库…”，支持 `.scel` 与文本导出（UTF-8/UTF-16），合并进用户词库；命令行 `yiime import`。
 - **只显示常用字**（默认开）：隐藏扩展区生僻字、兼容/私用区字，以及低频简拼词和低频单字（如 `bjdx` 不再出“伯喈倒屣”）；命令行 `--all-chars` 关闭。
+- 只显示常用字且输出简体时，GB 2312 之外的单字（多为繁体、异体字）排在 GB 2312 单字之后（不删除）：`shuo` 先出“说”再出“說”，`dui`、`zhe`、`guo` 同理；`--all-chars` 或繁体输出时保持原顺序。最常用的 120 个音节中，前 10 名里的非 GB 2312 字从 57 个减到 26 个，前 5 名里从 13 个减到 6 个。
 - `lve`/`nve` 与 `lue`/`nue` 等价（`lve` → 略）；编码里带 `'` 时只查拼音。
 - 首次启动时显示一次隐私说明；`SECURITY.md` 列出每个翻译服务发送什么、本机保存了哪些文件，并随安装包和 zip 分发。
 - 可选代码签名：Windows（signtool / osslsigncode，签 EXE、DLL 和安装包）与 macOS（Developer ID + 公证），没有配置证书时自动跳过；新增 `release.yml` 构建工作流与 `SIGNING.md`。
@@ -134,7 +137,8 @@ Linux：
 
 - 命令行工具 `yiime`（`query` 查候选、`translate` 测试翻译），提供 tar.gz 与 .deb。
 
-[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.1.5...HEAD
+[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.1...HEAD
+[0.2.0-rc.1]: https://github.com/leelieber2025/YiIME/compare/v0.1.5...v0.2.0-rc.1
 [0.1.5]: https://github.com/leelieber2025/YiIME/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/leelieber2025/YiIME/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/leelieber2025/YiIME/compare/v0.1.2...v0.1.3

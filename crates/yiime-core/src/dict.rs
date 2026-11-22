@@ -107,6 +107,30 @@ pub fn is_common_text(text: &str) -> bool {
     })
 }
 
+/// The 6763 Hanzi of GB 2312, sorted by code point (`data/gb2312/hanzi.txt`).
+static GB2312_HANZI: &str = include_str!("../../../data/gb2312/hanzi.txt");
+
+/// Whether `ch` is one of the 6763 GB 2312 Hanzi: the everyday Simplified set. Characters outside
+/// it are mostly Traditional or variant forms (說, 對, 這) or rare characters.
+pub fn is_gb2312_hanzi(ch: char) -> bool {
+    static SET: std::sync::OnceLock<Vec<char>> = std::sync::OnceLock::new();
+    SET.get_or_init(|| {
+        GB2312_HANZI
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .flat_map(str::chars)
+            .collect()
+    })
+    .binary_search(&ch)
+    .is_ok()
+}
+
+/// A single character outside GB 2312 (see [`is_gb2312_hanzi`]).
+fn is_non_gb2312_char(text: &str) -> bool {
+    let mut chars = text.chars();
+    matches!((chars.next(), chars.next()), (Some(ch), None) if !is_gb2312_hanzi(ch))
+}
+
 /// First letter of each syllable; zh/ch/sh become Z/C/S.
 fn syllable_initials(syllables: &str) -> String {
     syllables
@@ -600,12 +624,15 @@ impl MixedInput {
         fuzzy: bool,
         pinyin_first: bool,
     ) -> Vec<Candidate> {
-        self.candidates_filtered(raw, limit, page_size, fuzzy, pinyin_first, false)
+        self.candidates_filtered(raw, limit, page_size, fuzzy, pinyin_first, false, false)
     }
 
     /// Like [`Self::candidates_with_options`]; `common_only` leaves out rare characters (see
     /// [`is_common_text`]) and initials or single-character pinyin matches below
-    /// [`COMMON_FREQUENCY_FLOOR`].
+    /// [`COMMON_FREQUENCY_FLOOR`]. `prefer_gb2312` (for Simplified output) ranks single pinyin
+    /// characters outside GB 2312 after the others, keeping their relative order: `shuo` gives
+    /// 说 before 說. They are demoted, not removed.
+    #[allow(clippy::too_many_arguments)]
     pub fn candidates_filtered(
         &self,
         raw: &str,
@@ -614,6 +641,7 @@ impl MixedInput {
         fuzzy: bool,
         pinyin_first: bool,
         common_only: bool,
+        prefer_gb2312: bool,
     ) -> Vec<Candidate> {
         let code = raw.to_ascii_lowercase().replace([' ', '\''], "");
         if code.is_empty() {
@@ -630,6 +658,10 @@ impl MixedInput {
                 is_common_text(text)
                     && (*weight >= COMMON_FREQUENCY_FLOOR || text.chars().nth(1).is_some())
             });
+        }
+        if prefer_gb2312 {
+            // Stable: everything else keeps its order.
+            homophones.sort_by_key(|(text, _, _)| is_non_gb2312_char(text));
         }
         let wanted = if raw.contains('\'') {
             boundaries(&raw.to_ascii_lowercase().replace(' ', ""), '\'')
@@ -927,7 +959,7 @@ mod tests {
         let input = MixedInput::from_rime(wubi, pinyin).with_frequency_words(words.to_owned());
         let texts = |code: &str, common: bool| -> Vec<String> {
             input
-                .candidates_filtered(code, 9, 9, false, false, common)
+                .candidates_filtered(code, 9, 9, false, false, common, false)
                 .into_iter()
                 .map(|c| c.text)
                 .collect()
@@ -944,7 +976,7 @@ mod tests {
         // The real dictionaries: lve no longer offers the Ext-B 𨋨 prefix, bjdx only 北京大学.
         let full = MixedInput::bundled();
         let real = |code: &str| -> Vec<String> {
-            full.candidates_filtered(code, 90, 9, false, false, true)
+            full.candidates_filtered(code, 90, 9, false, false, true, false)
                 .into_iter()
                 .map(|c| c.text)
                 .collect()

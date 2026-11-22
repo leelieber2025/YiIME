@@ -98,6 +98,8 @@ impl Composer {
                 options.fuzzy,
                 options.pinyin_first || options.shuangpin.is_some(),
                 options.common_only,
+                // Traditional output converts every candidate anyway.
+                options.common_only && !options.traditional,
             ),
         };
         // A partial match leaves full pinyin unconsumed; keep the matching typed keys instead.
