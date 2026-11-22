@@ -97,6 +97,13 @@ unsafe fn receiver_proc_impl(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> 
         };
         return unsafe { (*pointer).commit(text) as LRESULT };
     }
+    if message == WM_APP + 9 {
+        let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TextService_Impl };
+        if !pointer.is_null() {
+            unsafe { (*pointer).notify_box_english() };
+        }
+        return 0;
+    }
     if message == WM_APP + 1 {
         let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TextService_Impl };
         if !pointer.is_null() && unsafe { !(*pointer).flush_keys() } {

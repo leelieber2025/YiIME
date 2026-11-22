@@ -542,7 +542,34 @@ fn process_image(pid: u32) -> Option<std::path::PathBuf> {
         ok.then(|| std::path::PathBuf::from(String::from_utf16_lossy(&buffer[..len as usize])))
     }
 }
+thread_local! {
+    /// Receiver window of this thread's text service, so the input-mode button (which sees every
+    /// OPENCLOSE change: Shift tap, Ctrl+Space, the button, the taskbar) can reach it.
+    static SESSION_RECEIVER: Cell<HWND> = const { Cell::new(null_mut()) };
+}
+/// The application switched to English (from any source): tell this thread's text service,
+/// which tells the input box (asynchronously, never from inside the compartment callback).
+pub(super) fn notify_english_mode() {
+    let receiver = SESSION_RECEIVER.with(Cell::get);
+    if !receiver.is_null() {
+        unsafe {
+            let _ = PostMessageW(receiver, WM_APP + 9, 0, 0);
+        }
+    }
+}
 impl TextService {
+    /// English is on: an input box still showing for this application ends the session (it is
+    /// hidden; a draft is kept for next time). WM_APP + 9, wParam = receiver.
+    fn notify_box_english(&self) {
+        let editor_window = self.editor_window.get();
+        let receiver = self.receiver.get();
+        if !editor_window.is_null() && !receiver.is_null() {
+            log("切到英文：通知输入框结束会话");
+            unsafe {
+                let _ = PostMessageW(editor_window, WM_APP + 9, receiver as usize, 0);
+            }
+        }
+    }
     /// Tells the shared input box that the focus in this application moved (another text field,
     /// the page, another window), so an empty box is hidden at once instead of lingering
     /// (WM_APP + 8, wParam = receiver; the box ignores it when it has content or the keyboard).
@@ -1431,6 +1458,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
                 return Err(error);
             }
             self.receiver.set(receiver);
+            SESSION_RECEIVER.with(|cell| cell.set(receiver));
             self.client_id.set(client_id);
             if let Ok(source) = manager.cast::<ITfSource>() {
                 let event_sink: ITfThreadMgrEventSink = self.to_interface();
@@ -1489,6 +1517,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
     }
     fn Deactivate(&self) -> Result<()> {
         com_guard("Deactivate", || {
+            SESSION_RECEIVER.with(|cell| cell.set(null_mut()));
             // End this application's session in the shared service; the service stays for the
             // other applications (and exits by itself when idle).
             let editor_window = self.editor_window.get();

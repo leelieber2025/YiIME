@@ -266,6 +266,14 @@ pub fn hide_empty_box(view: BoxView, host_focus_moved: bool) -> bool {
         && (host_focus_moved || view.shown_for_ms >= EMPTY_BOX_GRACE_MS)
 }
 
+/// The host application switched to English (Shift tap, Ctrl+Space, the mode button, the
+/// taskbar): the box ends its session and hides, empty or not (a draft is kept for next time, as
+/// when clicking away), unless a translation is in flight (its result still lands). Before
+/// 0.2.0-rc.2 the box was not told, and an empty translation box stayed up until it timed out.
+pub fn english_ends_session(view: BoxView) -> bool {
+    view.visible && !view.busy
+}
+
 /// What a Shift tap in the input box does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShiftTapAction {
@@ -578,5 +586,30 @@ mod tests {
         assert_eq!(shift_tap_action(true, true, true, true), ToggleSegment);
         // The standalone box has no application to switch.
         assert_eq!(shift_tap_action(false, true, true, false), ToggleSegment);
+    }
+
+    #[test]
+    fn switching_the_host_to_english_closes_the_box() {
+        let shown = BoxView {
+            visible: true,
+            empty: true,
+            ..BoxView::default()
+        };
+        assert!(english_ends_session(shown));
+        // Empty or not, and even when it still has the foreground.
+        assert!(english_ends_session(BoxView {
+            empty: false,
+            foreground: true,
+            ..shown
+        }));
+        // A translation in flight stays until its result is committed; a hidden box is left.
+        assert!(!english_ends_session(BoxView {
+            busy: true,
+            ..shown
+        }));
+        assert!(!english_ends_session(BoxView {
+            visible: false,
+            ..shown
+        }));
     }
 }

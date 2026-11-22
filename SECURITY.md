@@ -56,7 +56,7 @@
 | `HKCU\Software\YiIME` | 开关、快捷键、每页候选数、输入方案、是否已显示隐私说明 | 注册表 | — |
 | `%TEMP%\YiIME-tsf.log`（超过 512 KB 轮换为 `.log.old`） | TSF DLL 诊断事件：时间、进程号、宿主程序文件名、事件（如“Shift 单击切换中/英”“InputScope 查询失败”） | 明文；**不含输入的文字** | 总是 |
 | `%TEMP%\YiIME-translate.log`（同样轮换） | 每次翻译请求的引擎、模型、主机名、字数、耗时、成功或错误类别 | 明文；**不含原文、译文和密钥**（有单元测试保证） | 总是 |
-| `%TEMP%\YiIME-service.log`（同样轮换） | 输入框服务的看门狗事件（如“消息循环无响应，退出”）：时间、进程号 | 明文；**不含输入的文字** | 出事时才写 |
+| `%TEMP%\YiIME-service.log`（同样轮换） | 输入框服务的事件：会话开始/结束/切换应用、输入框隐藏的原因、看门狗退出；时间、进程号 | 明文；**不含输入的文字** | 每次会话一两行，超过 512 KB 轮换 |
 | `HKLM\Software\YiIME\CurrentDir`、`Program Files\YiIME\<版本目录>` | 安装程序写入的当前版本目录和程序文件 | 需要管理员权限修改 | — |
 
 0.1.x 版本用的是 `%APPDATA%\InputTranslation`、`HKCU\Software\InputTranslation` 和明文 `learned.txt`；

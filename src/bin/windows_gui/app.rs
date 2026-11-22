@@ -147,6 +147,9 @@ const WM_FULL_INPUT: u32 = WM_APP + 7;
 /// From the TSF DLL (wParam = receiver): the focus in that application moved (another text field,
 /// the page, another window).
 const WM_TSF_FOCUS_MOVED: u32 = WM_APP + 8;
+/// From the TSF DLL (wParam = receiver): that application switched to English (Shift tap,
+/// Ctrl+Space, the mode button…); its session ends.
+const WM_TSF_ENGLISH: u32 = WM_APP + 9;
 /// Tray (portable) and TSF editor instances use different titles so each can find its single
 /// instance.
 const TRAY_TITLE: &str = "YiIME 译 · 托盘";
@@ -639,6 +642,7 @@ unsafe fn toggle_inline_english(hwnd: HWND, state: &State) {
 /// close the box right away (end the session, give the focus back).
 unsafe fn switch_to_english(hwnd: HWND, state: &State) {
     let receiver = state.tsf_receiver.get();
+    service_log("session end: Shift tap in the empty box, switching to English");
     unsafe {
         cancel_session(hwnd, state);
         if !receiver.is_null() && !send_tsf_english(receiver, hwnd) {
@@ -1032,6 +1036,13 @@ unsafe fn activate(hwnd: HWND, state: &State, target: HWND, anchor: Option<RECT>
         KillTimer(hwnd, IDLE_TIMER);
     }
     refresh_user_words(state);
+    if state.tsf_service {
+        service_log(if code.is_empty() {
+            "session start (history)"
+        } else {
+            "session start"
+        });
+    }
     state.target.set(target);
     state.finished.set(false);
     state.pending.set(false);
@@ -1157,6 +1168,7 @@ unsafe fn switch_receiver(hwnd: HWND, state: &State, receiver: HWND) {
     }
     state.finished.set(true);
     state.tsf_receiver.set(receiver);
+    service_log("session moved to another application");
     watch_receiver(hwnd, state, receiver);
 }
 /// Tells the TSF DLL this input ended without inserting text.
@@ -1211,6 +1223,11 @@ unsafe fn hide_if_empty(hwnd: HWND, state: &State, focus_moved: bool) {
             .map_or(u64::MAX, |at| at.elapsed().as_millis() as u64),
     };
     if yiime_core::hide_empty_box(view, focus_moved) {
+        service_log(if focus_moved {
+            "box hidden: empty, host focus moved"
+        } else {
+            "box hidden: empty, not in the foreground"
+        });
         unsafe { deactivate(hwnd, state) };
     }
 }
@@ -1586,6 +1603,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 && current_host(state)
                 && w as HWND == state.tsf_receiver.get()
             {
+                service_log(if l == 0 {
+                    "session end: IME deactivated in the host"
+                } else {
+                    "session end: host exited"
+                });
                 state.finished.set(true);
                 state.tsf_receiver.set(null_mut());
                 unsafe {
@@ -1601,6 +1623,24 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         WM_TIMER if w == EMPTY_BOX_TIMER => {
             if let Some(state) = state {
                 unsafe { hide_if_empty(hwnd, state, false) };
+            }
+            0
+        }
+        WM_TSF_ENGLISH => {
+            if let Some(state) = state
+                && state.tsf_service
+                && w != 0
+                && w as HWND == state.tsf_receiver.get()
+                && yiime_core::english_ends_session(yiime_core::BoxView {
+                    visible: unsafe { IsWindowVisible(hwnd) } != 0,
+                    busy: state.pending.get(),
+                    ..Default::default()
+                })
+            {
+                // Hide and end the session (a draft is kept for next time, as when clicking
+                // away). While a translation is in flight the box stays so the result lands.
+                service_log("session end: host switched to English");
+                unsafe { deactivate(hwnd, state) };
             }
             0
         }

@@ -412,6 +412,9 @@ impl ITfCompartmentEventSink_Impl for InputModeButton_Impl {
                 self.refresh();
             } else if guid == GUID_COMPARTMENT_KEYBOARD_OPENCLOSE {
                 self.refresh();
+                if !self.chinese() {
+                    notify_english_mode();
+                }
             }
             Ok(())
         })
