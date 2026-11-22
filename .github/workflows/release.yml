@@ -55,6 +55,16 @@ jobs:
           path: dist
       - name: Install Inno Setup
         run: choco install innosetup --no-progress -y
+      # Inno Setup 6 ships the Simplified Chinese messages only as an unofficial translation in its
+      # source tree; take it from the matching release tag when the install lacks it.
+      - name: Simplified Chinese installer messages
+        shell: pwsh
+        run: |
+          $isl = 'C:\Program Files (x86)\Inno Setup 6\Languages\ChineseSimplified.isl'
+          if (-not (Test-Path $isl)) {
+            Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/jrsoftware/issrc/is-6_7_4/Files/Languages/Unofficial/ChineseSimplified.isl' -OutFile $isl
+          }
+          Get-Item $isl
       # With a certificate, ISCC signs both the setup and the uninstaller inside it.
       - name: Prepare signing
         if: env.WINDOWS_SIGN_PFX_BASE64 != ''
