@@ -78,7 +78,7 @@ pub use service::{
     duplicate_commit, english_ends_session, field_scope, focused_first, handle_from_wire,
     hide_empty_box, key_route, keys_to_give_back, late_commit_landed, left_field,
     may_share_service, needs_private_editor, next_held_id, pass_reason, private_scope,
-    redirect_to_focused, service_window_title, shift_tap_action, startup_state, treat_as_private,
+    redirect_to_focused, service_window_title, shift_tap_action, startup_state,
 };
 pub use settings::{
     AZURE_KEY_FILE, ApiSettings, DEFAULT_HISTORY_KEY, DEFAULT_URL, Engine, Flag, GOOGLE_KEY_FILE,

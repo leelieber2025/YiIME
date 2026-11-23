@@ -1356,11 +1356,6 @@ impl TextService {
             .filter(|(cached, _)| cached == context)
             .and_then(|(_, result)| result.get())
     }
-    /// Privacy for learning, history and translation: a field whose InputScope is not read yet
-    /// counts as private (yiime_core::treat_as_private).
-    fn private_field(&self, context: &ITfContext) -> bool {
-        yiime_core::treat_as_private(self.field_scope(context))
-    }
     /// The field is known to be private (read, and password, PIN or IS_PRIVATE).
     fn known_private(&self, context: &ITfContext) -> bool {
         self.field_scope(context)
@@ -1434,7 +1429,9 @@ impl TextService {
         {
             return;
         }
-        let private = self.private_field(&context);
+        // Unknown counts as ordinary: the read can arrive only with the next write session (Word
+        // grants a queued read lock then), i.e. after Enter, so it must not hold up translation.
+        let private = self.known_private(&context);
         unsafe {
             PostMessageW(
                 window,
@@ -2408,8 +2405,8 @@ impl TextService_Impl {
             )
         };
         if requested.is_err() && result.get().is_none() {
-            // The host refuses read sessions: the scope can never be read, so do not keep the field
-            // "private until read" forever (no translation there at all).
+            // The host refuses read sessions: the scope can never be read; treat it as an ordinary
+            // field instead of re-requesting on every edit.
             log("读取 InputScope 失败，按普通输入框处理");
             result.set(Some(yiime_core::FieldScope::Normal));
             unsafe {

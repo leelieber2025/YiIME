@@ -449,13 +449,6 @@ pub fn private_scope(scopes: &[i32]) -> bool {
     field_scope(scopes) != FieldScope::Normal
 }
 
-/// Privacy of a field whose InputScope may not have been read yet: unknown counts as private, so
-/// the first keys of a session are never learned, recorded or translated before the read
-/// arrives.
-pub fn treat_as_private(scope: Option<FieldScope>) -> bool {
-    scope != Some(FieldScope::Normal)
-}
-
 /// Line heights (physical pixels) trusted as one text line: smaller is a caret sliver, larger
 /// most likely the whole edit box (qingjian anchor.rs MIN/MAX_LINE_HEIGHT).
 pub const MIN_LINE_HEIGHT: i32 = 8;
@@ -910,14 +903,6 @@ mod tests {
         assert_eq!(field_scope(&[1, 61]), FieldScope::Private); // IS_PRIVATE only
         assert_eq!(field_scope(&[]), FieldScope::Normal);
         assert_eq!(field_scope(&[0, 1, 5]), FieldScope::Normal);
-    }
-
-    #[test]
-    fn unknown_scope_is_private_until_read() {
-        assert!(treat_as_private(None));
-        assert!(treat_as_private(Some(FieldScope::Private)));
-        assert!(treat_as_private(Some(FieldScope::Password)));
-        assert!(!treat_as_private(Some(FieldScope::Normal)));
     }
 
     #[test]
