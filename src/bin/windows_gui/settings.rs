@@ -1,3 +1,4 @@
+use super::candidate::{create_font, scale_px, window_dpi};
 use super::*;
 
 /// Opens the settings window (or brings it forward).
@@ -13,32 +14,27 @@ pub(super) unsafe fn open_settings(owner: HWND) {
         }
         return;
     }
-    let style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
-    let ex_style = WS_EX_TOPMOST | WS_EX_APPWINDOW | WS_EX_DLGMODALFRAME;
+    let (style, ex_style) = settings_styles();
+    // Real size is applied in WM_CREATE from font metrics; this is only a placeholder.
+    let dpi = window_dpi(owner);
     let mut rect = RECT {
         left: 0,
         top: 0,
-        right: 440,
-        bottom: 524 + OPTION_SHIFT + ENGINE_SHIFT,
+        right: scale_px(720, dpi),
+        bottom: scale_px(760, dpi),
     };
     unsafe {
-        AdjustWindowRectEx(&mut rect, style, 0, ex_style);
+        AdjustWindowRectExForDpi(&mut rect, style, 0, ex_style, dpi);
     }
     let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
-    let (x, y) = unsafe {
-        (
-            (GetSystemMetrics(SM_CXSCREEN) - width) / 2,
-            (GetSystemMetrics(SM_CYSCREEN) - height) / 3,
-        )
-    };
     let window = unsafe {
         CreateWindowExW(
             ex_style,
             wide(SETTINGS_CLASS).as_ptr(),
             wide(concat!("YiIME 译 · 设置 · v", env!("CARGO_PKG_VERSION"))).as_ptr(),
             style,
-            x,
-            y,
+            0,
+            0,
             width,
             height,
             null_mut(),
@@ -52,6 +48,7 @@ pub(super) unsafe fn open_settings(owner: HWND) {
     }
     state.settings_window.set(window);
     unsafe {
+        center_settings_window(window);
         ShowWindow(window, SW_SHOWNORMAL);
         SetForegroundWindow(window);
         let url = GetDlgItem(window, SETTINGS_URL);
@@ -59,6 +56,500 @@ pub(super) unsafe fn open_settings(owner: HWND) {
         SendMessageW(url, EM_SETSEL, 0, -1);
     }
 }
+
+fn settings_styles() -> (u32, u32) {
+    (
+        WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX,
+        WS_EX_TOPMOST | WS_EX_APPWINDOW | WS_EX_DLGMODALFRAME,
+    )
+}
+
+fn settings_dialog_font(dpi: u32) -> HFONT {
+    unsafe {
+        let mut metrics = std::mem::zeroed::<NONCLIENTMETRICSW>();
+        metrics.cbSize = std::mem::size_of::<NONCLIENTMETRICSW>() as u32;
+        if SystemParametersInfoW(
+            SPI_GETNONCLIENTMETRICS,
+            metrics.cbSize,
+            &mut metrics as *mut NONCLIENTMETRICSW as *mut _,
+            0,
+        ) != 0
+        {
+            let system = GetDpiForSystem().max(96);
+            metrics.lfMessageFont.lfHeight = (i64::from(metrics.lfMessageFont.lfHeight)
+                * i64::from(dpi)
+                / i64::from(system)) as i32;
+            metrics.lfMessageFont.lfQuality = CLEARTYPE_QUALITY;
+            let font = CreateFontIndirectW(&metrics.lfMessageFont);
+            if !font.is_null() {
+                return font;
+            }
+        }
+        create_font(scale_px(SETTINGS_FONT_PX, dpi))
+    }
+}
+
+fn text_cx(font: HFONT, text: &str) -> i32 {
+    unsafe {
+        let dc = GetDC(null_mut());
+        if dc.is_null() {
+            return scale_px(8, 96) * text.chars().count() as i32;
+        }
+        let previous = SelectObject(dc, font as _);
+        let units = wide(text);
+        let mut size = SIZE { cx: 0, cy: 0 };
+        GetTextExtentPoint32W(dc, units.as_ptr(), units.len() as i32 - 1, &mut size);
+        SelectObject(dc, previous);
+        ReleaseDC(null_mut(), dc);
+        size.cx
+    }
+}
+
+fn font_height(font: HFONT) -> i32 {
+    unsafe {
+        let dc = GetDC(null_mut());
+        if dc.is_null() {
+            return scale_px(SETTINGS_FONT_PX, 96);
+        }
+        let previous = SelectObject(dc, font as _);
+        let mut tm = std::mem::zeroed::<TEXTMETRICW>();
+        GetTextMetricsW(dc, &mut tm);
+        SelectObject(dc, previous);
+        ReleaseDC(null_mut(), dc);
+        tm.tmHeight
+    }
+}
+
+fn metric_for_dpi(index: i32, dpi: u32) -> i32 {
+    let value = unsafe { GetSystemMetricsForDpi(index, dpi) };
+    if value == 0 {
+        unsafe { GetSystemMetrics(index) }
+    } else {
+        value
+    }
+}
+
+struct SettingsMetrics {
+    margin: i32,
+    gutter: i32,
+    label_h: i32,
+    edit_h: i32,
+    btn_h: i32,
+    check_extra: i32,
+    combo_extra: i32,
+    combo_list_h: i32,
+    label_gap: i32,
+    row_gap: i32,
+    tight_gap: i32,
+    btn_pad: i32,
+}
+
+fn settings_metrics(font: HFONT, dpi: u32) -> SettingsMetrics {
+    let font_h = font_height(font).max(1);
+    SettingsMetrics {
+        margin: scale_px(16, dpi),
+        gutter: scale_px(16, dpi),
+        label_h: font_h + scale_px(2, dpi),
+        edit_h: font_h + scale_px(8, dpi),
+        btn_h: font_h + scale_px(12, dpi),
+        check_extra: metric_for_dpi(SM_CXMENUCHECK, dpi).max(scale_px(16, dpi)) + scale_px(8, dpi),
+        combo_extra: metric_for_dpi(SM_CXVSCROLL, dpi).max(scale_px(16, dpi)) + scale_px(12, dpi),
+        combo_list_h: font_h * 10 + scale_px(8, dpi),
+        label_gap: scale_px(2, dpi),
+        row_gap: scale_px(8, dpi),
+        tight_gap: scale_px(2, dpi),
+        btn_pad: scale_px(8, dpi),
+    }
+}
+
+struct SettingsLayout {
+    /// Client width used for this layout (may be wider than `min_w` when the user resizes).
+    client_w: i32,
+    /// Unscrolled content height; also the minimum client height when it fits the work area.
+    min_w: i32,
+    min_h: i32,
+    rects: Vec<(i32, i32, i32, i32, i32)>,
+}
+
+impl SettingsLayout {
+    fn compute(font: HFONT, dpi: u32, client_w: Option<i32>) -> Self {
+        let m = settings_metrics(font, dpi);
+        let slack = scale_px(8, dpi);
+        let mut col = 0;
+        for (_, text, _) in OPTION_BOXES {
+            col = col.max(text_cx(font, text) + m.check_extra);
+        }
+        for engine in Engine::ALL {
+            col = col.max(text_cx(font, engine.label()) + m.combo_extra);
+        }
+        for style in TranslationStyle::ALL {
+            col = col.max(text_cx(font, style.label()) + m.combo_extra);
+        }
+        for text in [
+            "翻译引擎",
+            "Azure 翻译密钥（加密保存）",
+            "模型",
+            "翻译风格",
+            "Google Cloud 密钥（可选，加密保存）",
+            "Azure 区域（如 eastus，全局可留空）",
+            "API 密钥（Windows 加密保存）",
+        ] {
+            col = col.max(text_cx(font, text) + m.btn_pad);
+        }
+        col = col.max(text_cx(font, "失败时允许改用其他翻译服务") + m.check_extra);
+
+        let mut preferred = m.margin * 2 + col * 2 + m.gutter;
+        for (text, extra) in [
+            (
+                "DeepL 密钥（加密保存；以 :fx 结尾为免费版，译文为美式英文）",
+                m.btn_pad,
+            ),
+            (
+                "大模型 API 地址（OpenAI 兼容；选 Google 时作备用，可不填）",
+                m.btn_pad,
+            ),
+            (
+                "自定义要求（可选，追加到翻译提示词，例如“保留产品名不翻译”）",
+                m.btn_pad,
+            ),
+            ("普通五笔模式（不翻译，选字直接上屏）", m.check_extra),
+            (
+                "切换快捷键（如 Ctrl+Shift+Space；重新切到本输入法后生效）",
+                m.btn_pad,
+            ),
+            (
+                "输入记忆：保存翻译过的中文，快捷键找回重新编辑/翻译",
+                m.check_extra,
+            ),
+        ] {
+            preferred = preferred.max(m.margin * 2 + text_cx(font, text) + extra);
+        }
+
+        let scheme_label_w = text_cx(font, "输入方案") + m.btn_pad;
+        let mut scheme_combo = text_cx(font, "五笔 + 全拼（默认）") + m.combo_extra;
+        for item in Shuangpin::ALL {
+            scheme_combo = scheme_combo.max(text_cx(font, item.label()) + m.combo_extra);
+        }
+        let import_w = text_cx(font, "导入搜狗/QQ 词库…") + m.btn_pad * 2;
+        preferred = preferred
+            .max(m.margin * 2 + scheme_label_w + m.gutter + scheme_combo + m.gutter + import_w);
+
+        let hist_label_w = text_cx(font, "找回快捷键") + m.btn_pad;
+        let clear_w = text_cx(font, "清除输入记忆") + m.btn_pad * 2;
+        preferred = preferred
+            .max(m.margin * 2 + hist_label_w + m.gutter + scale_px(160, dpi) + m.gutter + clear_w);
+
+        let words_w = text_cx(font, "用户词库…") + m.btn_pad * 2;
+        let save_w = (text_cx(font, "保存") + m.btn_pad * 2).max(scale_px(80, dpi));
+        let cancel_w = (text_cx(font, "取消") + m.btn_pad * 2).max(scale_px(80, dpi));
+        preferred =
+            preferred.max(m.margin * 2 + words_w + m.gutter + save_w + m.gutter / 2 + cancel_w);
+        preferred += slack;
+
+        let width = client_w.unwrap_or(preferred).max(preferred);
+        let col_w = (width - m.margin * 2 - m.gutter) / 2;
+        let left = m.margin;
+        let right = m.margin + col_w + m.gutter;
+        let full_w = width - m.margin * 2;
+
+        let mut y = m.margin;
+        let mut rects = Vec::new();
+        let mut place = |id: i32, x: i32, y: i32, w: i32, h: i32| {
+            rects.push((id, x, y, w, h));
+        };
+
+        place(LBL_ENGINE, left, y, col_w, m.label_h);
+        place(LBL_GOOGLE_KEY, right, y, col_w, m.label_h);
+        y += m.label_h + m.label_gap;
+        place(SETTINGS_ENGINE, left, y, col_w, m.combo_list_h);
+        place(SETTINGS_GOOGLE_KEY, right, y, col_w, m.edit_h);
+        y += m.edit_h + m.row_gap;
+
+        place(LBL_AZURE_KEY, left, y, col_w, m.label_h);
+        place(LBL_AZURE_REGION, right, y, col_w, m.label_h);
+        y += m.label_h + m.label_gap;
+        place(SETTINGS_AZURE_KEY, left, y, col_w, m.edit_h);
+        place(SETTINGS_AZURE_REGION, right, y, col_w, m.edit_h);
+        y += m.edit_h + m.row_gap;
+
+        place(LBL_DEEPL, left, y, full_w, m.label_h);
+        y += m.label_h + m.label_gap;
+        place(SETTINGS_DEEPL_KEY, left, y, col_w, m.edit_h);
+        place(SETTINGS_FALLBACK, right, y, col_w, m.edit_h);
+        y += m.edit_h + m.row_gap;
+
+        place(LBL_URL, left, y, full_w, m.label_h);
+        y += m.label_h + m.label_gap;
+        place(SETTINGS_URL, left, y, full_w, m.edit_h);
+        y += m.edit_h + m.row_gap;
+
+        place(LBL_MODEL, left, y, col_w, m.label_h);
+        place(LBL_KEY, right, y, col_w, m.label_h);
+        y += m.label_h + m.label_gap;
+        place(SETTINGS_MODEL, left, y, col_w, m.edit_h);
+        place(SETTINGS_KEY, right, y, col_w, m.edit_h);
+        y += m.edit_h + m.row_gap;
+
+        place(LBL_STYLE, left, y, col_w, m.label_h);
+        y += m.label_h + m.label_gap;
+        place(SETTINGS_STYLE, left, y, col_w, m.combo_list_h);
+        y += m.edit_h + m.row_gap;
+
+        place(LBL_CUSTOM, left, y, full_w, m.label_h);
+        y += m.label_h + m.label_gap;
+        place(SETTINGS_CUSTOM, left, y, full_w, m.edit_h);
+        y += m.edit_h + m.row_gap;
+
+        place(SETTINGS_PLAIN, left, y, full_w, m.edit_h);
+        y += m.edit_h + m.row_gap;
+
+        place(LBL_HOTKEY, left, y, full_w, m.label_h);
+        y += m.label_h + m.label_gap;
+        place(SETTINGS_HOTKEY, left, y, col_w, m.edit_h);
+        let page_label_w = text_cx(font, "每页候选数（1–9）") + m.btn_pad;
+        let page_edit_w = scale_px(48, dpi);
+        place(
+            LBL_PAGE_SIZE,
+            right,
+            y + (m.edit_h - m.label_h) / 2,
+            page_label_w,
+            m.label_h,
+        );
+        place(
+            SETTINGS_PAGE_SIZE,
+            right + page_label_w,
+            y,
+            page_edit_w.min(col_w.saturating_sub(page_label_w)),
+            m.edit_h,
+        );
+        y += m.edit_h + m.row_gap;
+
+        for (index, (id, _, _)) in OPTION_BOXES.iter().enumerate() {
+            let x = if index % 2 == 0 { left } else { right };
+            place(*id, x, y, col_w, m.edit_h);
+            if index % 2 == 1 || index + 1 == OPTION_BOXES.len() {
+                y += m.edit_h + m.tight_gap;
+            }
+        }
+        y += m.row_gap - m.tight_gap;
+
+        let scheme_y = y;
+        place(
+            LBL_SCHEME,
+            left,
+            scheme_y + (m.edit_h - m.label_h) / 2,
+            scheme_label_w,
+            m.label_h,
+        );
+        let import_x = left + full_w - import_w;
+        let scheme_x = left + scheme_label_w + m.gutter / 2;
+        let scheme_w = (import_x - m.gutter / 2 - scheme_x).max(scheme_combo);
+        place(
+            SETTINGS_SCHEME,
+            scheme_x,
+            scheme_y,
+            scheme_w,
+            m.combo_list_h,
+        );
+        place(SETTINGS_IMPORT, import_x, scheme_y, import_w, m.btn_h);
+        y += m.btn_h.max(m.edit_h) + m.row_gap;
+
+        place(SETTINGS_HISTORY, left, y, full_w, m.edit_h);
+        y += m.edit_h + m.row_gap;
+
+        place(
+            LBL_HISTORY_KEY,
+            left,
+            y + (m.edit_h - m.label_h) / 2,
+            hist_label_w,
+            m.label_h,
+        );
+        let hist_edit_x = left + hist_label_w + m.gutter / 2;
+        let clear_x = left + full_w - clear_w;
+        let hist_edit_w = (clear_x - m.gutter / 2 - hist_edit_x).max(scale_px(120, dpi));
+        place(SETTINGS_HISTORY_KEY, hist_edit_x, y, hist_edit_w, m.edit_h);
+        place(SETTINGS_CLEAR_HISTORY, clear_x, y, clear_w, m.btn_h);
+        y += m.btn_h.max(m.edit_h) + m.row_gap;
+
+        let btn_y = y;
+        place(SETTINGS_USER_WORDS, left, btn_y, words_w, m.btn_h);
+        place(
+            ID_CANCEL,
+            left + full_w - cancel_w,
+            btn_y,
+            cancel_w,
+            m.btn_h,
+        );
+        place(
+            ID_OK,
+            left + full_w - cancel_w - m.gutter / 2 - save_w,
+            btn_y,
+            save_w,
+            m.btn_h,
+        );
+        y += m.btn_h + m.margin;
+
+        Self {
+            client_w: width,
+            min_w: preferred,
+            min_h: y,
+            rects,
+        }
+    }
+}
+
+fn work_area(hwnd: HWND) -> RECT {
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = std::mem::zeroed::<MONITORINFO>();
+        info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(monitor, &mut info) != 0 {
+            info.rcWork
+        } else {
+            RECT {
+                left: 0,
+                top: 0,
+                right: GetSystemMetrics(SM_CXSCREEN),
+                bottom: GetSystemMetrics(SM_CYSCREEN),
+            }
+        }
+    }
+}
+
+fn window_size_for_client(cw: i32, ch: i32, dpi: u32) -> (i32, i32) {
+    let (style, ex_style) = settings_styles();
+    let mut rect = RECT {
+        left: 0,
+        top: 0,
+        right: cw,
+        bottom: ch,
+    };
+    unsafe {
+        AdjustWindowRectExForDpi(&mut rect, style, 0, ex_style, dpi);
+    }
+    (rect.right - rect.left, rect.bottom - rect.top)
+}
+
+fn center_settings_window(hwnd: HWND) {
+    unsafe {
+        let mut rect = std::mem::zeroed::<RECT>();
+        GetWindowRect(hwnd, &mut rect);
+        let work = work_area(hwnd);
+        let width = (rect.right - rect.left).min(work.right - work.left);
+        let height = (rect.bottom - rect.top).min(work.bottom - work.top);
+        let x = work.left + ((work.right - work.left) - width).max(0) / 2;
+        let y = work.top + ((work.bottom - work.top) - height).max(0) / 3;
+        SetWindowPos(
+            hwnd,
+            null_mut(),
+            x,
+            y,
+            width,
+            height,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+}
+
+fn apply_child_font(parent: HWND, font: HFONT) {
+    unsafe {
+        let mut child = GetWindow(parent, GW_CHILD);
+        while !child.is_null() {
+            SendMessageW(child, WM_SETFONT, font as usize, 1);
+            child = GetWindow(child, GW_HWNDNEXT);
+        }
+    }
+}
+
+fn apply_settings_layout(hwnd: HWND, layout: &SettingsLayout, scroll: i32) {
+    unsafe {
+        for (id, x, y, w, h) in &layout.rects {
+            let child = GetDlgItem(hwnd, *id);
+            if !child.is_null() {
+                SetWindowPos(
+                    child,
+                    null_mut(),
+                    *x,
+                    *y - scroll,
+                    *w,
+                    *h,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+        }
+    }
+}
+
+fn sync_settings_scroll(hwnd: HWND, state: &State, content_h: i32, client_h: i32) {
+    let max_scroll = (content_h - client_h).max(0);
+    let scroll = state.settings_scroll.get().clamp(0, max_scroll);
+    state.settings_scroll.set(scroll);
+    unsafe {
+        let mut info = std::mem::zeroed::<SCROLLINFO>();
+        info.cbSize = std::mem::size_of::<SCROLLINFO>() as u32;
+        info.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+        info.nMin = 0;
+        info.nMax = content_h.max(1) - 1;
+        info.nPage = client_h.max(1) as u32;
+        info.nPos = scroll;
+        SetScrollInfo(hwnd, SB_VERT, &info, 1);
+        ShowScrollBar(hwnd, SB_VERT, (max_scroll > 0) as i32);
+    }
+}
+
+fn relayout_settings(hwnd: HWND, state: &State) {
+    let font = state.settings_font.get();
+    if font.is_null() {
+        return;
+    }
+    let dpi = window_dpi(hwnd);
+    let mut client = RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    unsafe {
+        GetClientRect(hwnd, &mut client);
+    }
+    let layout = SettingsLayout::compute(font, dpi, Some(client.right).filter(|w| *w > 0));
+    state.settings_min.set((layout.min_w, layout.min_h));
+    state.settings_dpi.set(dpi);
+    sync_settings_scroll(hwnd, state, layout.min_h, client.bottom);
+    apply_settings_layout(hwnd, &layout, state.settings_scroll.get());
+    unsafe {
+        InvalidateRect(hwnd, null(), 1);
+    }
+}
+
+fn size_settings_to_layout(hwnd: HWND, state: &State, layout: &SettingsLayout) {
+    let dpi = window_dpi(hwnd);
+    let work = work_area(hwnd);
+    let (mut ww, mut wh) = window_size_for_client(layout.client_w, layout.min_h, dpi);
+    ww = ww.min(work.right - work.left);
+    wh = wh.min(work.bottom - work.top);
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            null_mut(),
+            0,
+            0,
+            ww,
+            wh,
+            SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
+    relayout_settings(hwnd, state);
+}
+
+fn add_control(parent: HWND, class: &str, text: &str, style: u32, id: i32) -> HWND {
+    unsafe { control(parent, class, text, style, 0, 0, 1, 1, id) }
+}
+
+fn add_label(parent: HWND, text: &str, id: i32) -> HWND {
+    add_control(parent, "STATIC", text, 0x80, id)
+}
+
 pub(super) unsafe extern "system" fn settings_proc(
     hwnd: HWND,
     msg: u32,
@@ -75,58 +566,119 @@ pub(super) unsafe extern "system" fn settings_proc(
                 return -1;
             };
             let settings = state.settings.borrow().clone();
-            label(
-                hwnd,
-                "大模型 API 地址（OpenAI 兼容；选 Google 时作备用，可不填）",
-                16,
-                12,
-                408,
-            );
-            control(
-                hwnd,
-                "EDIT",
-                &settings.url,
-                ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-                16,
-                34,
-                408,
-                24,
-                SETTINGS_URL,
-            );
-            label(hwnd, "模型", 16, 68, 196);
-            control(
-                hwnd,
-                "EDIT",
-                &settings.model,
-                ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-                16,
-                90,
-                196,
-                24,
-                SETTINGS_MODEL,
-            );
-            label(hwnd, "API 密钥（Windows 加密保存）", 228, 68, 196);
-            control(
-                hwnd,
-                "EDIT",
-                &settings.key,
-                ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-                228,
-                90,
-                196,
-                24,
-                SETTINGS_KEY,
-            );
-            label(hwnd, "翻译风格", 16, 124, 196);
-            let combo = control(
+            let dpi = window_dpi(hwnd);
+            let font = settings_dialog_font(dpi);
+            let previous = state.settings_font.replace(font);
+            if !previous.is_null() {
+                DeleteObject(previous as _);
+            }
+            state.settings_dpi.set(dpi);
+            state.settings_scroll.set(0);
+
+            add_label(hwnd, "翻译引擎", LBL_ENGINE);
+            let _engine = add_control(
                 hwnd,
                 "COMBOBOX",
                 "",
                 CBS_DROPDOWNLIST as u32 | WS_VSCROLL | WS_TABSTOP,
-                16,
-                146,
-                196,
-                220,
+                SETTINGS_ENGINE,
+            );
+            for item in Engine::ALL {
+                SendMessageW(
+                    _engine,
+                    CB_ADDSTRING,
+                    0,
+                    wide(item.label()).as_ptr() as isize,
+                );
+            }
+            let selected = Engine::ALL
+                .iter()
+                .position(|item| *item == settings.engine)
+                .unwrap_or(0);
+            SendMessageW(_engine, CB_SETCURSEL, selected, 0);
+            add_label(hwnd, "Google Cloud 密钥（可选，加密保存）", LBL_GOOGLE_KEY);
+            add_control(
+                hwnd,
+                "EDIT",
+                &settings.google_key,
+                ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+                SETTINGS_GOOGLE_KEY,
+            );
+            add_label(hwnd, "Azure 翻译密钥（加密保存）", LBL_AZURE_KEY);
+            add_control(
+                hwnd,
+                "EDIT",
+                &settings.azure_key,
+                ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+                SETTINGS_AZURE_KEY,
+            );
+            add_label(
+                hwnd,
+                "Azure 区域（如 eastus，全局可留空）",
+                LBL_AZURE_REGION,
+            );
+            add_control(
+                hwnd,
+                "EDIT",
+                &settings.azure_region,
+                ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+                SETTINGS_AZURE_REGION,
+            );
+            add_label(
+                hwnd,
+                "DeepL 密钥（加密保存；以 :fx 结尾为免费版，译文为美式英文）",
+                LBL_DEEPL,
+            );
+            add_control(
+                hwnd,
+                "EDIT",
+                &settings.deepl_key,
+                ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+                SETTINGS_DEEPL_KEY,
+            );
+            let fallback = add_control(
+                hwnd,
+                "BUTTON",
+                "失败时允许改用其他翻译服务",
+                BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+                SETTINGS_FALLBACK,
+            );
+            SendMessageW(fallback, BM_SETCHECK, settings.allow_fallback as usize, 0);
+
+            add_label(
+                hwnd,
+                "大模型 API 地址（OpenAI 兼容；选 Google 时作备用，可不填）",
+                LBL_URL,
+            );
+            add_control(
+                hwnd,
+                "EDIT",
+                &settings.url,
+                ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+                SETTINGS_URL,
+            );
+            add_label(hwnd, "模型", LBL_MODEL);
+            add_control(
+                hwnd,
+                "EDIT",
+                &settings.model,
+                ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+                SETTINGS_MODEL,
+            );
+            add_label(hwnd, "API 密钥（Windows 加密保存）", LBL_KEY);
+            add_control(
+                hwnd,
+                "EDIT",
+                &settings.key,
+                ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+                SETTINGS_KEY,
+            );
+            add_label(hwnd, "翻译风格", LBL_STYLE);
+            let combo = add_control(
+                hwnd,
+                "COMBOBOX",
+                "",
+                CBS_DROPDOWNLIST as u32 | WS_VSCROLL | WS_TABSTOP,
                 SETTINGS_STYLE,
             );
             for style in TranslationStyle::ALL {
@@ -142,97 +694,65 @@ pub(super) unsafe extern "system" fn settings_proc(
                 .position(|style| *style == settings.style)
                 .unwrap_or(0);
             SendMessageW(combo, CB_SETCURSEL, selected, 0);
-            label(
+            add_label(
                 hwnd,
                 "自定义要求（可选，追加到翻译提示词，例如“保留产品名不翻译”）",
-                16,
-                182,
-                408,
+                LBL_CUSTOM,
             );
-            control(
+            add_control(
                 hwnd,
                 "EDIT",
                 &settings.custom,
                 ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-                16,
-                204,
-                408,
-                24,
                 SETTINGS_CUSTOM,
             );
-            let plain = control(
+            let plain = add_control(
                 hwnd,
                 "BUTTON",
                 "普通五笔模式（不翻译，选字直接上屏）",
                 BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-                16,
-                242,
-                408,
-                24,
                 SETTINGS_PLAIN,
             );
             SendMessageW(plain, BM_SETCHECK, plain_mode() as usize, 0);
-            label(
+            add_label(
                 hwnd,
                 "切换快捷键（如 Ctrl+Shift+Space；重新切到本输入法后生效）",
-                16,
-                272,
-                408,
+                LBL_HOTKEY,
             );
-            control(
+            add_control(
                 hwnd,
                 "EDIT",
                 &plain_toggle_text(),
                 ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-                16,
-                294,
-                196,
-                24,
                 SETTINGS_HOTKEY,
             );
-            label(hwnd, "每页候选数（1–9）", 228, 298, 128);
-            control(
+            add_label(hwnd, "每页候选数（1–9）", LBL_PAGE_SIZE);
+            add_control(
                 hwnd,
                 "EDIT",
                 &OPTIONS.page_size().to_string(),
                 ES_NUMBER as u32 | WS_TABSTOP,
-                360,
-                294,
-                48,
-                24,
                 SETTINGS_PAGE_SIZE,
             );
             SendMessageW(GetDlgItem(hwnd, SETTINGS_PAGE_SIZE), EM_LIMITTEXT, 2, 0);
-            for (index, (id, text, option_key)) in OPTION_BOXES.iter().enumerate() {
-                let x = if index % 2 == 0 { 16 } else { 228 };
-                let y = 330 + (index as i32 / 2) * 26;
-                let checkbox = control(
+            for (id, text, option_key) in OPTION_BOXES {
+                let checkbox = add_control(
                     hwnd,
                     "BUTTON",
                     text,
                     BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-                    x,
-                    y,
-                    204,
-                    24,
-                    *id,
+                    id,
                 );
                 // "中文标点" checked = PunctEnglish off.
-                let on = option(*option_key) != (*option_key == Flag::PunctEnglish);
+                let on = option(option_key) != (option_key == Flag::PunctEnglish);
                 SendMessageW(checkbox, BM_SETCHECK, on as usize, 0);
             }
-            // Input scheme: Wubi + full pinyin, or a Shuangpin layout; and dictionary import.
-            let scheme_y = 330 + (OPTION_BOXES.len() as i32 + 1) / 2 * 26 + 4;
-            label(hwnd, "输入方案", 16, scheme_y + 4, 80);
-            let scheme = control(
+            add_label(hwnd, "输入方案", LBL_SCHEME);
+            let scheme = add_control(
                 hwnd,
                 "COMBOBOX",
                 "",
                 CBS_DROPDOWNLIST as u32 | WS_VSCROLL | WS_TABSTOP,
-                100,
-                scheme_y,
-                196,
-                160,
                 SETTINGS_SCHEME,
             );
             SendMessageW(
@@ -254,26 +774,18 @@ pub(super) unsafe extern "system" fn settings_proc(
                 .and_then(|current| Shuangpin::ALL.iter().position(|item| *item == current))
                 .map_or(0, |index| index + 1);
             SendMessageW(scheme, CB_SETCURSEL, current, 0);
-            control(
+            add_control(
                 hwnd,
                 "BUTTON",
                 "导入搜狗/QQ 词库…",
                 WS_TABSTOP,
-                304,
-                scheme_y - 2,
-                120,
-                28,
                 SETTINGS_IMPORT,
             );
-            let history = control(
+            let history = add_control(
                 hwnd,
                 "BUTTON",
                 "输入记忆：保存翻译过的中文，快捷键找回重新编辑/翻译",
                 BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-                16,
-                412 + OPTION_SHIFT,
-                408,
-                24,
                 SETTINGS_HISTORY,
             );
             SendMessageW(
@@ -282,180 +794,148 @@ pub(super) unsafe extern "system" fn settings_proc(
                 option(Flag::HistoryEnabled) as usize,
                 0,
             );
-            label(hwnd, "找回快捷键", 16, 446 + OPTION_SHIFT, 80);
-            control(
+            add_label(hwnd, "找回快捷键", LBL_HISTORY_KEY);
+            add_control(
                 hwnd,
                 "EDIT",
                 &history_key_text(),
                 ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-                100,
-                442 + OPTION_SHIFT,
-                150,
-                24,
                 SETTINGS_HISTORY_KEY,
             );
-            control(
+            add_control(
                 hwnd,
                 "BUTTON",
                 "清除输入记忆",
                 WS_TABSTOP,
-                272,
-                440 + OPTION_SHIFT,
-                152,
-                28,
                 SETTINGS_CLEAR_HISTORY,
             );
-            control(
-                hwnd,
-                "BUTTON",
-                "用户词库…",
-                WS_TABSTOP,
-                16,
-                482 + OPTION_SHIFT,
-                100,
-                28,
-                SETTINGS_USER_WORDS,
-            );
-            control(
+            add_control(hwnd, "BUTTON", "用户词库…", WS_TABSTOP, SETTINGS_USER_WORDS);
+            add_control(
                 hwnd,
                 "BUTTON",
                 "保存",
                 BS_DEFPUSHBUTTON as u32 | WS_TABSTOP,
-                256,
-                482 + OPTION_SHIFT,
-                80,
-                28,
                 ID_OK,
             );
-            control(
-                hwnd,
-                "BUTTON",
-                "取消",
-                WS_TABSTOP,
-                344,
-                482 + OPTION_SHIFT,
-                80,
-                28,
-                ID_CANCEL,
-            );
-            // Insert the Translation Engine row at the top: move the existing controls down and
-            // put the new ones first in tab order.
-            let mut child = GetWindow(hwnd, GW_CHILD);
-            while !child.is_null() {
-                let mut rect: RECT = std::mem::zeroed();
-                GetWindowRect(child, &mut rect);
-                MapWindowPoints(null_mut(), hwnd, &mut rect as *mut RECT as *mut POINT, 2);
-                SetWindowPos(
-                    child,
-                    null_mut(),
-                    rect.left,
-                    rect.top + ENGINE_SHIFT,
-                    0,
-                    0,
-                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                );
-                child = GetWindow(child, GW_HWNDNEXT);
-            }
-            label(hwnd, "翻译引擎", 16, 12, 196);
-            let engine = control(
-                hwnd,
-                "COMBOBOX",
-                "",
-                CBS_DROPDOWNLIST as u32 | WS_VSCROLL | WS_TABSTOP,
-                16,
-                34,
-                196,
-                160,
-                SETTINGS_ENGINE,
-            );
-            for item in Engine::ALL {
-                SendMessageW(
-                    engine,
-                    CB_ADDSTRING,
-                    0,
-                    wide(item.label()).as_ptr() as isize,
-                );
-            }
-            let selected = Engine::ALL
-                .iter()
-                .position(|item| *item == settings.engine)
-                .unwrap_or(0);
-            SendMessageW(engine, CB_SETCURSEL, selected, 0);
-            label(hwnd, "Google Cloud 密钥（可选，加密保存）", 228, 12, 196);
-            let google_key = control(
-                hwnd,
-                "EDIT",
-                &settings.google_key,
-                ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-                228,
-                34,
-                196,
-                24,
-                SETTINGS_GOOGLE_KEY,
-            );
-            label(hwnd, "Azure 翻译密钥（加密保存）", 16, 68, 196);
-            let azure_key = control(
-                hwnd,
-                "EDIT",
-                &settings.azure_key,
-                ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-                16,
-                90,
-                196,
-                24,
-                SETTINGS_AZURE_KEY,
-            );
-            label(hwnd, "Azure 区域（如 eastus，全局可留空）", 228, 68, 196);
-            let azure_region = control(
-                hwnd,
-                "EDIT",
-                &settings.azure_region,
-                ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-                228,
-                90,
-                196,
-                24,
-                SETTINGS_AZURE_REGION,
-            );
-            label(
-                hwnd,
-                "DeepL 密钥（加密保存；以 :fx 结尾为免费版，译文为美式英文）",
-                16,
-                124,
-                408,
-            );
-            let deepl_key = control(
-                hwnd,
-                "EDIT",
-                &settings.deepl_key,
-                ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-                16,
-                146,
-                196,
-                24,
-                SETTINGS_DEEPL_KEY,
-            );
-            let fallback = control(
-                hwnd,
-                "BUTTON",
-                "失败时允许改用其他翻译服务",
-                BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
-                228,
-                146,
-                196,
-                24,
-                SETTINGS_FALLBACK,
-            );
-            SendMessageW(fallback, BM_SETCHECK, settings.allow_fallback as usize, 0);
-            let flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
-            SetWindowPos(engine, HWND_TOP, 0, 0, 0, 0, flags);
-            SetWindowPos(google_key, engine, 0, 0, 0, 0, flags);
-            SetWindowPos(azure_key, google_key, 0, 0, 0, 0, flags);
-            SetWindowPos(azure_region, azure_key, 0, 0, 0, 0, flags);
-            SetWindowPos(deepl_key, azure_region, 0, 0, 0, 0, flags);
-            SetWindowPos(fallback, deepl_key, 0, 0, 0, 0, flags);
+            add_control(hwnd, "BUTTON", "取消", WS_TABSTOP, ID_CANCEL);
+
+            apply_child_font(hwnd, font);
+            let layout = SettingsLayout::compute(font, dpi, None);
+            state.settings_min.set((layout.min_w, layout.min_h));
+            size_settings_to_layout(hwnd, state, &layout);
             0
         },
+        WM_SIZE => {
+            if let Some(state) = unsafe { state_of(owner) }
+                && !state.settings_font.get().is_null()
+                && w != SIZE_MINIMIZED as usize
+            {
+                relayout_settings(hwnd, state);
+            }
+            0
+        }
+        WM_GETMINMAXINFO => {
+            if let Some(state) = unsafe { state_of(owner) } {
+                let (min_cw, min_ch) = state.settings_min.get();
+                if min_cw > 0 {
+                    let dpi = window_dpi(hwnd);
+                    let work = work_area(hwnd);
+                    let (min_ww, min_wh) = window_size_for_client(min_cw, min_ch, dpi);
+                    let floor_h = window_size_for_client(min_cw, scale_px(360, dpi), dpi).1;
+                    let info = l as *mut MINMAXINFO;
+                    unsafe {
+                        (*info).ptMinTrackSize.x = min_ww;
+                        (*info).ptMinTrackSize.y = floor_h.min(min_wh).min(work.bottom - work.top);
+                        (*info).ptMaxTrackSize.x = work.right - work.left;
+                        (*info).ptMaxTrackSize.y = work.bottom - work.top;
+                    }
+                }
+            }
+            0
+        }
+        WM_DPICHANGED => {
+            if let Some(state) = unsafe { state_of(owner) } {
+                let dpi = ((w >> 16) as u32).max(96);
+                let suggested = unsafe { &*(l as *const RECT) };
+                let font = settings_dialog_font(dpi);
+                let previous = state.settings_font.replace(font);
+                if !previous.is_null() {
+                    unsafe { DeleteObject(previous as _) };
+                }
+                apply_child_font(hwnd, font);
+                state.settings_dpi.set(dpi);
+                let preferred = SettingsLayout::compute(font, dpi, None);
+                state.settings_min.set((preferred.min_w, preferred.min_h));
+                let (need_w, need_h) =
+                    window_size_for_client(preferred.min_w, preferred.min_h, dpi);
+                let work = work_area(hwnd);
+                let width = (suggested.right - suggested.left)
+                    .max(need_w)
+                    .min(work.right - work.left);
+                let height = (suggested.bottom - suggested.top)
+                    .max(need_h.min(work.bottom - work.top))
+                    .min(work.bottom - work.top);
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        null_mut(),
+                        suggested.left,
+                        suggested.top,
+                        width,
+                        height,
+                        SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+                relayout_settings(hwnd, state);
+            }
+            0
+        }
+        WM_VSCROLL => {
+            if let Some(state) = unsafe { state_of(owner) } {
+                let mut client = RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                };
+                unsafe {
+                    GetClientRect(hwnd, &mut client);
+                }
+                let content_h = state.settings_min.get().1;
+                let max_scroll = (content_h - client.bottom).max(0);
+                let code = (w & 0xffff) as i32;
+                let pos = ((w >> 16) & 0xffff) as i16 as i32;
+                let line = scale_px(24, window_dpi(hwnd));
+                let page = (client.bottom - line).max(line);
+                let current = state.settings_scroll.get();
+                let next = match code {
+                    SB_LINEUP => current - line,
+                    SB_LINEDOWN => current + line,
+                    SB_PAGEUP => current - page,
+                    SB_PAGEDOWN => current + page,
+                    SB_THUMBTRACK | SB_THUMBPOSITION => pos,
+                    SB_TOP => 0,
+                    SB_BOTTOM => max_scroll,
+                    _ => current,
+                }
+                .clamp(0, max_scroll);
+                if next != current {
+                    state.settings_scroll.set(next);
+                    relayout_settings(hwnd, state);
+                }
+            }
+            0
+        }
+        WM_MOUSEWHEEL => {
+            if let Some(state) = unsafe { state_of(owner) } {
+                let delta = ((w >> 16) & 0xffff) as i16 as i32;
+                let line = scale_px(24, window_dpi(hwnd));
+                let next = state.settings_scroll.get() - delta * line / 120;
+                state.settings_scroll.set(next);
+                relayout_settings(hwnd, state);
+            }
+            0
+        }
         WM_COMMAND => unsafe {
             match (w & 0xffff) as i32 {
                 ID_OK => {
@@ -641,6 +1121,11 @@ pub(super) unsafe extern "system" fn settings_proc(
         WM_DESTROY => unsafe {
             if let Some(state) = state_of(owner) {
                 state.settings_window.set(null_mut());
+                let font = state.settings_font.replace(null_mut());
+                if !font.is_null() {
+                    DeleteObject(font as _);
+                }
+                state.settings_scroll.set(0);
                 if IsWindowVisible(owner) != 0 {
                     SetForegroundWindow(owner);
                     SetFocus(state.edit);

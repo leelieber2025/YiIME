@@ -24,14 +24,14 @@ use windows_sys::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUNDSMALL, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, ClientToScreen, CreateFontW,
-    CreatePen, CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_GUI_FONT,
-    DT_CALCRECT, DT_EDITCONTROL, DT_NOPREFIX, DT_WORDBREAK, DeleteObject, DrawTextW, EndPaint,
-    FillRect, GetDC, GetMonitorInfoW, GetStockObject, GetTextExtentPoint32W, GetTextMetricsW,
-    HBRUSH, HDC, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MapWindowPoints,
-    MonitorFromPoint, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, ReleaseDC, RoundRect,
-    SelectObject, SetBkColor, SetBkMode, SetTextColor, SetWindowRgn, TEXTMETRICW, TRANSPARENT,
-    TextOutW,
+    BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, ClientToScreen,
+    CreateFontIndirectW, CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush,
+    DEFAULT_CHARSET, DEFAULT_GUI_FONT, DT_CALCRECT, DT_EDITCONTROL, DT_NOPREFIX, DT_WORDBREAK,
+    DeleteObject, DrawTextW, EndPaint, FillRect, GetDC, GetMonitorInfoW, GetStockObject,
+    GetTextExtentPoint32W, GetTextMetricsW, HBRUSH, HDC, HFONT, InvalidateRect,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, MonitorFromWindow, NULL_BRUSH,
+    OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, ReleaseDC, RoundRect, SelectObject, SetBkColor,
+    SetBkMode, SetTextColor, SetWindowRgn, TEXTMETRICW, TRANSPARENT, TextOutW,
 };
 use windows_sys::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
@@ -50,11 +50,11 @@ use windows_sys::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
 use windows_sys::Win32::UI::Controls::{
-    EM_GETSEL, EM_LIMITTEXT, EM_REPLACESEL, EM_SCROLLCARET, EM_SETSEL,
+    EM_GETSEL, EM_LIMITTEXT, EM_REPLACESEL, EM_SCROLLCARET, EM_SETSEL, SetScrollInfo, ShowScrollBar,
 };
 use windows_sys::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow,
-    SetProcessDpiAwarenessContext,
+    AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem,
+    GetDpiForWindow, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::Input::Ime::ImmAssociateContextEx;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -110,11 +110,21 @@ const OPTION_BOXES: [(i32, &str, Flag); 12] = [
     (229, "拼音优先（关闭五笔顶字）", Flag::PinyinFirst),
     (230, "只显示常用字（隐藏生僻字）", Flag::CommonOnly),
 ];
-/// Height of the input-scheme row (Wubi + pinyin / Shuangpin layouts, dictionary import) below
-/// the switches.
-const SCHEME_ROW: i32 = 34;
-/// Each extra row of switches moves the controls below it down.
-const OPTION_SHIFT: i32 = (OPTION_BOXES.len() as i32 + 1) / 2 * 26 - 3 * 26 + SCHEME_ROW;
+/// Label control IDs in the settings window (unique so the layout can move them).
+const LBL_ENGINE: i32 = 240;
+const LBL_GOOGLE_KEY: i32 = 241;
+const LBL_AZURE_KEY: i32 = 242;
+const LBL_AZURE_REGION: i32 = 243;
+const LBL_DEEPL: i32 = 244;
+const LBL_URL: i32 = 245;
+const LBL_MODEL: i32 = 246;
+const LBL_KEY: i32 = 247;
+const LBL_STYLE: i32 = 248;
+const LBL_CUSTOM: i32 = 249;
+const LBL_HOTKEY: i32 = 250;
+const LBL_PAGE_SIZE: i32 = 251;
+const LBL_SCHEME: i32 = 252;
+const LBL_HISTORY_KEY: i32 = 253;
 const ID_OK: i32 = 1;
 const ID_CANCEL: i32 = 2;
 const TRAY_SETTINGS: usize = 1;
@@ -242,9 +252,8 @@ const SETTINGS_DEEPL_KEY: i32 = 228;
 const SETTINGS_FALLBACK: i32 = 231;
 const SETTINGS_SCHEME: i32 = 232;
 const SETTINGS_IMPORT: i32 = 233;
-/// Height of the Translation Engine row at the top of the settings window; the other controls
-/// move down by this much.
-const ENGINE_SHIFT: i32 = 168;
+/// Message-font size used if `SPI_GETNONCLIENTMETRICS` is unavailable (12px at 96 DPI).
+const SETTINGS_FONT_PX: i32 = 12;
 /// Longest custom LLM instruction kept from the settings window, in characters.
 const MAX_CUSTOM_LEN: usize = 500;
 const PAD: i32 = 8;
@@ -310,6 +319,12 @@ struct State {
     status: RefCell<Option<(String, bool)>>,
     settings: RefCell<ApiSettings>,
     settings_window: Cell<HWND>,
+    /// Dialog font for the settings window (message font, scaled to the window DPI).
+    settings_font: Cell<HFONT>,
+    settings_dpi: Cell<u32>,
+    /// Minimum client size that fits every label (unscrolled content height).
+    settings_min: Cell<(i32, i32)>,
+    settings_scroll: Cell<i32>,
     /// Screen rectangle of the target's text cursor; the box is placed against it.
     anchor: Cell<RECT>,
     /// Cursor rectangle sent by the TSF DLL before activation.
@@ -892,11 +907,6 @@ unsafe fn control(
         }
     }
     child
-}
-unsafe fn label(parent: HWND, text: &str, x: i32, y: i32, w: i32) {
-    unsafe {
-        control(parent, "STATIC", text, 0, x, y, w, 22, 0);
-    }
 }
 unsafe fn send_unicode(text: &str) -> bool {
     let mut events = Vec::new();
@@ -1939,11 +1949,15 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     if !(*ptr).tsf_receiver.get().is_null() && !(*ptr).finished.get() {
                         send_tsf_text((*ptr).tsf_receiver.get(), hwnd, "");
                     }
-                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-                    let state = Box::from_raw(ptr);
-                    let settings = state.settings_window.get();
+                    let settings = (*ptr).settings_window.get();
                     if !settings.is_null() {
                         DestroyWindow(settings);
+                    }
+                    SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                    let state = Box::from_raw(ptr);
+                    let settings_font = state.settings_font.get();
+                    if !settings_font.is_null() {
+                        DeleteObject(settings_font as _);
                     }
                     DeleteObject(state.font.get() as _);
                     DeleteObject(state.small_font.get() as _);
@@ -2032,6 +2046,10 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
             status: RefCell::new(None),
             settings: RefCell::new(load_settings()),
             settings_window: Cell::new(null_mut()),
+            settings_font: Cell::new(null_mut()),
+            settings_dpi: Cell::new(0),
+            settings_min: Cell::new((0, 0)),
+            settings_scroll: Cell::new(0),
             anchor: Cell::new(caret_of(target)),
             pending_anchor: Cell::new(None),
             target: Cell::new(target),
