@@ -859,7 +859,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "yiime-app"
-version = "0.2.1"
+version = "0.2.1-rc.1"
 dependencies = [
  "embed-resource",
  "windows-sys 0.61.2",
@@ -868,14 +868,14 @@ dependencies = [
 
 [[package]]
 name = "yiime-cli"
-version = "0.2.1"
+version = "0.2.1-rc.1"
 dependencies = [
  "yiime-core",
 ]
 
 [[package]]
 name = "yiime-core"
-version = "0.2.1"
+version = "0.2.1-rc.1"
 dependencies = [
  "serde_json",
  "ureq",
@@ -884,7 +884,7 @@ dependencies = [
 
 [[package]]
 name = "yiime-ffi"
-version = "0.2.1"
+version = "0.2.1-rc.1"
 dependencies = [
  "serde_json",
  "yiime-core",
@@ -892,7 +892,7 @@ dependencies = [
 
 [[package]]
 name = "yiime-tsf"
-version = "0.2.1"
+version = "0.2.1-rc.1"
 dependencies = [
  "embed-resource",
  "windows",
