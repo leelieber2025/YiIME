@@ -67,6 +67,68 @@ unsafe fn work_area(anchor: RECT) -> RECT {
         }
     }
 }
+
+/// Match the inline candidate bar: DWM small rounded corners, or a region fallback.
+fn apply_window_shape(hwnd: HWND, width: i32, height: i32) {
+    let preference = DWMWCP_ROUNDSMALL;
+    let rounded = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            &preference as *const _ as _,
+            std::mem::size_of_val(&preference) as u32,
+        )
+    } >= 0;
+    if !rounded && width > 0 && height > 0 {
+        let region = unsafe { CreateRoundRectRgn(0, 0, width, height, 8, 8) };
+        if !region.is_null() {
+            unsafe {
+                SetWindowRgn(hwnd, region, 1);
+            }
+        }
+    }
+}
+fn fill_round(hdc: HDC, rect: RECT, color: u32, radius: i32) {
+    let brush = unsafe { CreateSolidBrush(color) };
+    let pen = unsafe { CreatePen(PS_SOLID, 1, color) };
+    let old_brush = unsafe { SelectObject(hdc, brush as _) };
+    let old_pen = unsafe { SelectObject(hdc, pen as _) };
+    unsafe {
+        RoundRect(
+            hdc,
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            radius,
+            radius,
+        );
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
+        DeleteObject(brush as _);
+        DeleteObject(pen as _);
+    }
+}
+fn stroke_border(hdc: HDC, client: RECT, color: u32, radius: i32) {
+    let pen = unsafe { CreatePen(PS_SOLID, 1, color) };
+    let old_pen = unsafe { SelectObject(hdc, pen as _) };
+    let old_brush = unsafe { SelectObject(hdc, GetStockObject(NULL_BRUSH)) };
+    unsafe {
+        RoundRect(
+            hdc,
+            client.left,
+            client.top,
+            client.right,
+            client.bottom,
+            radius,
+            radius,
+        );
+        SelectObject(hdc, old_pen);
+        SelectObject(hdc, old_brush);
+        DeleteObject(pen as _);
+    }
+}
+
 /// Resizes and repositions the box for the draft, code and candidates.
 pub(super) unsafe fn relayout(hwnd: HWND, state: &State) {
     let draft = unsafe { get_text(state.edit) };
@@ -85,7 +147,7 @@ pub(super) unsafe fn relayout(hwnd: HWND, state: &State) {
             .enumerate()
             .map(|(index, candidate)| {
                 (
-                    format!("{}.{}", index + 1, candidate.text),
+                    format!("{} {}", index + 1, candidate.text),
                     composition.hint(candidate),
                 )
             })
@@ -95,14 +157,14 @@ pub(super) unsafe fn relayout(hwnd: HWND, state: &State) {
             if !hint.is_empty() {
                 unsafe {
                     SelectObject(hdc, state.small_font as _);
-                    w += text_width(hdc, &hint) + 1;
+                    w += text_width(hdc, &hint) + 2;
                     SelectObject(hdc, state.font as _);
                 }
             }
             composition.hits.push((x, x + w));
             x += w + GAP;
         }
-        width = width.max(x + PAD);
+        width = width.max(x + PAD + 4);
         let code = unsafe { text_width(hdc, &composition.code) };
         unsafe {
             SelectObject(hdc, state.small_font as _);
@@ -163,6 +225,7 @@ pub(super) unsafe fn relayout(hwnd: HWND, state: &State) {
     let (x, y) = unsafe { place(state.anchor.get(), width, height) };
     unsafe {
         SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
+        apply_window_shape(hwnd, width, height);
         MoveWindow(state.edit, PAD, PAD, edit_w, draft_h, 1);
         // Keep the caret visible (scroll to it when the draft exceeds the maximum lines).
         SendMessageW(state.edit, EM_SCROLLCARET, 0, 0);
@@ -175,7 +238,9 @@ pub(super) unsafe fn paint(hwnd: HWND, state: &State) {
     let mut client = RECT::default();
     unsafe {
         GetClientRect(hwnd, &mut client);
-        FillRect(hdc, &client, GetStockObject(WHITE_BRUSH) as _);
+        let bg = CreateSolidBrush(BACKGROUND);
+        FillRect(hdc, &client, bg);
+        DeleteObject(bg as _);
         let separator = CreateSolidBrush(SEPARATOR);
         let line = RECT {
             left: PAD,
@@ -202,29 +267,36 @@ pub(super) unsafe fn paint(hwnd: HWND, state: &State) {
             .enumerate()
         {
             if index == 0 {
-                let highlight = unsafe { CreateSolidBrush(HIGHLIGHT) };
                 let rect = RECT {
-                    left: left - 3,
+                    left: left - 4,
                     top: row,
-                    right: right + 3,
+                    right: right + 4,
                     bottom: row + LINE_H - 2,
                 };
                 unsafe {
-                    FillRect(hdc, &rect, highlight);
-                    DeleteObject(highlight as _);
+                    fill_round(hdc, rect, HIGHLIGHT, 4);
+                    let accent = CreateSolidBrush(ACCENT);
+                    let bar = RECT {
+                        left: rect.left + 1,
+                        top: rect.top + 3,
+                        right: rect.left + 3,
+                        bottom: rect.bottom - 3,
+                    };
+                    FillRect(hdc, &bar, accent);
+                    DeleteObject(accent as _);
                 }
             }
-            let color = if candidate.complete { INK } else { GRAY };
-            let label = format!("{}.{}", index + 1, candidate.text);
+            let color = if candidate.complete { INK } else { MUTED };
+            let label = format!("{} {}", index + 1, candidate.text);
             unsafe {
                 draw_text(hdc, left, row + 2, color, &label);
             }
             let hint = composition.hint(candidate);
             if !hint.is_empty() {
                 unsafe {
-                    let x = left + text_width(hdc, &label) + 1;
+                    let x = left + text_width(hdc, &label) + 2;
                     let previous = SelectObject(hdc, state.small_font as _);
-                    draw_text(hdc, x, row + 6, GRAY, &hint);
+                    draw_text(hdc, x, row + 5, MUTED, &hint);
                     SelectObject(hdc, previous);
                 }
             }
@@ -234,15 +306,16 @@ pub(super) unsafe fn paint(hwnd: HWND, state: &State) {
                 SelectObject(hdc, state.small_font as _);
                 let label = composition.page_label();
                 let w = text_width(hdc, &label);
-                draw_text(hdc, client.right - PAD - w, top + 5, GRAY, &label);
+                draw_text(hdc, client.right - PAD - w, top + 5, MUTED, &label);
             }
         }
     } else {
+        // Enter translates, Shift+Enter commits Chinese; errors stay on this red status line.
         let status = state.status.borrow();
         let (text, color) = match status.as_ref() {
             Some((text, true)) => (text.as_str(), RED),
             Some((text, false)) => (text.as_str(), BLUE),
-            None => (hint(state), GRAY),
+            None => (hint(state), MUTED),
         };
         unsafe {
             SelectObject(hdc, state.small_font as _);
@@ -251,6 +324,7 @@ pub(super) unsafe fn paint(hwnd: HWND, state: &State) {
     }
     unsafe {
         SelectObject(hdc, old);
+        stroke_border(hdc, client, BORDER, 8);
         EndPaint(hwnd, &paint);
     }
 }

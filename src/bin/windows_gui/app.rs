@@ -20,14 +20,18 @@ use std::sync::{Arc, OnceLock};
 use tray::{add_tray, tray_data, tray_menu, update_tray_tip};
 use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows_sys::Win32::Graphics::Dwm::{
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUNDSMALL, DwmSetWindowAttribute,
+};
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, ClientToScreen, CreateFontW,
-    CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DT_CALCRECT, DT_EDITCONTROL, DT_NOPREFIX,
-    DT_WORDBREAK, DeleteObject, DrawTextW, EndPaint, FillRect, GetDC, GetMonitorInfoW,
-    GetStockObject, GetTextExtentPoint32W, GetTextMetricsW, HDC, HFONT, InvalidateRect,
-    MONITOR_DEFAULTTONEAREST, MONITORINFO, MapWindowPoints, MonitorFromPoint, OUT_DEFAULT_PRECIS,
-    PAINTSTRUCT, ReleaseDC, SelectObject, SetBkMode, SetTextColor, TEXTMETRICW, TRANSPARENT,
-    TextOutW, WHITE_BRUSH,
+    CreatePen, CreateRoundRectRgn, CreateSolidBrush, DEFAULT_CHARSET, DEFAULT_GUI_FONT,
+    DT_CALCRECT, DT_EDITCONTROL, DT_NOPREFIX, DT_WORDBREAK, DeleteObject, DrawTextW, EndPaint,
+    FillRect, GetDC, GetMonitorInfoW, GetStockObject, GetTextExtentPoint32W, GetTextMetricsW,
+    HBRUSH, HDC, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MapWindowPoints,
+    MonitorFromPoint, NULL_BRUSH, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, ReleaseDC, RoundRect,
+    SelectObject, SetBkColor, SetBkMode, SetTextColor, SetWindowRgn, TEXTMETRICW, TRANSPARENT,
+    TextOutW,
 };
 use windows_sys::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
@@ -239,11 +243,11 @@ const SETTINGS_IMPORT: i32 = 233;
 const ENGINE_SHIFT: i32 = 168;
 /// Longest custom LLM instruction kept from the settings window, in characters.
 const MAX_CUSTOM_LEN: usize = 500;
-const PAD: i32 = 6;
-const EDIT_H: i32 = 26;
-const LINE_H: i32 = 24;
-const GAP: i32 = 14;
-const MIN_W: i32 = 340;
+const PAD: i32 = 8;
+const EDIT_H: i32 = 22;
+const LINE_H: i32 = 22;
+const GAP: i32 = 16;
+const MIN_W: i32 = 280;
 /// Widest candidate bar (fits 9 candidates with Wubi hints).
 const MAX_W: i32 = 1000;
 /// Drafts wrap beyond this width and then grow only in height.
@@ -255,10 +259,13 @@ const ENGLISH_HINT: &str = "[英] 字母原样输入 · 单击 Shift 回中文 �
 const PLAIN_HINT: &str = "普通五笔模式 · 空格/数字 选字上屏 · Enter 上屏字母 · Esc 取消";
 // COLORREF is 0x00BBGGRR.
 const BLUE: u32 = 0x00C0_6000;
-const GRAY: u32 = 0x0080_8080;
+const MUTED: u32 = 0x0070_7070;
 const RED: u32 = 0x0000_00C0;
 const INK: u32 = 0x0020_2020;
-const HIGHLIGHT: u32 = 0x00FB_E9D6;
+const HIGHLIGHT: u32 = 0x00EB_EBEB;
+const ACCENT: u32 = 0x005C_5C5C;
+const BACKGROUND: u32 = 0x00F7_F7F7;
+const BORDER: u32 = 0x00D8_D8D8;
 const SEPARATOR: u32 = 0x00E0_E0E0;
 
 /// Input-box state: composition lives in the core (`yiime_core::Composer`); this adds the
@@ -288,6 +295,8 @@ struct State {
     edit: HWND,
     font: HFONT,
     small_font: HFONT,
+    /// Fill for the box and the draft edit (Win11 light gray).
+    bg_brush: HBRUSH,
     /// Current draft height (grows with multi-line content).
     draft_h: Cell<i32>,
     composition: RefCell<Composition>,
@@ -1484,6 +1493,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
     }
     match msg {
         WM_CREATE => unsafe { create(hwnd) },
+        WM_CTLCOLOREDIT | WM_CTLCOLORSTATIC => {
+            if let Some(state) = state {
+                let hdc = w as HDC;
+                unsafe {
+                    SetBkColor(hdc, BACKGROUND);
+                    SetTextColor(hdc, INK);
+                }
+                state.bg_brush as LRESULT
+            } else {
+                unsafe { DefWindowProcW(hwnd, msg, w, l) }
+            }
+        }
         WM_PAINT => {
             if let Some(state) = state {
                 unsafe {
@@ -1904,6 +1925,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     }
                     DeleteObject(state.font as _);
                     DeleteObject(state.small_font as _);
+                    DeleteObject(state.bg_brush as _);
                 }
                 PostQuitMessage(0);
             }
@@ -1950,8 +1972,9 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
         std::thread::spawn(move || warm.warm_up());
     }
     unsafe {
-        let font = create_font(18);
-        let small_font = create_font(13);
+        // Same 14/11 YaHei sizes as the inline candidate bar (document-like, compact).
+        let font = create_font(14);
+        let small_font = create_font(11);
         let edit = CreateWindowExW(
             0,
             wide("EDIT").as_ptr(),
@@ -1980,6 +2003,7 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
             edit,
             font,
             small_font,
+            bg_brush: CreateSolidBrush(BACKGROUND),
             draft_h: Cell::new(EDIT_H),
             composition: RefCell::new(Composition::default()),
             status: RefCell::new(None),
@@ -2186,7 +2210,7 @@ pub fn run() {
                 TRAY_TITLE.to_owned()
             })
             .as_ptr(),
-            WS_POPUP | WS_BORDER,
+            WS_POPUP,
             0,
             0,
             MIN_W,
