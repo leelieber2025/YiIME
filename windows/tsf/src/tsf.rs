@@ -55,7 +55,8 @@ use windows_sys::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromPoint,
+    ClientToScreen, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, MONITORINFO,
+    MonitorFromPoint,
 };
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringW;
@@ -68,13 +69,13 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    ES_PASSWORD, GA_ROOT, GWL_STYLE, GWLP_USERDATA, GetAncestor, GetClassNameW,
-    GetForegroundWindow, GetSystemMetrics, GetWindowLongPtrW, GetWindowLongW,
-    GetWindowThreadProcessId, HWND_MESSAGE, HWND_TOPMOST, IMAGE_ICON, IsChild, IsWindow, KillTimer,
-    LoadImageW, PostMessageW, RegisterClassW, SM_CXSMICON, SMTO_ABORTIFHUNG, SW_HIDE,
-    SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageTimeoutW, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, WM_APP, WM_COPYDATA, WM_CREATE, WM_TIMER, WNDCLASSW, WS_BORDER, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    ES_PASSWORD, GA_ROOT, GUITHREADINFO, GWL_STYLE, GWLP_USERDATA, GetAncestor, GetClassNameW,
+    GetCursorPos, GetForegroundWindow, GetGUIThreadInfo, GetSystemMetrics, GetWindowLongPtrW,
+    GetWindowLongW, GetWindowThreadProcessId, HWND_MESSAGE, HWND_TOPMOST, IMAGE_ICON, IsChild,
+    IsWindow, KillTimer, LoadImageW, PostMessageW, RegisterClassW, SM_CXSMICON, SMTO_ABORTIFHUNG,
+    SW_HIDE, SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageTimeoutW, SetTimer, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, WM_APP, WM_COPYDATA, WM_CREATE, WM_TIMER, WNDCLASSW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, FindWindowExW, FindWindowW, MF_CHECKED,
@@ -432,10 +433,65 @@ fn rect_of([left, top, right, bottom]: [i32; 4]) -> RECT {
         bottom,
     }
 }
+/// System caret of the focused thread, else the mouse, as a last resort when GetTextExt is empty.
+fn screen_caret() -> Option<RECT> {
+    let hwnd = unsafe { GetFocus() };
+    let hwnd = if hwnd.is_null() {
+        unsafe { GetForegroundWindow() }
+    } else {
+        hwnd
+    };
+    let thread = if hwnd.is_null() {
+        0
+    } else {
+        unsafe { GetWindowThreadProcessId(hwnd, null_mut()) }
+    };
+    let mut info: GUITHREADINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+    if thread != 0
+        && unsafe { GetGUIThreadInfo(thread, &mut info) } != 0
+        && !info.hwndCaret.is_null()
+    {
+        let mut top_left = POINT {
+            x: info.rcCaret.left,
+            y: info.rcCaret.top,
+        };
+        let mut bottom_right = POINT {
+            x: info.rcCaret.right,
+            y: info.rcCaret.bottom,
+        };
+        unsafe {
+            ClientToScreen(info.hwndCaret, &mut top_left);
+            ClientToScreen(info.hwndCaret, &mut bottom_right);
+        }
+        if bottom_right.y > top_left.y {
+            return Some(RECT {
+                left: top_left.x,
+                top: top_left.y,
+                right: bottom_right.x,
+                bottom: bottom_right.y,
+            });
+        }
+    }
+    let mut point = POINT { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut point) } != 0 {
+        let height = LINE_HEIGHT.load(Ordering::Relaxed).max(20);
+        return Some(RECT {
+            left: point.x,
+            top: point.y,
+            right: point.x + 1,
+            bottom: point.y + height,
+        });
+    }
+    None
+}
+
 #[implement(ITfEditSession)]
 struct CaretQuery {
     context: ITfContext,
     result: Rc<Cell<yiime_core::SegmentAnchor>>,
+    /// Survives SegmentAnchor::begin, so a later session can fall back to this rectangle.
+    last: Rc<Cell<Option<[i32; 4]>>>,
     ticket: u32,
     receiver: usize,
 }
@@ -487,6 +543,7 @@ impl ITfEditSession_Impl for CaretQuery_Impl {
                 return Ok(());
             }
             self.result.set(current);
+            self.last.set(Some(anchor));
             unsafe {
                 PostMessageW(self.receiver as HWND, WM_CARET_READ, 0, 0);
             }
@@ -884,6 +941,8 @@ struct TextService {
     last_commit: Cell<Option<(u32, std::time::Instant)>>,
     /// Last good caret rectangle (shared with the asynchronous CaretQuery).
     caret: Rc<Cell<yiime_core::SegmentAnchor>>,
+    /// Last GetTextExt rectangle kept after a new session clears [`Self::caret`].
+    last_caret: Rc<Cell<Option<[i32; 4]>>>,
     /// A rectangle arrived while the box was starting; sent once it is ready.
     caret_fresh: Cell<bool>,
     held_id: Cell<u64>,
@@ -939,6 +998,7 @@ impl TextService {
             pass_logged: Cell::new(None),
             last_commit: Cell::new(None),
             caret: Rc::new(Cell::new(yiime_core::SegmentAnchor::default())),
+            last_caret: Rc::new(Cell::new(None)),
             caret_fresh: Cell::new(false),
             held_id: Cell::new(0),
             next_held: Cell::new(0),
@@ -1107,9 +1167,10 @@ impl TextService {
     }
     /// The insertion point's screen rectangle for the box. Read without TF_ES_SYNC (Word may
     /// refuse synchronous sessions on the key path, SampleIME KeyHandler.cpp): TSF runs the read
-    /// now when it can, else later, and the box is moved when it arrives (WM_CARET_READ). Until
-    /// then the box places itself (system caret, else mouse): a new session does not reuse the
-    /// previous one's rectangle (see [`yiime_core::SegmentAnchor`]).
+    /// now when it can, else later, and the box is moved when it arrives (WM_CARET_READ). If
+    /// GetTextExt is empty or still pending, fall back to the last caret rectangle (same as the
+    /// candidate window), then the system caret or mouse, so the box opens under the caret
+    /// instead of at a stale or far-away position.
     fn caret_rect(&self, context: &ITfContext) -> Option<RECT> {
         self.caret_fresh.set(false);
         let mut anchor = self.caret.get();
@@ -1118,6 +1179,7 @@ impl TextService {
         let session: ITfEditSession = CaretQuery {
             context: context.clone(),
             result: self.caret.clone(),
+            last: self.last_caret.clone(),
             ticket,
             receiver: self.receiver.get() as usize,
         }
@@ -1129,7 +1191,27 @@ impl TextService {
                 TF_ES_ASYNCDONTCARE | TF_ES_READ,
             )
         };
-        self.caret.get().rect().map(rect_of)
+        if let Some(rect) = self.caret.get().rect().map(rect_of) {
+            return Some(rect);
+        }
+        if let Some(rect) = self.last_caret.get() {
+            log("草稿框：光标矩形尚未读到，使用上次位置");
+            return Some(rect_of(rect));
+        }
+        if let Some((x, top, bottom)) = self.inline.last_caret() {
+            log("草稿框：光标矩形尚未读到，使用组字光标");
+            return Some(RECT {
+                left: x,
+                top,
+                right: x,
+                bottom,
+            });
+        }
+        if let Some(rect) = screen_caret() {
+            log("草稿框：光标矩形尚未读到，使用系统光标或鼠标位置");
+            return Some(rect);
+        }
+        None
     }
     /// A caret rectangle read asynchronously arrived: move the open box there.
     fn caret_arrived(&self) {

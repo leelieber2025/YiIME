@@ -2,11 +2,15 @@ use super::*;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use windows_sys::Win32::Foundation::SIZE;
+use windows_sys::Win32::Graphics::Dwm::{
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUNDSMALL, DwmSetWindowAttribute,
+};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush,
-    DEFAULT_CHARSET, DeleteObject, EndPaint, FillRect, GetDC, GetStockObject,
-    GetTextExtentPoint32W, HFONT, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, ReleaseDC,
-    SelectObject, SetBkMode, SetTextColor, TRANSPARENT, TextOutW, WHITE_BRUSH,
+    BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreatePen, CreateRoundRectRgn,
+    CreateSolidBrush, DEFAULT_CHARSET, DeleteObject, EndPaint, FillRect, GetDC, GetStockObject,
+    GetTextExtentPoint32W, GetTextMetricsW, HFONT, InvalidateRect, NULL_BRUSH, OUT_DEFAULT_PRECIS,
+    PAINTSTRUCT, PS_SOLID, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor,
+    SetWindowRgn, TEXTMETRICW, TRANSPARENT, TextOutW, WHITE_BRUSH,
 };
 use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -16,17 +20,25 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 const CANDIDATE_GUID: GUID = GUID::from_u128(0xd39fb88b_09bb_4ca2_a050_174b5ab3b7c0);
 const CANDIDATE_CLASS: &str = "YiIMECandidate";
-// Same palette and metrics as the draft box (windows_gui/app.rs and candidate.rs).
-const BLUE: u32 = 0x00C0_6000;
-const GRAY: u32 = 0x0080_8080;
+// Compact Microsoft Wubi (Win11) palette: light bar, gray pill, dark text, small gray hints.
 const INK: u32 = 0x0020_2020;
-const HIGHLIGHT: u32 = 0x00FB_E9D6;
-const SEPARATOR: u32 = 0x00E0_E0E0;
-const FONT_PX: i32 = 18;
-const SMALL_FONT_PX: i32 = 13;
-const PAD: i32 = 6;
-const LINE_H: i32 = 24;
-const GAP: i32 = 14;
+const MUTED: u32 = 0x0070_7070;
+const GRAY: u32 = 0x0080_8080;
+const DISABLED: u32 = 0x00B0_B0B0;
+const HIGHLIGHT: u32 = 0x00EB_EBEB;
+const ACCENT: u32 = 0x005C_5C5C;
+const BACKGROUND: u32 = 0x00F7_F7F7;
+const BORDER: u32 = 0x00D8_D8D8;
+const DIVIDER: u32 = 0x00E0_E0E0;
+const FONT_PX: i32 = 14;
+const SMALL_FONT_PX: i32 = 11;
+const PAD_X: i32 = 8;
+const PAD_Y: i32 = 4;
+const ITEM_GAP: i32 = 16;
+const NUM_GAP: i32 = 4;
+const HINT_GAP: i32 = 2;
+const PILL_PAD_X: i32 = 5;
+const TRAIL_SLOT: i32 = 18;
 static DICTIONARY: DictionaryLock<yiime_core::MixedInput> = DictionaryLock::new();
 static USER_WORDS: Mutex<Option<yiime_core::UserWordsReloader>> = Mutex::new(None);
 
@@ -39,6 +51,7 @@ struct DisplayCandidate {
 struct CandidateView {
     code: String,
     rows: Vec<DisplayCandidate>,
+    page: usize,
 }
 
 fn user_words_path() -> Option<PathBuf> {
@@ -130,7 +143,7 @@ fn candidates(code: &str) -> Vec<DisplayCandidate> {
         None => Vec::new(),
         Some(lookup) => input.candidates_filtered(
             lookup,
-            size,
+            size * yiime_core::CANDIDATE_PAGES,
             size,
             fuzzy,
             pinyin_first,
@@ -172,6 +185,25 @@ fn candidates(code: &str) -> Vec<DisplayCandidate> {
             }
         })
         .collect()
+}
+
+fn page_len() -> usize {
+    page_size().max(1)
+}
+
+fn page_count(total: usize) -> usize {
+    total.div_ceil(page_len()).max(1)
+}
+
+fn page_items(view: &CandidateView) -> &[DisplayCandidate] {
+    let size = page_len();
+    let start = view.page.saturating_mul(size);
+    let end = (start + size).min(view.rows.len());
+    if start >= view.rows.len() {
+        &[]
+    } else {
+        &view.rows[start..end]
+    }
 }
 
 fn window_dpi(hwnd: HWND) -> u32 {
@@ -237,37 +269,123 @@ unsafe fn draw_text(
     }
 }
 
-/// Client size for the current candidates, matching the draft box row layout.
+struct BarLayout {
+    width: i32,
+    height: i32,
+    text_y: i32,
+    hint_y: i32,
+    pill_top: i32,
+    pill_bottom: i32,
+    items: Vec<(i32, i32)>,
+    divider_x: i32,
+    prev_x: i32,
+    next_x: i32,
+    icon_x: i32,
+    radius: i32,
+}
+
+fn measure_fonts(
+    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+    font: HFONT,
+    small: HFONT,
+    dpi: u32,
+) -> (i32, i32, i32) {
+    let old = unsafe { SelectObject(hdc, font as _) };
+    let mut metrics: TEXTMETRICW = unsafe { std::mem::zeroed() };
+    unsafe { GetTextMetricsW(hdc, &mut metrics) };
+    let text_h = metrics.tmHeight.max(scale_px(FONT_PX, dpi));
+    unsafe { SelectObject(hdc, small as _) };
+    unsafe { GetTextMetricsW(hdc, &mut metrics) };
+    let small_h = metrics.tmHeight.max(scale_px(SMALL_FONT_PX, dpi));
+    unsafe { SelectObject(hdc, old) };
+    let pad_y = scale_px(PAD_Y, dpi);
+    (text_h, small_h, (text_h + 2 * pad_y).max(scale_px(24, dpi)))
+}
+
+fn item_width(
+    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+    font: HFONT,
+    small: HFONT,
+    index: usize,
+    row: &DisplayCandidate,
+    dpi: u32,
+) -> i32 {
+    let num = format!("{}", index + 1);
+    let num_gap = scale_px(NUM_GAP, dpi);
+    let hint_gap = scale_px(HINT_GAP, dpi);
+    unsafe { SelectObject(hdc, font as _) };
+    let mut w = unsafe { text_width(hdc, &num) } + num_gap + unsafe { text_width(hdc, &row.text) };
+    if !row.hint.is_empty() {
+        unsafe { SelectObject(hdc, small as _) };
+        w += hint_gap + unsafe { text_width(hdc, &row.hint) };
+        unsafe { SelectObject(hdc, font as _) };
+    }
+    w
+}
+
+fn layout_bar(
+    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+    font: HFONT,
+    small: HFONT,
+    view: &CandidateView,
+    dpi: u32,
+) -> BarLayout {
+    let (text_h, small_h, height) = measure_fonts(hdc, font, small, dpi);
+    let pad_x = scale_px(PAD_X, dpi);
+    let pad_y = scale_px(PAD_Y, dpi);
+    let gap = scale_px(ITEM_GAP, dpi);
+    let slot = scale_px(TRAIL_SLOT, dpi);
+    let radius = scale_px(8, dpi);
+    let text_y = (height - text_h) / 2;
+    let hint_y = (height - small_h) / 2 + scale_px(1, dpi);
+    let pill_top = pad_y.max(1);
+    let pill_bottom = height - pad_y.max(1);
+    let items_on_page = page_items(view);
+    let mut x = pad_x;
+    let mut items = Vec::new();
+    for (index, row) in items_on_page.iter().enumerate() {
+        let w = item_width(hdc, font, small, index, row, dpi);
+        items.push((x, w));
+        x += w + gap;
+    }
+    if items.is_empty() {
+        x += scale_px(24, dpi);
+    }
+    // divider + ◀ + ▶ + menu icon, as in the Win11 Wubi bar.
+    let divider_x = x - gap / 2 + scale_px(2, dpi);
+    x = divider_x + scale_px(8, dpi);
+    let prev_x = x;
+    x += slot;
+    let next_x = x;
+    x += slot;
+    let icon_x = x;
+    x += slot + pad_x;
+    BarLayout {
+        width: x.max(scale_px(80, dpi)),
+        height,
+        text_y,
+        hint_y,
+        pill_top,
+        pill_bottom,
+        items,
+        divider_x,
+        prev_x,
+        next_x,
+        icon_x,
+        radius,
+    }
+}
+
 fn measure_view(hwnd: HWND, view: &CandidateView) -> (i32, i32) {
     let dpi = window_dpi(hwnd);
-    let pad = scale_px(PAD, dpi);
-    let line_h = scale_px(LINE_H, dpi);
-    let gap = scale_px(GAP, dpi);
     let hdc = unsafe { GetDC(hwnd) };
     if hdc.is_null() {
-        let rows = 1 + i32::from(!view.rows.is_empty());
-        return (scale_px(200, dpi), pad + rows * line_h + pad);
+        return (scale_px(200, dpi), scale_px(26, dpi));
     }
     let font = unsafe { create_ui_font(scale_px(FONT_PX, dpi)) };
     let small = unsafe { create_ui_font(scale_px(SMALL_FONT_PX, dpi)) };
-    let old = unsafe { SelectObject(hdc, font as _) };
-    let mut width = unsafe { text_width(hdc, &view.code) } + 2 * pad;
-    let mut x = pad;
-    for (index, row) in view.rows.iter().enumerate() {
-        let label = format!("{}.{}", index + 1, row.text);
-        let mut w = unsafe { text_width(hdc, &label) };
-        if !row.hint.is_empty() {
-            unsafe { SelectObject(hdc, small as _) };
-            w += unsafe { text_width(hdc, &row.hint) } + 1;
-            unsafe { SelectObject(hdc, font as _) };
-        }
-        x += w + gap;
-    }
-    if !view.rows.is_empty() {
-        width = width.max(x + pad);
-    }
+    let layout = layout_bar(hdc, font, small, view, dpi);
     unsafe {
-        SelectObject(hdc, old);
         if !font.is_null() {
             DeleteObject(font as _);
         }
@@ -276,12 +394,53 @@ fn measure_view(hwnd: HWND, view: &CandidateView) -> (i32, i32) {
         }
         ReleaseDC(hwnd, hdc);
     }
-    let rows = 1 + i32::from(!view.rows.is_empty());
-    // +2 for the 1px separator under the code and the window border inset.
-    (
-        width.max(scale_px(120, dpi)) + 2,
-        pad + rows * line_h + pad + 2,
-    )
+    (layout.width, layout.height)
+}
+
+fn apply_window_shape(hwnd: HWND, width: i32, height: i32) {
+    let preference = DWMWCP_ROUNDSMALL;
+    let rounded = unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            &preference as *const _ as _,
+            std::mem::size_of_val(&preference) as u32,
+        )
+    } >= 0;
+    if !rounded && width > 0 && height > 0 {
+        let radius = scale_px(8, window_dpi(hwnd));
+        let region = unsafe { CreateRoundRectRgn(0, 0, width, height, radius, radius) };
+        if !region.is_null() {
+            unsafe { SetWindowRgn(hwnd, region, 1) };
+        }
+    }
+}
+
+fn fill_round(
+    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+    rect: windows_sys::Win32::Foundation::RECT,
+    color: u32,
+    radius: i32,
+) {
+    let brush = unsafe { CreateSolidBrush(color) };
+    let pen = unsafe { CreatePen(PS_SOLID, 1, color) };
+    let old_brush = unsafe { SelectObject(hdc, brush as _) };
+    let old_pen = unsafe { SelectObject(hdc, pen as _) };
+    unsafe {
+        RoundRect(
+            hdc,
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            radius,
+            radius,
+        )
+    };
+    unsafe { SelectObject(hdc, old_brush) };
+    unsafe { SelectObject(hdc, old_pen) };
+    unsafe { DeleteObject(brush as _) };
+    unsafe { DeleteObject(pen as _) };
 }
 
 fn log_hresult(action: &str, error: &windows::core::Error) {
@@ -359,6 +518,7 @@ struct Composition {
 struct CandidateElement {
     state: Rc<RefCell<Option<Composition>>>,
     shown: Rc<Cell<bool>>,
+    view: Rc<RefCell<CandidateView>>,
 }
 impl ITfUIElement_Impl for CandidateElement_Impl {
     fn GetDescription(&self) -> Result<BSTR> {
@@ -389,18 +549,13 @@ impl ITfCandidateListUIElement_Impl for CandidateElement_Impl {
         unsafe { state.as_ref().ok_or(E_FAIL)?.context.GetDocumentMgr() }
     }
     fn GetCount(&self) -> Result<u32> {
-        Ok(self
-            .state
-            .borrow()
-            .as_ref()
-            .map_or(0, |state| candidates(&state.code).len() as u32))
+        Ok(page_items(&self.view.borrow()).len() as u32)
     }
     fn GetSelection(&self) -> Result<u32> {
         Ok(0)
     }
     fn GetString(&self, index: u32) -> Result<BSTR> {
-        let state = self.state.borrow();
-        candidates(&state.as_ref().ok_or(E_FAIL)?.code)
+        page_items(&self.view.borrow())
             .get(index as usize)
             .map(|candidate| BSTR::from(candidate.text.as_str()))
             .ok_or(E_FAIL.into())
@@ -409,10 +564,13 @@ impl ITfCandidateListUIElement_Impl for CandidateElement_Impl {
         if count.is_null() || (size > 0 && index.is_null()) {
             return Err(E_FAIL.into());
         }
+        let pages = page_count(self.view.borrow().rows.len()) as u32;
+        let step = page_len() as u32;
         unsafe {
-            *count = u32::from(self.GetCount()? > 0);
-            if size > 0 {
-                *index = 0;
+            *count = pages;
+            let n = size.min(pages);
+            for i in 0..n {
+                *index.add(i as usize) = i * step;
             }
         }
         Ok(())
@@ -421,7 +579,7 @@ impl ITfCandidateListUIElement_Impl for CandidateElement_Impl {
         Ok(())
     }
     fn GetCurrentPage(&self) -> Result<u32> {
-        Ok(0)
+        Ok(self.view.borrow().page as u32)
     }
 }
 
@@ -786,70 +944,129 @@ fn paint_candidates(hwnd: HWND) {
         bottom: 0,
     };
     unsafe { GetClientRect(hwnd, &mut client) };
-    unsafe { FillRect(hdc, &client, GetStockObject(WHITE_BRUSH) as _) };
+    let background = unsafe { CreateSolidBrush(BACKGROUND) };
+    unsafe { FillRect(hdc, &client, background) };
+    unsafe { DeleteObject(background as _) };
     unsafe { SetBkMode(hdc, TRANSPARENT as i32) };
     let Some(view) = view.as_ref() else {
         unsafe { EndPaint(hwnd, &paint) };
         return;
     };
     let dpi = window_dpi(hwnd);
-    let pad = scale_px(PAD, dpi);
-    let line_h = scale_px(LINE_H, dpi);
-    let gap = scale_px(GAP, dpi);
     let font = unsafe { create_ui_font(scale_px(FONT_PX, dpi)) };
     let small = unsafe { create_ui_font(scale_px(SMALL_FONT_PX, dpi)) };
+    let layout = layout_bar(hdc, font, small, view, dpi);
     let old = unsafe { SelectObject(hdc, font as _) };
-    let separator = unsafe { CreateSolidBrush(SEPARATOR) };
-    let line = windows_sys::Win32::Foundation::RECT {
-        left: pad,
-        top: pad + line_h - 2,
-        right: client.right - pad,
-        bottom: pad + line_h - 1,
-    };
-    unsafe {
-        FillRect(hdc, &line, separator);
-        DeleteObject(separator as _);
-        draw_text(hdc, pad, pad + 2, BLUE, &view.code);
-    }
-    if !view.rows.is_empty() {
-        let row_top = pad + line_h;
-        let mut x = pad;
-        for (index, row) in view.rows.iter().enumerate() {
-            let label = format!("{}.{}", index + 1, row.text);
-            let mut w = unsafe { text_width(hdc, &label) };
-            if !row.hint.is_empty() {
-                unsafe { SelectObject(hdc, small as _) };
-                w += unsafe { text_width(hdc, &row.hint) } + 1;
-                unsafe { SelectObject(hdc, font as _) };
+    let items = page_items(view);
+    let num_gap = scale_px(NUM_GAP, dpi);
+    let hint_gap = scale_px(HINT_GAP, dpi);
+    let pill = scale_px(PILL_PAD_X, dpi);
+    let accent_w = scale_px(2, dpi).max(2);
+    let accent_inset = scale_px(3, dpi);
+    for (index, row) in items.iter().enumerate() {
+        let Some(&(x, w)) = layout.items.get(index) else {
+            break;
+        };
+        if index == 0 {
+            fill_round(
+                hdc,
+                windows_sys::Win32::Foundation::RECT {
+                    left: x - pill,
+                    top: layout.pill_top,
+                    right: x + w + pill,
+                    bottom: layout.pill_bottom,
+                },
+                HIGHLIGHT,
+                scale_px(4, dpi),
+            );
+            let accent = unsafe { CreateSolidBrush(ACCENT) };
+            let bar = windows_sys::Win32::Foundation::RECT {
+                left: x - pill,
+                top: layout.pill_top + accent_inset,
+                right: x - pill + accent_w,
+                bottom: layout.pill_bottom - accent_inset,
+            };
+            unsafe {
+                FillRect(hdc, &bar, accent);
+                DeleteObject(accent as _);
             }
-            if index == 0 {
-                let highlight = unsafe { CreateSolidBrush(HIGHLIGHT) };
-                let rect = windows_sys::Win32::Foundation::RECT {
-                    left: x - 3,
-                    top: row_top,
-                    right: x + w + 3,
-                    bottom: row_top + line_h - 2,
-                };
-                unsafe {
-                    FillRect(hdc, &rect, highlight);
-                    DeleteObject(highlight as _);
-                }
+        }
+        let number = format!("{}", index + 1);
+        unsafe { SelectObject(hdc, font as _) };
+        let num_w = unsafe { text_width(hdc, &number) };
+        unsafe { draw_text(hdc, x, layout.text_y, MUTED, &number) };
+        let text_x = x + num_w + num_gap;
+        let color = if row.complete { INK } else { GRAY };
+        unsafe { draw_text(hdc, text_x, layout.text_y, color, &row.text) };
+        if !row.hint.is_empty() {
+            let hx = text_x + unsafe { text_width(hdc, &row.text) } + hint_gap;
+            unsafe {
+                let previous = SelectObject(hdc, small as _);
+                draw_text(hdc, hx, layout.hint_y, GRAY, &row.hint);
+                SelectObject(hdc, previous);
             }
-            let color = if row.complete { INK } else { GRAY };
-            unsafe { draw_text(hdc, x, row_top + 2, color, &label) };
-            if !row.hint.is_empty() {
-                let hx = x + unsafe { text_width(hdc, &label) } + 1;
-                unsafe {
-                    let previous = SelectObject(hdc, small as _);
-                    draw_text(hdc, hx, row_top + 6, GRAY, &row.hint);
-                    SelectObject(hdc, previous);
-                }
-            }
-            x += w + gap;
         }
     }
+    let divider = unsafe { CreateSolidBrush(DIVIDER) };
+    let mid = windows_sys::Win32::Foundation::RECT {
+        left: layout.divider_x,
+        top: layout.pill_top + scale_px(2, dpi),
+        right: layout.divider_x + scale_px(1, dpi).max(1),
+        bottom: layout.pill_bottom - scale_px(2, dpi),
+    };
     unsafe {
+        FillRect(hdc, &mid, divider);
+        DeleteObject(divider as _);
+    }
+    let pages = page_count(view.rows.len());
+    let prev_color = if view.page > 0 { MUTED } else { DISABLED };
+    let next_color = if view.page + 1 < pages {
+        MUTED
+    } else {
+        DISABLED
+    };
+    unsafe { SelectObject(hdc, small as _) };
+    unsafe { draw_text(hdc, layout.prev_x, layout.hint_y, prev_color, "◀") };
+    unsafe { draw_text(hdc, layout.next_x, layout.hint_y, next_color, "▶") };
+    // Menu button: a compact rounded chip with a down chevron, not a Microsoft logo.
+    fill_round(
+        hdc,
+        windows_sys::Win32::Foundation::RECT {
+            left: layout.icon_x,
+            top: layout.pill_top,
+            right: layout.icon_x + scale_px(TRAIL_SLOT, dpi) - scale_px(2, dpi),
+            bottom: layout.pill_bottom,
+        },
+        HIGHLIGHT,
+        scale_px(4, dpi),
+    );
+    unsafe {
+        draw_text(
+            hdc,
+            layout.icon_x + scale_px(3, dpi),
+            layout.hint_y,
+            MUTED,
+            "▾",
+        )
+    };
+    let border = unsafe { CreatePen(PS_SOLID, 1, BORDER) };
+    let empty = unsafe { GetStockObject(NULL_BRUSH) };
+    let old_pen = unsafe { SelectObject(hdc, border as _) };
+    let old_brush = unsafe { SelectObject(hdc, empty) };
+    unsafe {
+        RoundRect(
+            hdc,
+            client.left,
+            client.top,
+            client.right,
+            client.bottom,
+            layout.radius,
+            layout.radius,
+        );
+        SelectObject(hdc, old_brush);
+        SelectObject(hdc, old_pen);
         SelectObject(hdc, old);
+        DeleteObject(border as _);
         if !font.is_null() {
             DeleteObject(font as _);
         }
@@ -889,6 +1106,7 @@ impl CandidateUi {
         let element: ITfCandidateListUIElement = CandidateElement {
             state: self.state.clone(),
             shown: self.shown.clone(),
+            view: self.view.clone(),
         }
         .into();
         let mut show = BOOL(1);
@@ -906,10 +1124,17 @@ impl CandidateUi {
     }
     fn show(&self, context: &ITfContext, position: Option<(i32, i32, i32)>, code: &str) {
         let rows = candidates(code);
-        *self.view.borrow_mut() = CandidateView {
-            code: code.to_owned(),
-            rows,
-        };
+        {
+            let mut view = self.view.borrow_mut();
+            let page = if view.code == code { view.page } else { 0 };
+            *view = CandidateView {
+                code: code.to_owned(),
+                rows,
+                page,
+            };
+            let last = page_count(view.rows.len()).saturating_sub(1);
+            view.page = view.page.min(last);
+        }
         let mut window = self.window.get();
         if window.is_null() || unsafe { IsWindow(window) } == 0 {
             if !register_candidate_class() {
@@ -926,7 +1151,7 @@ impl CandidateUi {
                     WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
                     wide(CANDIDATE_CLASS).as_ptr(),
                     wide("").as_ptr(),
-                    WS_POPUP | WS_BORDER,
+                    WS_POPUP,
                     0,
                     0,
                     0,
@@ -958,6 +1183,7 @@ impl CandidateUi {
                 height,
                 SWP_NOACTIVATE | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOMOVE,
             );
+            apply_window_shape(window, width, height);
             InvalidateRect(window, std::ptr::null(), 1);
         }
         let position = if let Some(position) = position {
@@ -984,6 +1210,56 @@ impl CandidateUi {
         if !window.is_null() {
             unsafe { ShowWindow(window, SW_HIDE) };
         }
+    }
+    fn turn_page(&self, forward: bool) -> bool {
+        let changed = {
+            let mut view = self.view.borrow_mut();
+            let last = page_count(view.rows.len()).saturating_sub(1);
+            let next = if forward {
+                view.page.saturating_add(1).min(last)
+            } else {
+                view.page.saturating_sub(1)
+            };
+            if next == view.page {
+                false
+            } else {
+                view.page = next;
+                true
+            }
+        };
+        if changed {
+            self.relayout();
+        }
+        true
+    }
+    fn relayout(&self) {
+        let window = self.window.get();
+        if window.is_null() || unsafe { IsWindow(window) } == 0 {
+            return;
+        }
+        let (width, height) = measure_view(window, &self.view.borrow());
+        unsafe {
+            SetWindowPos(
+                window,
+                HWND_TOPMOST,
+                0,
+                0,
+                width,
+                height,
+                SWP_NOACTIVATE | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOMOVE,
+            );
+            apply_window_shape(window, width, height);
+            InvalidateRect(window, std::ptr::null(), 1);
+        }
+        if let Some(position) = self.last_caret.get() {
+            place(window, position);
+        }
+        self.refresh_element();
+    }
+    fn page_choice(&self, index: usize) -> Option<String> {
+        page_items(&self.view.borrow())
+            .get(index)
+            .map(|item| item.text.clone())
     }
     fn advise_layout(&self, context: &ITfContext, client_id: u32) {
         if self.layout.borrow().is_some() {
@@ -1037,6 +1313,7 @@ impl InlineInput {
                 view: Rc::new(RefCell::new(CandidateView {
                     code: String::new(),
                     rows: Vec::new(),
+                    page: 0,
                 })),
                 last_caret: Rc::new(Cell::new(None)),
             },
@@ -1048,6 +1325,9 @@ impl InlineInput {
     pub(super) fn active(&self) -> bool {
         self.ui.state.borrow().is_some()
     }
+    pub(super) fn last_caret(&self) -> Option<(i32, i32, i32)> {
+        self.ui.last_caret.get()
+    }
     pub(super) fn same_context(&self, context: &ITfContext) -> bool {
         self.ui
             .state
@@ -1057,8 +1337,12 @@ impl InlineInput {
     }
     pub(super) fn wants(&self, context: &ITfContext, key: usize) -> bool {
         if let Some(state) = self.ui.state.borrow().as_ref() {
+            // 0xBD/0xBB are `-`/`=` paging keys (yiime_core::paging_direction).
             state.context == *context
-                && matches!(key, 0x41..=0x5a | 0x08 | 0x1b | 0x0d | 0x20 | 0x31..=0x39)
+                && matches!(
+                    key,
+                    0x41..=0x5a | 0x08 | 0x1b | 0x0d | 0x20 | 0x31..=0x39 | 0xBD | 0xBB
+                )
         } else {
             (0x41..=0x5a).contains(&key)
         }
@@ -1092,15 +1376,15 @@ impl InlineInput {
             }
             0x1b => self.edit(context, client_id, Action::Finish(String::new())),
             0x0d | 0x20 => {
-                let word = candidates(&code)
-                    .first()
-                    .map(|item| item.text.clone())
-                    .unwrap_or(code);
+                let word = self.ui.page_choice(0).unwrap_or(code);
                 self.edit(context, client_id, Action::Finish(word))
             }
-            0x31..=0x39 => candidates(&code).get(key - 0x31).is_some_and(|item| {
-                self.edit(context, client_id, Action::Finish(item.text.clone()))
-            }),
+            0x31..=0x39 => self
+                .ui
+                .page_choice(key - 0x31)
+                .is_some_and(|word| self.edit(context, client_id, Action::Finish(word))),
+            0xBD => self.ui.turn_page(false),
+            0xBB => self.ui.turn_page(true),
             _ => false,
         }
     }
