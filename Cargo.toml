@@ -7,7 +7,7 @@ rust-version = "1.88"
 default-run = "yiime-app"
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 
 [workspace]
 members = ["crates/yiime-core", "crates/yiime-cli", "crates/yiime-ffi", "windows/tsf"]
