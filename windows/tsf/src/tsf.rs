@@ -1649,21 +1649,32 @@ impl TextService {
             return true;
         }
         let focused = self.focused_context();
+        let session_window = self.session_window.get();
         let moved_in_window = session.is_some()
             && focused.as_ref().is_some_and(|focused| {
-                let session_window = self.session_window.get();
                 let document = unsafe { focused.GetDocumentMgr() }.ok();
                 same_root(context_window(focused), session_window)
                     && document.as_ref() != self.session_document.borrow().as_ref()
             });
-        if moved_in_window {
-            log("上屏：会话的文档已不是焦点文档（同一顶层窗口），先上屏到焦点输入框");
+        let mut redirect = false;
+        if moved_in_window && let (Some(session), Some(focused)) = (&session, &focused) {
+            let alive = self.session_alive(session);
+            let same_control = context_window(focused) == session_window;
+            redirect = yiime_core::redirect_to_focused(true, alive, same_control);
+            log(&format!(
+                "上屏：焦点在同一顶层窗口的另一个文档（会话上下文仍有效={alive}，同一控件窗口={same_control}）→ 先上屏到{}",
+                if redirect {
+                    "焦点输入框"
+                } else {
+                    "会话的输入框"
+                }
+            ));
         }
         let targets = yiime_core::commit_targets(
             session.is_some(),
             held.is_some(),
             focused.is_some(),
-            moved_in_window,
+            redirect,
         );
         for target in targets {
             let (context, which) = match target {
@@ -1673,6 +1684,7 @@ impl TextService {
             };
             let Some(context) = context else { continue };
             if self.insert_text(&context, text.clone()) {
+                log(&format!("上屏成功：{which}"));
                 self.last_commit
                     .set(Some((digest, std::time::Instant::now())));
                 self.confirm_commit(digest);
@@ -1707,6 +1719,32 @@ impl TextService {
                     receiver as usize,
                     digest as isize,
                 );
+            }
+        }
+    }
+    /// The session's context is still in place: the top context of its document, and that
+    /// document still belongs to this thread.
+    fn session_alive(&self, session: &ITfContext) -> bool {
+        let Some(document) = self.session_document.borrow().clone() else {
+            return false;
+        };
+        if unsafe { document.GetTop() }.ok().as_ref() != Some(session) {
+            return false;
+        }
+        let Some(manager) = self.thread_manager.borrow().clone() else {
+            return false;
+        };
+        let Ok(list) = (unsafe { manager.EnumDocumentMgrs() }) else {
+            return true;
+        };
+        loop {
+            let mut item = [None];
+            let mut fetched = 0;
+            if unsafe { list.Next(&mut item, &mut fetched) }.is_err() || fetched == 0 {
+                return false;
+            }
+            if item[0].as_ref() == Some(&document) {
+                return true;
             }
         }
     }

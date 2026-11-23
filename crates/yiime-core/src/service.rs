@@ -477,20 +477,30 @@ pub enum CommitTarget {
     Focused,
 }
 
+/// Whether the commit tries the focused context before the session's own. Like qingjian, which
+/// commits into the context of the last key (key_sink.rs query_key → set_last_context) even after
+/// the focus moved (document.rs commit on focus loss), and takes the focused top context only when
+/// it has none (panel.rs): the session's context comes first. Only when the focus moved to
+/// another document in the same top-level window (`moved_in_window`) AND the session's context
+/// was replaced is the focused one first: its document no longer lists it as the top context or
+/// is gone from the thread (`session_alive` false), or the focused document lives in the same
+/// control window (`same_control`, a fresh Word swapping its start-up document). Explorer's
+/// search box keeps its context while the focus goes to the file list or the suggestion list
+/// (another child window): the text belongs in the search box.
+pub fn redirect_to_focused(moved_in_window: bool, session_alive: bool, same_control: bool) -> bool {
+    moved_in_window && (!session_alive || same_control)
+}
+
 /// Commit targets in the order to try them. An open session wins, so text never lands in a field
-/// that was left; the focused field is the last resort. `moved_in_window`: the session's
-/// document no longer has the focus, but the focus is still inside the same top-level window
-/// (Word replaces its first document right after opening, Electron gives a refocused field a new
-/// one, Explorer's search box moves between child windows). The focused context is then tried
-/// first, as qingjian commits into the context the host handed over last rather than a
-/// remembered one: the old context may accept the edit and show nothing.
+/// that was left; the focused field is the last resort, or the first when
+/// [`redirect_to_focused`] says the session's context was replaced.
 pub fn commit_targets(
     session: bool,
     held: bool,
     focused: bool,
-    moved_in_window: bool,
+    redirect: bool,
 ) -> Vec<CommitTarget> {
-    let first_focused = session && focused && moved_in_window;
+    let first_focused = session && focused && redirect;
     [
         (first_focused, CommitTarget::Focused),
         (session, CommitTarget::Session),
@@ -878,6 +888,26 @@ mod tests {
         );
         // Nothing focused: the session's own context.
         assert_eq!(commit_targets(true, false, false, true), [Session]);
+    }
+
+    #[test]
+    fn explorer_search_box_keeps_the_commit() {
+        use CommitTarget::*;
+        // Explorer: the focus went to the file list / suggestion list (another child window of the
+        // same window) while the search box's context is still alive: commit into the search box,
+        // the focused document only if that fails.
+        let redirect = redirect_to_focused(true, true, false);
+        assert!(!redirect);
+        assert_eq!(
+            commit_targets(true, false, true, redirect),
+            [Session, Focused]
+        );
+        // Fresh Word: the start-up document was popped or replaced, or the new document is in the
+        // same control window: the focused one first.
+        assert!(redirect_to_focused(true, false, false));
+        assert!(redirect_to_focused(true, true, true));
+        // The focus did not move within the window: never redirected.
+        assert!(!redirect_to_focused(false, false, true));
     }
 
     #[test]
