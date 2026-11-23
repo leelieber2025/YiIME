@@ -347,16 +347,42 @@ pub enum KeyRoute {
     StaleSession,
     /// No session: the letter starts one.
     NewSession,
+    /// A session is open and the letter comes from another document in another child window of
+    /// the same top-level window (Explorer's search box hands later keys over from another
+    /// document): the session continues there, as qingjian keeps composing and commits into the
+    /// context of the last key (key_sink.rs query_key → set_last_context).
+    Adopt,
 }
 
 /// `session_open`: the DLL has an input session; `same_context`: the key comes from the text
 /// field (TSF context) that session belongs to. A session for another field never swallows
 /// input: before 0.2.0-rc.2 those letters were refused until the old box ended.
-pub fn key_route(session_open: bool, same_context: bool) -> KeyRoute {
+/// `other_child_window`: the key's context is in another child window of the session's
+/// top-level window. Another field in the same control window (two inputs of a Chrome page) still
+/// starts a fresh session, so a box left over from one field never commits into the next.
+pub fn key_route(session_open: bool, same_context: bool, other_child_window: bool) -> KeyRoute {
     match (session_open, same_context) {
         (true, true) => KeyRoute::Buffer,
+        (true, false) if other_child_window => KeyRoute::Adopt,
         (true, false) => KeyRoute::StaleSession,
         (false, _) => KeyRoute::NewSession,
+    }
+}
+
+/// Whether the commit goes to the focused context before the session's. The window with the
+/// Win32 keyboard focus decides first: the field the user types into is the one whose view
+/// window has it (Explorer's search box keeps it while TSF's focused document and the
+/// session's context move to the suggestion list or file list). Only when neither or both have
+/// it does [`redirect_to_focused`] decide.
+pub fn focused_first(
+    session_has_keyboard: bool,
+    focused_has_keyboard: bool,
+    redirect: bool,
+) -> bool {
+    match (session_has_keyboard, focused_has_keyboard) {
+        (true, false) => false,
+        (false, true) => true,
+        _ => redirect,
     }
 }
 
@@ -763,9 +789,30 @@ mod tests {
         // Explorer's search box, Chromium, Electron and Word move the focused document around
         // (other child windows, suggestion lists, new documents) while the box has the keyboard.
         // Only a letter typed into another field in the application ends the session.
-        assert_eq!(key_route(true, true), KeyRoute::Buffer);
-        assert_eq!(key_route(true, false), KeyRoute::StaleSession);
-        assert_eq!(key_route(false, false), KeyRoute::NewSession);
+        assert_eq!(key_route(true, true, false), KeyRoute::Buffer);
+        assert_eq!(key_route(true, false, false), KeyRoute::StaleSession);
+        assert_eq!(key_route(false, false, false), KeyRoute::NewSession);
+        assert_eq!(key_route(false, false, true), KeyRoute::NewSession);
+    }
+
+    #[test]
+    fn explorer_search_box_keys_from_another_child_window_keep_the_session() {
+        // Explorer: the next letter arrives from a document in another child window of the same
+        // window; the session continues in that context instead of starting over.
+        assert_eq!(key_route(true, false, true), KeyRoute::Adopt);
+        assert_eq!(key_route(true, true, true), KeyRoute::Buffer);
+    }
+
+    #[test]
+    fn the_field_with_the_keyboard_gets_the_commit() {
+        // Explorer: the search box (Win32 focus) is the session's field, TSF's focused document is
+        // the list: session first, even if the context looked replaced.
+        assert!(!focused_first(true, false, true));
+        // The focused document's window has the keyboard (fresh Word, a recreated field): first.
+        assert!(focused_first(false, true, false));
+        // Neither or both: the document rule decides.
+        assert!(focused_first(false, false, true));
+        assert!(!focused_first(true, true, false));
     }
 
     #[test]
@@ -1273,10 +1320,10 @@ mod tests {
 
     #[test]
     fn a_session_for_another_field_never_blocks_input() {
-        assert_eq!(key_route(true, true), KeyRoute::Buffer);
-        assert_eq!(key_route(true, false), KeyRoute::StaleSession);
-        assert_eq!(key_route(false, false), KeyRoute::NewSession);
-        assert_eq!(key_route(false, true), KeyRoute::NewSession);
+        assert_eq!(key_route(true, true, false), KeyRoute::Buffer);
+        assert_eq!(key_route(true, false, false), KeyRoute::StaleSession);
+        assert_eq!(key_route(false, false, false), KeyRoute::NewSession);
+        assert_eq!(key_route(false, true, false), KeyRoute::NewSession);
         // After the DLL drops the stale session it tells the box. The box closes even with a
         // draft, unless a translation is in flight (that Chinese is committed to the old field).
         let lingering = BoxView {

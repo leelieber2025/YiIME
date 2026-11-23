@@ -62,7 +62,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow,
     ES_PASSWORD, GA_ROOT, GWL_STYLE, GWLP_USERDATA, GetAncestor, GetClassNameW,
     GetForegroundWindow, GetSystemMetrics, GetWindowLongPtrW, GetWindowLongW,
-    GetWindowThreadProcessId, HWND_MESSAGE, IMAGE_ICON, IsWindow, KillTimer, LoadImageW,
+    GetWindowThreadProcessId, HWND_MESSAGE, IMAGE_ICON, IsChild, IsWindow, KillTimer, LoadImageW,
     PostMessageW, RegisterClassW, SM_CXSMICON, SMTO_ABORTIFHUNG, SendMessageTimeoutW, SetTimer,
     SetWindowLongPtrW, WM_APP, WM_COPYDATA, WM_CREATE, WM_TIMER, WNDCLASSW,
 };
@@ -544,6 +544,21 @@ fn set_conversion_mode(manager: &ITfThreadMgr, client_id: u32, mode: i32) {
 /// Both windows are inside the same top-level window (GetAncestor GA_ROOT).
 fn same_root(a: HWND, b: HWND) -> bool {
     !a.is_null() && !b.is_null() && unsafe { GetAncestor(a, GA_ROOT) == GetAncestor(b, GA_ROOT) }
+}
+/// `window` is, or contains, the window with the keyboard focus.
+fn has_keyboard(window: HWND, keyboard: HWND) -> bool {
+    !window.is_null()
+        && !keyboard.is_null()
+        && (window == keyboard || unsafe { IsChild(window, keyboard) } != 0)
+}
+/// Window class for the log (no content).
+fn window_class(window: HWND) -> String {
+    if window.is_null() {
+        return "-".into();
+    }
+    let mut class = [0u16; 64];
+    let len = unsafe { GetClassNameW(window, class.as_mut_ptr(), class.len() as i32) } as usize;
+    String::from_utf16_lossy(&class[..len])
 }
 fn context_window(context: &ITfContext) -> HWND {
     unsafe { context.GetActiveView() }
@@ -1189,8 +1204,24 @@ impl TextService {
                 .is_some_and(|document| {
                     unsafe { context.GetDocumentMgr() }.is_ok_and(|other| &other == document)
                 });
-        match yiime_core::key_route(self.buffering(), same_context) {
+        let key_window = context_window(context);
+        let session_window = self.session_window.get();
+        let other_child_window =
+            key_window != session_window && same_root(key_window, session_window);
+        match yiime_core::key_route(self.buffering(), same_context, other_child_window) {
             yiime_core::KeyRoute::Buffer => return true,
+            yiime_core::KeyRoute::Adopt => {
+                log(&format!(
+                    "按键来自同一窗口的另一个子窗口（{} → {}，键盘焦点 {}）：会话改用该输入框",
+                    window_class(session_window),
+                    window_class(key_window),
+                    window_class(unsafe { GetFocus() }),
+                ));
+                *self.context.borrow_mut() = Some(context.clone());
+                *self.session_document.borrow_mut() = unsafe { context.GetDocumentMgr() }.ok();
+                self.session_window.set(key_window);
+                return true;
+            }
             // The box still belongs to another text field: drop that session so this letter
             // starts a fresh one instead of being refused.
             yiime_core::KeyRoute::StaleSession => self.drop_stale_session("按键来自另一个输入框"),
@@ -1659,10 +1690,21 @@ impl TextService {
         let mut redirect = false;
         if moved_in_window && let (Some(session), Some(focused)) = (&session, &focused) {
             let alive = self.session_alive(session);
-            let same_control = context_window(focused) == session_window;
-            redirect = yiime_core::redirect_to_focused(true, alive, same_control);
+            let focused_window = context_window(focused);
+            let same_control = focused_window == session_window;
+            let keyboard = unsafe { GetFocus() };
+            let session_keyboard = has_keyboard(session_window, keyboard);
+            let focused_keyboard = has_keyboard(focused_window, keyboard);
+            redirect = yiime_core::focused_first(
+                session_keyboard,
+                focused_keyboard,
+                yiime_core::redirect_to_focused(true, alive, same_control),
+            );
             log(&format!(
-                "上屏：焦点在同一顶层窗口的另一个文档（会话上下文仍有效={alive}，同一控件窗口={same_control}）→ 先上屏到{}",
+                "上屏：焦点在同一顶层窗口的另一个文档（会话上下文仍有效={alive}，同一控件窗口={same_control}，会话窗口 {} 键盘={session_keyboard}，焦点文档窗口 {} 键盘={focused_keyboard}，键盘焦点 {}）→ 先上屏到{}",
+                window_class(session_window),
+                window_class(focused_window),
+                window_class(keyboard),
                 if redirect {
                     "焦点输入框"
                 } else {
