@@ -6,7 +6,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             self.tested_key.borrow_mut().take();
             self.shift_down.set(None);
             if !foreground.as_bool() {
-                self.inline.cancel(self.client_id.get());
+                // Losing the key sink here can also be a same-window document change; cancel
+                // only when the thread itself loses focus (OnKillThreadFocus) or a key arrives
+                // from another field (wants_key).
                 // This application's thread lost the keyboard (also when the input box itself
                 // takes it; the box then ignores the notice because it has the foreground).
                 self.notify_focus_moved();
@@ -96,7 +98,21 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 }
                 return Ok(true.into());
             }
-            Ok(self.inline.key(context, self.client_id.get(), key.0).into())
+            if self.inline.key(context, self.client_id.get(), key.0) {
+                return Ok(true.into());
+            }
+            // The host did not accept the composition session. Fall back to the draft box
+            // rather than swallowing a key OnTestKeyDown already claimed.
+            if !self.inline.active() && (0x41..=0x5a).contains(&key.0) {
+                self.probe_new_field(context);
+                let opened = self.open_editor(context.clone(), key.0 as u8);
+                if !opened {
+                    self.note_pass(Some(yiime_core::PassReason::BoxUnavailable));
+                    log("组字会话未被受理，草稿框也未能打开：按键交还应用");
+                }
+                return Ok(opened.into());
+            }
+            Ok(false.into())
         })
     }
     fn OnTestKeyUp(

@@ -40,10 +40,9 @@ use windows::Win32::UI::TextServices::{
     ITfUIElement_Impl, ITfUIElementMgr, TF_AE_END, TF_ANCHOR_END, TF_ANCHOR_START, TF_CLUIE_COUNT,
     TF_CLUIE_CURRENTPAGE, TF_CLUIE_DOCUMENTMGR, TF_CLUIE_PAGEINDEX, TF_CLUIE_SELECTION,
     TF_CLUIE_STRING, TF_CONVERSIONMODE_NATIVE, TF_DEFAULT_SELECTION, TF_E_NOOBJECT, TF_ES_ASYNC,
-    TF_ES_ASYNCDONTCARE, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC, TF_LANGBARITEMINFO,
-    TF_LBI_CLK_RIGHT, TF_LBI_ICON, TF_LBI_STYLE_BTN_BUTTON, TF_LBI_TEXT, TF_LBI_TOOLTIP,
-    TF_MOD_ALT, TF_MOD_CONTROL, TF_MOD_SHIFT, TF_PRESERVEDKEY, TF_SD_READONLY, TF_SELECTION,
-    TF_SELECTIONSTYLE, TfLBIClick,
+    TF_ES_ASYNCDONTCARE, TF_ES_READ, TF_ES_READWRITE, TF_LANGBARITEMINFO, TF_LBI_CLK_RIGHT,
+    TF_LBI_ICON, TF_LBI_STYLE_BTN_BUTTON, TF_LBI_TEXT, TF_LBI_TOOLTIP, TF_MOD_ALT, TF_MOD_CONTROL,
+    TF_MOD_SHIFT, TF_PRESERVEDKEY, TF_SD_READONLY, TF_SELECTION, TF_SELECTIONSTYLE, TfLBIClick,
 };
 use windows::core::{
     BOOL, BSTR, GUID, HRESULT, IUnknown, IUnknownImpl, Interface, Ref, Result, implement,
@@ -1194,6 +1193,10 @@ impl TextService {
         self.refresh_editor();
         let modifier = |vk| unsafe { GetKeyState(vk as i32) } < 0;
         if !self.buffering() {
+            if self.inline.active() && !self.inline.same_context(context) {
+                log("按键来自另一个输入框，取消组字");
+                self.inline.cancel(self.client_id.get());
+            }
             let active = self.inline.active();
             return !Self::disabled(context)
                 && self.keyboard_open()
@@ -2161,7 +2164,18 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
         _previous: Ref<ITfDocumentMgr>,
     ) -> Result<()> {
         com_guard("OnSetFocus", || {
-            self.inline.cancel(self.client_id.get());
+            // Same-window document changes must not cancel in-document composition (Chrome,
+            // Electron, Word, Explorer). A letter in another field cancels it in wants_key.
+            if self.inline.active() {
+                let window = document
+                    .as_ref()
+                    .and_then(|document| unsafe { document.GetTop() }.ok())
+                    .map_or(null_mut(), |context| context_window(&context));
+                let same_root = same_root(window, unsafe { GetFocus() });
+                log(&format!(
+                    "焦点文档变化：同一顶层窗口={same_root} → 保持组字"
+                ));
+            }
             // A change of the focused document never ends the session (as in qingjian, which
             // has no document-manager switch at all): Chromium, Electron, Word and Explorer's
             // search box move it while the box has the keyboard. A letter typed into another
@@ -2197,7 +2211,6 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
     }
     fn OnPopContext(&self, _context: Ref<ITfContext>) -> Result<()> {
         com_guard("OnPopContext", || {
-            self.inline.cancel(self.client_id.get());
             self.tested_key.borrow_mut().take();
             Ok(())
         })

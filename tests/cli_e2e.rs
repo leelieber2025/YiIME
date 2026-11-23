@@ -25,6 +25,9 @@ fn wubi_then_pinyin_then_translate_and_commit() {
                 Err(error) => panic!("测试 API 未收到连接：{error}"),
             }
         };
+        // A socket accepted from a non-blocking listener stays non-blocking on Windows
+        // (WSAEWOULDBLOCK / 10035 on the first read). Put it back to blocking first.
+        stream.set_nonblocking(false).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
