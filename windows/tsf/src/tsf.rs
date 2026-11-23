@@ -775,6 +775,8 @@ struct TextService {
     session_window: Cell<HWND>,
     /// Last reason logged for letters passed to the application (logged again only on change).
     pass_logged: Cell<Option<yiime_core::PassReason>>,
+    /// Digest and time of the last text inserted for the box (see yiime_core::duplicate_commit).
+    last_commit: Cell<Option<(u32, std::time::Instant)>>,
     held_id: Cell<u64>,
     next_held: Cell<u64>,
     client_id: Cell<u32>,
@@ -824,6 +826,7 @@ impl TextService {
             session_document: RefCell::new(None),
             session_window: Cell::new(null_mut()),
             pass_logged: Cell::new(None),
+            last_commit: Cell::new(None),
             held_id: Cell::new(0),
             next_held: Cell::new(0),
             client_id: Cell::new(0),
@@ -1549,6 +1552,16 @@ impl TextService {
             .then(|| self.context.borrow().clone())
             .flatten();
         let held = self.held_context.borrow().clone();
+        let digest = yiime_core::commit_digest(&text);
+        let last = self
+            .last_commit
+            .get()
+            .map(|(previous, at)| (previous, at.elapsed().as_millis() as u64));
+        if yiime_core::duplicate_commit(session.is_some(), held.is_some(), last, digest) {
+            log("重复的上屏请求（上一次已上屏），忽略");
+            self.confirm_commit(digest);
+            return true;
+        }
         let focused = self.focused_context();
         let targets =
             yiime_core::commit_targets(session.is_some(), held.is_some(), focused.is_some());
@@ -1560,6 +1573,9 @@ impl TextService {
             };
             let Some(context) = context else { continue };
             if self.insert_text(&context, text.clone()) {
+                self.last_commit
+                    .set(Some((digest, std::time::Instant::now())));
+                self.confirm_commit(digest);
                 match target {
                     yiime_core::CommitTarget::Session => self.finish_editor(),
                     yiime_core::CommitTarget::Held => self.clear_held(),
@@ -1575,6 +1591,23 @@ impl TextService {
         }
         log("没有可上屏的输入框");
         false
+    }
+    /// Tells the box the text landed (WM_APP + 10, wParam = receiver, lParam = digest), posted
+    /// besides the COPYDATA reply: that reply can be lost to a timeout while the focus moves, and
+    /// the box would keep a draft that was already inserted.
+    fn confirm_commit(&self, digest: u32) {
+        let editor_window = self.editor_window.get();
+        let receiver = self.receiver.get();
+        if !editor_window.is_null() && !receiver.is_null() {
+            unsafe {
+                let _ = PostMessageW(
+                    editor_window,
+                    WM_APP + 10,
+                    receiver as usize,
+                    digest as isize,
+                );
+            }
+        }
     }
     /// Top context of the document that has the focus in this thread, if it takes input.
     fn focused_context(&self) -> Option<ITfContext> {

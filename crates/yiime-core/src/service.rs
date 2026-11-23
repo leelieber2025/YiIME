@@ -502,6 +502,44 @@ pub fn commit_targets(session: bool, held: bool, focused: bool) -> Vec<CommitTar
     .collect()
 }
 
+/// Digest of a committed text, sent back with the DLL's confirmation (WM_APP + 10) so the box can
+/// match it to the draft it sent. FNV-1a over the UTF-16 units the box puts in the packet.
+pub fn commit_digest(text: &str) -> u32 {
+    text.encode_utf16().fold(0x811c_9dc5u32, |hash, unit| {
+        (hash ^ u32::from(unit)).wrapping_mul(0x0100_0193)
+    })
+}
+
+/// How long after a commit the same text, arriving with no session and no parked field, is the
+/// box re-sending a commit whose reply it lost rather than new input (new input opens a session).
+pub const DUPLICATE_COMMIT_MS: u64 = 3000;
+
+/// Whether a commit is the box re-sending one that already landed. `last` is the digest and age
+/// in ms of the last successful commit.
+pub fn duplicate_commit(session: bool, held: bool, last: Option<(u32, u64)>, digest: u32) -> bool {
+    !session
+        && !held
+        && last.is_some_and(|(previous, age)| previous == digest && age < DUPLICATE_COMMIT_MS)
+}
+
+/// A commit the box gave up on (no reply): the receiver it went to, the digest of the text sent,
+/// and the digest of the draft the box kept (the text sent may be a translation of it).
+pub type UnconfirmedCommit = (usize, u32, u32);
+
+/// Whether a confirmation (`receiver`, `digest`) that arrives after the box gave up on a commit
+/// means the kept draft was already inserted: it matches that commit and the user has not edited
+/// the draft since. The box then clears it instead of the user sending it twice.
+pub fn late_commit_landed(
+    unconfirmed: Option<UnconfirmedCommit>,
+    receiver: usize,
+    digest: u32,
+    draft: &str,
+) -> bool {
+    unconfirmed.is_some_and(|(to, sent, kept)| {
+        to == receiver && sent == digest && commit_digest(draft) == kept
+    })
+}
+
 /// What a Shift tap in the input box does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShiftTapAction {
@@ -589,6 +627,51 @@ pub fn context_after_pop<C: PartialEq>(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn commit_digest_tells_texts_apart() {
+        assert_eq!(commit_digest("我想试一试"), commit_digest("我想试一试"));
+        assert_ne!(commit_digest("我想试一试"), commit_digest("我想试一下"));
+        assert_ne!(commit_digest(""), commit_digest("a"));
+    }
+
+    #[test]
+    fn resent_commit_after_fallback_is_not_inserted_twice() {
+        let digest = commit_digest("如果");
+        // The box lost the reply to a commit that landed through the focused-field fallback and
+        // sends it again: no session, no parked field, same text, moments later.
+        assert!(duplicate_commit(false, false, Some((digest, 50)), digest));
+        // New input opens a session, so the same word typed again is inserted.
+        assert!(!duplicate_commit(true, false, Some((digest, 50)), digest));
+        assert!(!duplicate_commit(false, true, Some((digest, 50)), digest));
+        assert!(!duplicate_commit(
+            false,
+            false,
+            Some((digest, DUPLICATE_COMMIT_MS)),
+            digest
+        ));
+        assert!(!duplicate_commit(
+            false,
+            false,
+            Some((commit_digest("别的"), 50)),
+            digest
+        ));
+        assert!(!duplicate_commit(false, false, None, digest));
+    }
+
+    #[test]
+    fn late_confirmation_clears_only_the_matching_draft() {
+        let sent = commit_digest("I want to try");
+        let kept = commit_digest("我想试一试");
+        let pending = Some((7, sent, kept));
+        assert!(late_commit_landed(pending, 7, sent, "我想试一试"));
+        // Another application's receiver, another text, or no commit waiting.
+        assert!(!late_commit_landed(pending, 8, sent, "我想试一试"));
+        assert!(!late_commit_landed(pending, 7, kept, "我想试一试"));
+        assert!(!late_commit_landed(None, 7, sent, "我想试一试"));
+        // The user already changed the kept draft: keep it.
+        assert!(!late_commit_landed(pending, 7, sent, "我想试一试吧"));
+    }
+
     use super::*;
 
     /// Replays OnSetFocus sequences seen in Chromium/Electron hosts (documents as numbers:

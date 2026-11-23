@@ -69,12 +69,13 @@ pub use learn::{
 pub use reload::{FileStamp, UserWordsReloader};
 pub use request::RequestGate;
 pub use service::{
-    APP_WINDOW_CLASS, Activation, BACKOFF_RESET, BoxView, CommitTarget, EMPTY_BOX_GRACE_MS,
-    FIRST_BACKOFF, FocusChange, HIGH_INTEGRITY, HostOwner, KeyRoute, LeftField, MAX_BACKOFF,
-    MEDIUM_INTEGRITY, PassReason, ProcessSecurity, REQUEST_TIMEOUT_MS, ScopeSource, ServiceHealth,
-    ShiftTapAction, Startup, TRAY_WINDOW_TITLE, TSF_PROTOCOL, TSF_RECEIVER_CLASS, WATCHDOG_GRACE,
-    WATCHDOG_LIMIT, Watchdog, WatchedHosts, commit_targets, context_after_pop,
-    english_ends_session, focus_change, hide_empty_box, key_route, keys_to_give_back, left_field,
+    APP_WINDOW_CLASS, Activation, BACKOFF_RESET, BoxView, CommitTarget, DUPLICATE_COMMIT_MS,
+    EMPTY_BOX_GRACE_MS, FIRST_BACKOFF, FocusChange, HIGH_INTEGRITY, HostOwner, KeyRoute, LeftField,
+    MAX_BACKOFF, MEDIUM_INTEGRITY, PassReason, ProcessSecurity, REQUEST_TIMEOUT_MS, ScopeSource,
+    ServiceHealth, ShiftTapAction, Startup, TRAY_WINDOW_TITLE, TSF_PROTOCOL, TSF_RECEIVER_CLASS,
+    UnconfirmedCommit, WATCHDOG_GRACE, WATCHDOG_LIMIT, Watchdog, WatchedHosts, commit_digest,
+    commit_targets, context_after_pop, duplicate_commit, english_ends_session, focus_change,
+    hide_empty_box, key_route, keys_to_give_back, late_commit_landed, left_field,
     may_share_service, needs_private_editor, pass_reason, password_field, service_window_title,
     shift_tap_action, startup_state,
 };

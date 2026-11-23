@@ -150,6 +150,9 @@ const WM_TSF_FOCUS_MOVED: u32 = WM_APP + 8;
 /// From the TSF DLL (wParam = receiver): that application switched to English (Shift tap,
 /// Ctrl+Space, the mode button…); its session ends.
 const WM_TSF_ENGLISH: u32 = WM_APP + 9;
+/// From the TSF DLL (wParam = receiver, lParam = yiime_core::commit_digest): a commit landed. Sent
+/// besides the COPYDATA reply, which can be lost to a timeout while the focus moves.
+const WM_TSF_COMMITTED: u32 = WM_APP + 10;
 /// Tray (portable) and TSF editor instances use different titles so each can find its single
 /// instance.
 const TRAY_TITLE: &str = yiime_core::TRAY_WINDOW_TITLE;
@@ -315,6 +318,8 @@ struct State {
     /// user_words.txt as last loaded; checked when a session or a code starts.
     user_words: RefCell<UserWordsReloader>,
     finished: Cell<bool>,
+    /// A TSF commit that got no reply, kept as a draft until the DLL confirms it landed.
+    unconfirmed: Cell<Option<yiime_core::UnconfirmedCommit>>,
     /// The plain-mode shortcut was pressed in the box: swallow the WM_CHAR it produces.
     swallow_char: Cell<bool>,
     /// Mode last shown in the tray tooltip.
@@ -1335,10 +1340,19 @@ unsafe fn commit_to_target(hwnd: HWND, state: &State, text: &str) {
     } else if unsafe { !target_ready(target) } {
         Err("原应用尚未取得输入焦点")
     } else if !state.tsf_receiver.get().is_null() {
-        if unsafe { send_tsf_text(state.tsf_receiver.get(), hwnd, &line) } {
+        let receiver = state.tsf_receiver.get();
+        let digest = yiime_core::commit_digest(&line);
+        state.unconfirmed.set(None);
+        if unsafe { send_tsf_text(receiver, hwnd, &line) }
+            || unsafe { take_commit_confirmation(hwnd, receiver, digest) }
+        {
             state.finished.set(true);
             Ok(())
         } else {
+            let kept = yiime_core::commit_digest(&single_line(&unsafe { get_text(state.edit) }));
+            state
+                .unconfirmed
+                .set(Some((receiver as usize, digest, kept)));
             Err("输入法没有接受提交")
         }
     } else if unsafe { send_unicode(&line) } {
@@ -1355,6 +1369,25 @@ unsafe fn commit_to_target(hwnd: HWND, state: &State, text: &str) {
             show_box(hwnd, state);
         },
     }
+}
+/// Whether the DLL already posted that `digest` landed (its COPYDATA reply was lost). Removes the
+/// confirmations that are waiting.
+unsafe fn take_commit_confirmation(hwnd: HWND, receiver: HWND, digest: u32) -> bool {
+    let mut landed = false;
+    let mut message: MSG = unsafe { std::mem::zeroed() };
+    while unsafe {
+        PeekMessageW(
+            &mut message,
+            hwnd,
+            WM_TSF_COMMITTED,
+            WM_TSF_COMMITTED,
+            PM_REMOVE,
+        )
+    } != 0
+    {
+        landed |= message.wParam == receiver as usize && message.lParam as u32 == digest;
+    }
+    landed
 }
 /// Switches to the dictionary with the large lexicon once it is loaded, between compositions;
 /// mid-composition the tray timer retries.
@@ -1658,6 +1691,28 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             }
             0
         }
+        WM_TSF_COMMITTED => {
+            if let Some(state) = state
+                && state.tsf_service
+                && yiime_core::late_commit_landed(
+                    state.unconfirmed.get(),
+                    w,
+                    l as u32,
+                    &single_line(&unsafe { get_text(state.edit) }),
+                )
+            {
+                // The red "not accepted" was wrong: the text is in the application. Drop the
+                // draft so it is not sent twice.
+                service_log("commit confirmed after the reply was lost");
+                state.unconfirmed.set(None);
+                state.finished.set(true);
+                unsafe {
+                    clear_box(hwnd, state);
+                    hide_box(hwnd, state);
+                }
+            }
+            0
+        }
         WM_TSF_FOCUS_MOVED => {
             if let Some(state) = state
                 && state.tsf_service
@@ -1887,6 +1942,7 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
             user_words: RefCell::new(user_words_reloader),
             shown_at: Cell::new(None),
             finished: Cell::new(false),
+            unconfirmed: Cell::new(None),
             swallow_char: Cell::new(false),
             last_plain: Cell::new(plain_mode()),
             learned: RefCell::new(Learned::load(learned_path(), Box::new(Dpapi))),
