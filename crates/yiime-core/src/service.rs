@@ -430,9 +430,37 @@ pub fn keys_to_give_back(first: Option<char>, pending: &str, box_ready: bool) ->
     keys
 }
 
+/// The input context whose InputScope must be queried after a nested context (e.g. a
+/// reconversion or a host's inline editor) was popped: the one now on top of the document, or,
+/// if the popped one is still reported on top (the pop not applied yet), the base context.
+/// Generic so it is testable without TSF.
+pub fn context_after_pop<C: PartialEq>(
+    popped: Option<&C>,
+    top: Option<C>,
+    base: Option<C>,
+) -> Option<C> {
+    [top, base]
+        .into_iter()
+        .flatten()
+        .find(|context| popped != Some(context))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_field_under_a_popped_context_is_queried_again() {
+        // Field 1 had context 2 pushed on it; after 2 pops, 1 is on top and is probed.
+        assert_eq!(context_after_pop(Some(&2), Some(1), Some(1)), Some(1));
+        assert_eq!(context_after_pop(None, Some(1), None), Some(1));
+        // Called before the stack changed: the popped context is still on top, the base is the
+        // field that remains.
+        assert_eq!(context_after_pop(Some(&2), Some(2), Some(1)), Some(1));
+        // Nothing else left on the document.
+        assert_eq!(context_after_pop(Some(&2), None, None), None);
+        assert_eq!(context_after_pop(Some(&2), Some(2), Some(2)), None);
+    }
 
     #[test]
     fn letters_typed_while_the_box_starts_are_given_back() {

@@ -1795,10 +1795,24 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
             Ok(())
         })
     }
-    fn OnPopContext(&self, _context: Ref<ITfContext>) -> Result<()> {
+    fn OnPopContext(&self, context: Ref<ITfContext>) -> Result<()> {
         com_guard("OnPopContext", || {
             self.scope_cache.borrow_mut().take();
             self.tested_key.borrow_mut().take();
+            // Query the context now on top (the original text field), as OnSetFocus does:
+            // without a known InputScope its letters would be passed through as if it were a
+            // password field until some later edit happened to probe it.
+            let popped = context.as_ref();
+            let document = popped.and_then(|popped| unsafe { popped.GetDocumentMgr() }.ok());
+            let top = document
+                .as_ref()
+                .and_then(|document| unsafe { document.GetTop() }.ok());
+            let base = document
+                .as_ref()
+                .and_then(|document| unsafe { document.GetBase() }.ok());
+            if let Some(top) = yiime_core::context_after_pop(popped, top, base) {
+                self.probe_scope(top);
+            }
             Ok(())
         })
     }

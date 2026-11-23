@@ -72,7 +72,7 @@ pub use service::{
     APP_WINDOW_CLASS, Activation, BACKOFF_RESET, BoxView, EMPTY_BOX_GRACE_MS, FIRST_BACKOFF,
     HIGH_INTEGRITY, HostOwner, KeyRoute, LeftField, MAX_BACKOFF, MEDIUM_INTEGRITY, ProcessSecurity,
     REQUEST_TIMEOUT_MS, ServiceHealth, ShiftTapAction, Startup, TRAY_WINDOW_TITLE, TSF_PROTOCOL,
-    TSF_RECEIVER_CLASS, WATCHDOG_GRACE, WATCHDOG_LIMIT, Watchdog, WatchedHosts,
+    TSF_RECEIVER_CLASS, WATCHDOG_GRACE, WATCHDOG_LIMIT, Watchdog, WatchedHosts, context_after_pop,
     english_ends_session, hide_empty_box, key_route, keys_to_give_back, left_field,
     may_share_service, needs_private_editor, service_window_title, shift_tap_action, startup_state,
 };
