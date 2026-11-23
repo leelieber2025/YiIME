@@ -392,10 +392,19 @@ impl ITfEditSession_Impl for ScopeCheck_Impl {
 
 /// Reads the screen rectangle of the insertion point so the editor can place its box at the
 /// target's cursor.
+fn rect_of([left, top, right, bottom]: [i32; 4]) -> RECT {
+    RECT {
+        left,
+        top,
+        right,
+        bottom,
+    }
+}
 #[implement(ITfEditSession)]
 struct CaretQuery {
     context: ITfContext,
-    result: Rc<Cell<Option<RECT>>>,
+    result: Rc<Cell<yiime_core::SegmentAnchor>>,
+    ticket: u32,
     receiver: usize,
 }
 impl ITfEditSession_Impl for CaretQuery_Impl {
@@ -441,12 +450,11 @@ impl ITfEditSession_Impl for CaretQuery_Impl {
                 return Ok(());
             }
             LINE_HEIGHT.store(height, Ordering::Relaxed);
-            self.result.set(Some(RECT {
-                left: anchor[0],
-                top: anchor[1],
-                right: anchor[2],
-                bottom: anchor[3],
-            }));
+            let mut current = self.result.get();
+            if !current.arrive(self.ticket, anchor) {
+                return Ok(());
+            }
+            self.result.set(current);
             unsafe {
                 PostMessageW(self.receiver as HWND, WM_CARET_READ, 0, 0);
             }
@@ -810,7 +818,7 @@ struct TextService {
     /// Digest and time of the last text inserted for the box (see yiime_core::duplicate_commit).
     last_commit: Cell<Option<(u32, std::time::Instant)>>,
     /// Last good caret rectangle (shared with the asynchronous CaretQuery).
-    caret: Rc<Cell<Option<RECT>>>,
+    caret: Rc<Cell<yiime_core::SegmentAnchor>>,
     /// A rectangle arrived while the box was starting; sent once it is ready.
     caret_fresh: Cell<bool>,
     held_id: Cell<u64>,
@@ -865,7 +873,7 @@ impl TextService {
             session_window: Cell::new(null_mut()),
             pass_logged: Cell::new(None),
             last_commit: Cell::new(None),
-            caret: Rc::new(Cell::new(None)),
+            caret: Rc::new(Cell::new(yiime_core::SegmentAnchor::default())),
             caret_fresh: Cell::new(false),
             held_id: Cell::new(0),
             next_held: Cell::new(0),
@@ -1024,12 +1032,17 @@ impl TextService {
     /// The insertion point's screen rectangle for the box. Read without TF_ES_SYNC (Word may
     /// refuse synchronous sessions on the key path, SampleIME KeyHandler.cpp): TSF runs the read
     /// now when it can, else later, and the box is moved when it arrives (WM_CARET_READ). Until
-    /// then the last good rectangle is used.
+    /// then the box places itself (system caret, else mouse): a new session does not reuse the
+    /// previous one's rectangle (see [`yiime_core::SegmentAnchor`]).
     fn caret_rect(&self, context: &ITfContext) -> Option<RECT> {
         self.caret_fresh.set(false);
+        let mut anchor = self.caret.get();
+        let ticket = anchor.begin();
+        self.caret.set(anchor);
         let session: ITfEditSession = CaretQuery {
             context: context.clone(),
             result: self.caret.clone(),
+            ticket,
             receiver: self.receiver.get() as usize,
         }
         .into();
@@ -1040,11 +1053,11 @@ impl TextService {
                 TF_ES_ASYNCDONTCARE | TF_ES_READ,
             )
         };
-        self.caret.get()
+        self.caret.get().rect().map(rect_of)
     }
     /// A caret rectangle read asynchronously arrived: move the open box there.
     fn caret_arrived(&self) {
-        let Some(rect) = self.caret.get() else {
+        let Some(rect) = self.caret.get().rect().map(rect_of) else {
             return;
         };
         if !self.buffering() {

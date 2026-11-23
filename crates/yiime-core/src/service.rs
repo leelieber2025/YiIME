@@ -558,6 +558,37 @@ pub fn next_held_id(previous: u64) -> u64 {
     }
 }
 
+/// The box's anchor for one input session (segment), like qingjian
+/// apps/windows/tsf/src/com/composition/mod.rs report_caret and shared.rs set_composing: a session
+/// starts without an anchor (the box then uses the system caret or the mouse) instead of reusing
+/// the previous session's rectangle, which may belong to another line, field or document; and a
+/// caret read still running for an earlier session is ignored when it arrives.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SegmentAnchor {
+    generation: u32,
+    rect: Option<[i32; 4]>,
+}
+
+impl SegmentAnchor {
+    /// A new session: forget the old anchor. Returns the ticket for this session's caret read.
+    pub fn begin(&mut self) -> u32 {
+        self.generation = self.generation.wrapping_add(1);
+        self.rect = None;
+        self.generation
+    }
+    /// A caret read finished. Returns whether it was for the current session (and kept).
+    pub fn arrive(&mut self, ticket: u32, rect: [i32; 4]) -> bool {
+        if ticket != self.generation {
+            return false;
+        }
+        self.rect = Some(rect);
+        true
+    }
+    pub fn rect(self) -> Option<[i32; 4]> {
+        self.rect
+    }
+}
+
 /// What a Shift tap in the input box does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShiftTapAction {
@@ -630,6 +661,22 @@ pub fn keys_to_give_back(first: Option<char>, pending: &str, box_ready: bool) ->
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn anchor_belongs_to_one_session() {
+        let mut anchor = SegmentAnchor::default();
+        let first = anchor.begin();
+        assert!(anchor.arrive(first, [10, 20, 11, 40]));
+        assert_eq!(anchor.rect(), Some([10, 20, 11, 40]));
+        // Next session (Word answers the read later): no stale rectangle in the meantime, and the
+        // first session's late read does not move the new box.
+        let second = anchor.begin();
+        assert_eq!(anchor.rect(), None);
+        assert!(!anchor.arrive(first, [500, 500, 501, 520]));
+        assert_eq!(anchor.rect(), None);
+        assert!(anchor.arrive(second, [30, 60, 31, 80]));
+        assert_eq!(anchor.rect(), Some([30, 60, 31, 80]));
+    }
+
     #[test]
     fn protocol_values_survive_a_32_bit_dll() {
         // Handles: the same window whether it came zero-extended from a 32-bit sender or
