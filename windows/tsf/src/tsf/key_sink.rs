@@ -98,6 +98,20 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 }
                 return Ok(true.into());
             }
+            // 译 mode (PlainMode=false): letters go to the draft box. 普通五笔 keeps
+            // in-document composition.
+            if !plain_mode() && (0x41..=0x5a).contains(&key.0) {
+                if self.inline.active() {
+                    self.inline.cancel(self.client_id.get());
+                }
+                self.probe_new_field(context);
+                let opened = self.open_editor(context.clone(), key.0 as u8);
+                if !opened {
+                    self.note_pass(Some(yiime_core::PassReason::BoxUnavailable));
+                    log("翻译模式：草稿框未能打开，按键交还应用");
+                }
+                return Ok(opened.into());
+            }
             if self.inline.key(context, self.client_id.get(), key.0) {
                 return Ok(true.into());
             }
@@ -146,15 +160,24 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             }
             let guid = unsafe { *guid };
             if guid == EDITOR_KEY {
+                log("保留键：Ctrl+Alt+T 打开草稿框");
                 self.inline.cancel(self.client_id.get());
                 if let Some(context) = context.as_ref() {
                     self.probe_new_field(context);
-                    return Ok(self.open_editor(context.clone(), 0).into());
+                    let opened = self.open_editor(context.clone(), 0);
+                    if !opened {
+                        log("保留键：草稿框未能打开");
+                    }
+                    return Ok(opened.into());
                 }
+                log("保留键：没有焦点上下文，草稿框未打开");
                 return Ok(false.into());
             }
             if guid == TOGGLE_KEY {
                 self.inline.cancel(self.client_id.get());
+            }
+            if guid == PLAIN_KEY {
+                log("保留键：切换普通五笔/翻译模式");
             }
             if guid == HISTORY_KEY {
                 // Passed through to the application when history is off, a session is active, in

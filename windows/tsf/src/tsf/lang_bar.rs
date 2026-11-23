@@ -126,10 +126,14 @@ impl InputModeButton_Impl {
                 set_keyboard_mode(&self.manager, self.client_id, id == MENU_CHINESE);
             }
             MENU_TRANSLATE | MENU_PLAIN => {
-                set_plain_mode(id == MENU_PLAIN);
+                let plain = id == MENU_PLAIN;
+                set_plain_mode(plain);
                 if !chinese {
                     set_keyboard_mode(&self.manager, self.client_id, true);
                 }
+                // Arm the route even if the flag was already in this state: 译 opens the
+                // draft box, 普通五笔 closes it.
+                notify_plain_mode(plain);
             }
             MENU_PUNCT => {
                 toggle_option(Flag::PunctEnglish);
@@ -190,6 +194,12 @@ pub(super) fn plain_mode() -> bool {
 }
 pub(super) fn set_plain_mode(on: bool) -> bool {
     OPTIONS.set_flag(Flag::PlainMode, on)
+}
+pub(super) fn page_size() -> usize {
+    OPTIONS.page_size()
+}
+pub(super) fn shuangpin_scheme() -> Option<yiime_core::Shuangpin> {
+    OPTIONS.shuangpin()
 }
 /// Chinese punctuation without the input box (US-layout virtual key + Shift, mapping in
 /// yiime-core); `.` `:` after digits stay half-width. Quotes return None and are alternated by the

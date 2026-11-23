@@ -1,22 +1,287 @@
 use super::*;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use windows_sys::Win32::Foundation::SIZE;
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, COLOR_WINDOW, COLOR_WINDOWTEXT, DT_LEFT, DT_NOPREFIX, DT_WORDBREAK, DrawTextW,
-    EndPaint, FillRect, GetSysColor, GetSysColorBrush, InvalidateRect, PAINTSTRUCT, SetBkMode,
-    SetTextColor, TRANSPARENT,
+    BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush,
+    DEFAULT_CHARSET, DeleteObject, EndPaint, FillRect, GetDC, GetStockObject,
+    GetTextExtentPoint32W, HFONT, InvalidateRect, OUT_DEFAULT_PRECIS, PAINTSTRUCT, ReleaseDC,
+    SelectObject, SetBkMode, SetTextColor, TRANSPARENT, TextOutW, WHITE_BRUSH,
 };
+use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CS_HREDRAW, CS_VREDRAW, GetClientRect, GetWindowTextLengthW, GetWindowTextW, MA_NOACTIVATE,
-    WM_MOUSEACTIVATE, WM_PAINT,
+    CS_DROPSHADOW, CS_HREDRAW, CS_VREDRAW, GetClientRect, GetCursorPos, GetWindowRect,
+    MA_NOACTIVATE, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_PAINT,
 };
 
 const CANDIDATE_GUID: GUID = GUID::from_u128(0xd39fb88b_09bb_4ca2_a050_174b5ab3b7c0);
 const CANDIDATE_CLASS: &str = "YiIMECandidate";
+// Same palette and metrics as the draft box (windows_gui/app.rs and candidate.rs).
+const BLUE: u32 = 0x00C0_6000;
+const GRAY: u32 = 0x0080_8080;
+const INK: u32 = 0x0020_2020;
+const HIGHLIGHT: u32 = 0x00FB_E9D6;
+const SEPARATOR: u32 = 0x00E0_E0E0;
+const FONT_PX: i32 = 18;
+const SMALL_FONT_PX: i32 = 13;
+const PAD: i32 = 6;
+const LINE_H: i32 = 24;
+const GAP: i32 = 14;
 static DICTIONARY: DictionaryLock<yiime_core::MixedInput> = DictionaryLock::new();
+static USER_WORDS: Mutex<Option<yiime_core::UserWordsReloader>> = Mutex::new(None);
 
-fn candidates(code: &str) -> Vec<yiime_core::Candidate> {
-    DICTIONARY
-        .get_or_init(yiime_core::MixedInput::bundled)
-        .candidates(code, 9)
+struct DisplayCandidate {
+    text: String,
+    hint: String,
+    complete: bool,
+}
+
+struct CandidateView {
+    code: String,
+    rows: Vec<DisplayCandidate>,
+}
+
+fn user_words_path() -> Option<PathBuf> {
+    let appdata = PathBuf::from(std::env::var_os("APPDATA")?);
+    let dir = appdata.join("YiIME");
+    let legacy = appdata.join("InputTranslation");
+    let folder = if !dir.exists() && legacy.is_dir() {
+        legacy
+    } else {
+        dir
+    };
+    Some(folder.join(yiime_core::USER_WORDS_FILE))
+}
+
+fn dictionary() -> &'static yiime_core::MixedInput {
+    let input = DICTIONARY.get_or_init(yiime_core::MixedInput::bundled);
+    refresh_user_words(input);
+    input
+}
+
+fn refresh_user_words(input: &yiime_core::MixedInput) {
+    let mut guard = USER_WORDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.is_none() {
+        let (reloader, contents) = yiime_core::UserWordsReloader::load(user_words_path());
+        if let Some(contents) = contents {
+            input.set_user_words(&contents);
+        }
+        *guard = Some(reloader);
+    } else if let Some(reloader) = guard.as_mut()
+        && let Some(contents) = reloader.check()
+    {
+        input.set_user_words(&contents);
+    }
+}
+
+fn hint_for(input: &yiime_core::MixedInput, candidate: &yiime_core::Candidate) -> String {
+    // Same annotations as the draft box (engine.rs Composer::set_code): Wubi matches show
+    // no hint; others get the remaining/full Wubi code, wildcard a short form, corrections
+    // a 纠错 label.
+    if candidate.source == yiime_core::Source::Wubi {
+        return String::new();
+    }
+    let Some(hint) = input.wubi_hint(&candidate.text) else {
+        return if candidate.source == yiime_core::Source::Corrected {
+            "(纠错)".to_owned()
+        } else {
+            String::new()
+        };
+    };
+    let hint = if candidate.source == yiime_core::Source::Wildcard {
+        hint.rsplit('/').next().unwrap_or(&hint).to_owned()
+    } else {
+        hint
+    };
+    if candidate.source == yiime_core::Source::Corrected {
+        format!("(纠错 {hint})")
+    } else {
+        format!("({hint})")
+    }
+}
+
+fn candidates(code: &str) -> Vec<DisplayCandidate> {
+    let input = dictionary();
+    let size = page_size();
+    let fuzzy = option(Flag::FuzzyPinyin);
+    let traditional = option(Flag::Traditional);
+    let common_only = option(Flag::CommonOnly);
+    let scheme = shuangpin_scheme();
+    let pinyin_first = option(Flag::PinyinFirst) || scheme.is_some();
+    let pending = match scheme {
+        Some(_) if code.replace('\'', "").len() % 2 == 1 => code.chars().last(),
+        _ => None,
+    };
+    let lookup = match scheme {
+        _ if code.is_empty() => None,
+        Some(scheme) => {
+            let keys = &code[..code.len() - pending.map_or(0, char::len_utf8)];
+            if keys.replace('\'', "").is_empty() {
+                None
+            } else {
+                scheme.expand(keys)
+            }
+        }
+        None => Some(code.to_owned()),
+    };
+    let mut items = match &lookup {
+        None => Vec::new(),
+        Some(lookup) => input.candidates_filtered(
+            lookup,
+            size,
+            size,
+            fuzzy,
+            pinyin_first,
+            common_only,
+            common_only && !traditional,
+        ),
+    };
+    if let Some(scheme) = scheme {
+        items.retain_mut(|candidate| {
+            if candidate.rest.is_empty() {
+                return true;
+            }
+            match scheme.rest_keys(code, &candidate.rest) {
+                Some(keys) => {
+                    candidate.rest = keys;
+                    true
+                }
+                None => false,
+            }
+        });
+        if let Some(key) = pending {
+            for candidate in &mut items {
+                candidate.rest.push(key);
+                candidate.source = yiime_core::Source::Partial;
+            }
+        }
+    }
+    items
+        .into_iter()
+        .map(|mut candidate| {
+            let hint = hint_for(input, &candidate);
+            if traditional {
+                candidate.text = yiime_core::to_traditional(&candidate.text);
+            }
+            DisplayCandidate {
+                text: candidate.text,
+                hint,
+                complete: candidate.complete,
+            }
+        })
+        .collect()
+}
+
+fn window_dpi(hwnd: HWND) -> u32 {
+    let dpi = if !hwnd.is_null() {
+        unsafe { GetDpiForWindow(hwnd) }
+    } else {
+        0
+    };
+    let dpi = if dpi == 0 {
+        unsafe { GetDpiForSystem() }
+    } else {
+        dpi
+    };
+    dpi.max(96)
+}
+
+fn scale_px(px: i32, dpi: u32) -> i32 {
+    (i64::from(px) * i64::from(dpi) / 96).max(1) as i32
+}
+
+unsafe fn create_ui_font(height: i32) -> HFONT {
+    // windows_gui/candidate.rs create_font: Microsoft YaHei UI, ClearType, default charset.
+    unsafe {
+        CreateFontW(
+            -height,
+            0,
+            0,
+            0,
+            400,
+            0,
+            0,
+            0,
+            DEFAULT_CHARSET as _,
+            OUT_DEFAULT_PRECIS as _,
+            CLIP_DEFAULT_PRECIS as _,
+            CLEARTYPE_QUALITY as _,
+            0,
+            wide("Microsoft YaHei UI").as_ptr(),
+        )
+    }
+}
+
+unsafe fn text_width(hdc: windows_sys::Win32::Graphics::Gdi::HDC, text: &str) -> i32 {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let mut size = SIZE { cx: 0, cy: 0 };
+    unsafe {
+        GetTextExtentPoint32W(hdc, units.as_ptr(), units.len() as i32, &mut size);
+    }
+    size.cx
+}
+
+unsafe fn draw_text(
+    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+    x: i32,
+    y: i32,
+    color: u32,
+    text: &str,
+) {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    unsafe {
+        SetTextColor(hdc, color);
+        TextOutW(hdc, x, y, units.as_ptr(), units.len() as i32);
+    }
+}
+
+/// Client size for the current candidates, matching the draft box row layout.
+fn measure_view(hwnd: HWND, view: &CandidateView) -> (i32, i32) {
+    let dpi = window_dpi(hwnd);
+    let pad = scale_px(PAD, dpi);
+    let line_h = scale_px(LINE_H, dpi);
+    let gap = scale_px(GAP, dpi);
+    let hdc = unsafe { GetDC(hwnd) };
+    if hdc.is_null() {
+        let rows = 1 + i32::from(!view.rows.is_empty());
+        return (scale_px(200, dpi), pad + rows * line_h + pad);
+    }
+    let font = unsafe { create_ui_font(scale_px(FONT_PX, dpi)) };
+    let small = unsafe { create_ui_font(scale_px(SMALL_FONT_PX, dpi)) };
+    let old = unsafe { SelectObject(hdc, font as _) };
+    let mut width = unsafe { text_width(hdc, &view.code) } + 2 * pad;
+    let mut x = pad;
+    for (index, row) in view.rows.iter().enumerate() {
+        let label = format!("{}.{}", index + 1, row.text);
+        let mut w = unsafe { text_width(hdc, &label) };
+        if !row.hint.is_empty() {
+            unsafe { SelectObject(hdc, small as _) };
+            w += unsafe { text_width(hdc, &row.hint) } + 1;
+            unsafe { SelectObject(hdc, font as _) };
+        }
+        x += w + gap;
+    }
+    if !view.rows.is_empty() {
+        width = width.max(x + pad);
+    }
+    unsafe {
+        SelectObject(hdc, old);
+        if !font.is_null() {
+            DeleteObject(font as _);
+        }
+        if !small.is_null() {
+            DeleteObject(small as _);
+        }
+        ReleaseDC(hwnd, hdc);
+    }
+    let rows = 1 + i32::from(!view.rows.is_empty());
+    // +2 for the 1px separator under the code and the window border inset.
+    (
+        width.max(scale_px(120, dpi)) + 2,
+        pad + rows * line_h + pad + 2,
+    )
 }
 
 fn log_hresult(action: &str, error: &windows::core::Error) {
@@ -176,6 +441,8 @@ struct CandidateUi {
     manager: Rc<RefCell<Option<ITfUIElementMgr>>>,
     element: Rc<Cell<Option<u32>>>,
     layout: Rc<RefCell<Option<(ITfContext, u32)>>>,
+    view: Rc<RefCell<CandidateView>>,
+    last_caret: Rc<Cell<Option<(i32, i32, i32)>>>,
 }
 
 #[implement(ITfEditSession)]
@@ -348,10 +615,13 @@ impl ITfEditSession_Impl for PositionEdit_Impl {
         let range = unsafe { active.composition.GetRange()? };
         let caret = unsafe { range.Clone()? };
         unsafe { caret.Collapse(cookie, TF_ANCHOR_END)? };
-        if let Ok(view) = unsafe { self.context.GetActiveView() }
-            && let Some(position) = position_of(cookie, &view, &caret)
-        {
-            place(window, position);
+        if let Ok(view) = unsafe { self.context.GetActiveView() } {
+            if let Some(position) = position_of(cookie, &view, &caret) {
+                self.ui.last_caret.set(Some(position));
+                place(window, position);
+            } else if let Some(position) = self.ui.last_caret.get() {
+                place(window, position);
+            }
         }
         Ok(())
     }
@@ -395,21 +665,31 @@ impl ITfTextLayoutSink_Impl for LayoutSink_Impl {
 
 fn place(window: HWND, (mut x, top, bottom): (i32, i32, i32)) {
     unsafe {
+        let mut rect = windows_sys::Win32::Foundation::RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        };
+        GetWindowRect(window, &mut rect);
+        let width = (rect.right - rect.left).max(1);
+        let height = (rect.bottom - rect.top).max(1);
         let monitor = MonitorFromPoint(POINT { x, y: bottom }, MONITOR_DEFAULTTONEAREST);
         let mut info: MONITORINFO = std::mem::zeroed();
         info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        // Draft box candidate.rs place: below the caret, or above if it does not fit.
         let mut y = bottom + 4;
         if GetMonitorInfoW(monitor, &mut info) != 0 {
             x = x.clamp(
                 info.rcWork.left,
-                (info.rcWork.right - 420).max(info.rcWork.left),
+                (info.rcWork.right - width).max(info.rcWork.left),
             );
-            if y + 62 > info.rcWork.bottom {
-                y = top - 66;
+            if y + height > info.rcWork.bottom {
+                y = top - height - 4;
             }
             y = y.clamp(
                 info.rcWork.top,
-                (info.rcWork.bottom - 62).max(info.rcWork.top),
+                (info.rcWork.bottom - height).max(info.rcWork.top),
             );
         }
         SetWindowPos(
@@ -417,10 +697,19 @@ fn place(window: HWND, (mut x, top, bottom): (i32, i32, i32)) {
             HWND_TOPMOST,
             x,
             y,
-            420,
-            62,
+            width,
+            height,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
+    }
+}
+
+fn mouse_caret() -> Option<(i32, i32, i32)> {
+    let mut point = POINT { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut point) } != 0 {
+        Some((point.x, point.y, point.y + 20))
+    } else {
+        None
     }
 }
 
@@ -428,10 +717,11 @@ fn register_candidate_class() -> bool {
     let instance = MODULE.load(Ordering::SeqCst) as _;
     let class = wide(CANDIDATE_CLASS);
     let wc = WNDCLASSW {
-        style: CS_HREDRAW | CS_VREDRAW,
+        // CS_DROPSHADOW matches the draft box (windows_gui/app.rs).
+        style: CS_HREDRAW | CS_VREDRAW | CS_DROPSHADOW,
         lpfnWndProc: Some(candidate_proc),
         hInstance: instance,
-        hbrBackground: (COLOR_WINDOW + 1) as _,
+        hbrBackground: unsafe { GetStockObject(WHITE_BRUSH) } as _,
         lpszClassName: class.as_ptr(),
         ..unsafe { std::mem::zeroed() }
     };
@@ -460,47 +750,114 @@ unsafe fn candidate_proc_impl(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) ->
     if message == WM_MOUSEACTIVATE {
         return MA_NOACTIVATE as LRESULT;
     }
-    if message == WM_PAINT {
-        let mut paint = unsafe { std::mem::zeroed::<PAINTSTRUCT>() };
-        let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
-        if !hdc.is_null() {
-            let mut rect = windows_sys::Win32::Foundation::RECT {
-                left: 0,
-                top: 0,
-                right: 0,
-                bottom: 0,
-            };
-            unsafe { GetClientRect(hwnd, &mut rect) };
-            unsafe { FillRect(hdc, &rect, GetSysColorBrush(COLOR_WINDOW)) };
-            unsafe { SetBkMode(hdc, TRANSPARENT as i32) };
-            unsafe { SetTextColor(hdc, GetSysColor(COLOR_WINDOWTEXT)) };
-            let length = unsafe { GetWindowTextLengthW(hwnd) };
-            if length > 0 {
-                let mut text = vec![0u16; length as usize + 1];
-                let written = unsafe { GetWindowTextW(hwnd, text.as_mut_ptr(), text.len() as i32) };
-                if written > 0 {
-                    let mut text_rect = windows_sys::Win32::Foundation::RECT {
-                        left: rect.left + 6,
-                        top: rect.top + 4,
-                        right: rect.right - 6,
-                        bottom: rect.bottom - 4,
-                    };
-                    unsafe {
-                        DrawTextW(
-                            hdc,
-                            text.as_ptr(),
-                            written,
-                            &mut text_rect,
-                            DT_LEFT | DT_WORDBREAK | DT_NOPREFIX,
-                        )
-                    };
-                }
-            }
-            unsafe { EndPaint(hwnd, &paint) };
+    if message == WM_NCDESTROY {
+        let data =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Rc<RefCell<CandidateView>>;
+        if !data.is_null() {
+            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
+            drop(unsafe { Box::from_raw(data) });
         }
         return 0;
     }
+    if message == WM_PAINT {
+        paint_candidates(hwnd);
+        return 0;
+    }
     unsafe { DefWindowProcW(hwnd, message, w, l) }
+}
+
+fn paint_candidates(hwnd: HWND) {
+    let mut paint = unsafe { std::mem::zeroed::<PAINTSTRUCT>() };
+    let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
+    if hdc.is_null() {
+        return;
+    }
+    let data =
+        unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Rc<RefCell<CandidateView>>;
+    let view = if data.is_null() {
+        None
+    } else {
+        Some(unsafe { (*data).borrow() })
+    };
+    let mut client = windows_sys::Win32::Foundation::RECT {
+        left: 0,
+        top: 0,
+        right: 0,
+        bottom: 0,
+    };
+    unsafe { GetClientRect(hwnd, &mut client) };
+    unsafe { FillRect(hdc, &client, GetStockObject(WHITE_BRUSH) as _) };
+    unsafe { SetBkMode(hdc, TRANSPARENT as i32) };
+    let Some(view) = view.as_ref() else {
+        unsafe { EndPaint(hwnd, &paint) };
+        return;
+    };
+    let dpi = window_dpi(hwnd);
+    let pad = scale_px(PAD, dpi);
+    let line_h = scale_px(LINE_H, dpi);
+    let gap = scale_px(GAP, dpi);
+    let font = unsafe { create_ui_font(scale_px(FONT_PX, dpi)) };
+    let small = unsafe { create_ui_font(scale_px(SMALL_FONT_PX, dpi)) };
+    let old = unsafe { SelectObject(hdc, font as _) };
+    let separator = unsafe { CreateSolidBrush(SEPARATOR) };
+    let line = windows_sys::Win32::Foundation::RECT {
+        left: pad,
+        top: pad + line_h - 2,
+        right: client.right - pad,
+        bottom: pad + line_h - 1,
+    };
+    unsafe {
+        FillRect(hdc, &line, separator);
+        DeleteObject(separator as _);
+        draw_text(hdc, pad, pad + 2, BLUE, &view.code);
+    }
+    if !view.rows.is_empty() {
+        let row_top = pad + line_h;
+        let mut x = pad;
+        for (index, row) in view.rows.iter().enumerate() {
+            let label = format!("{}.{}", index + 1, row.text);
+            let mut w = unsafe { text_width(hdc, &label) };
+            if !row.hint.is_empty() {
+                unsafe { SelectObject(hdc, small as _) };
+                w += unsafe { text_width(hdc, &row.hint) } + 1;
+                unsafe { SelectObject(hdc, font as _) };
+            }
+            if index == 0 {
+                let highlight = unsafe { CreateSolidBrush(HIGHLIGHT) };
+                let rect = windows_sys::Win32::Foundation::RECT {
+                    left: x - 3,
+                    top: row_top,
+                    right: x + w + 3,
+                    bottom: row_top + line_h - 2,
+                };
+                unsafe {
+                    FillRect(hdc, &rect, highlight);
+                    DeleteObject(highlight as _);
+                }
+            }
+            let color = if row.complete { INK } else { GRAY };
+            unsafe { draw_text(hdc, x, row_top + 2, color, &label) };
+            if !row.hint.is_empty() {
+                let hx = x + unsafe { text_width(hdc, &label) } + 1;
+                unsafe {
+                    let previous = SelectObject(hdc, small as _);
+                    draw_text(hdc, hx, row_top + 6, GRAY, &row.hint);
+                    SelectObject(hdc, previous);
+                }
+            }
+            x += w + gap;
+        }
+    }
+    unsafe {
+        SelectObject(hdc, old);
+        if !font.is_null() {
+            DeleteObject(font as _);
+        }
+        if !small.is_null() {
+            DeleteObject(small as _);
+        }
+        EndPaint(hwnd, &paint);
+    }
 }
 
 #[implement(ITfEditSession)]
@@ -548,13 +905,11 @@ impl CandidateUi {
         }
     }
     fn show(&self, context: &ITfContext, position: Option<(i32, i32, i32)>, code: &str) {
-        let mut text = format!("{code}\r\n");
-        for (index, candidate) in candidates(code).iter().enumerate() {
-            text.push_str(&format!("{} {}  ", index + 1, candidate.text));
-            if index == 4 {
-                text.push_str("\r\n");
-            }
-        }
+        let rows = candidates(code);
+        *self.view.borrow_mut() = CandidateView {
+            code: code.to_owned(),
+            rows,
+        };
         let mut window = self.window.get();
         if window.is_null() || unsafe { IsWindow(window) } == 0 {
             if !register_candidate_class() {
@@ -570,12 +925,12 @@ impl CandidateUi {
                 CreateWindowExW(
                     WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
                     wide(CANDIDATE_CLASS).as_ptr(),
-                    wide(&text).as_ptr(),
+                    wide("").as_ptr(),
                     WS_POPUP | WS_BORDER,
                     0,
                     0,
-                    420,
-                    62,
+                    0,
+                    0,
                     owner,
                     null_mut(),
                     MODULE.load(Ordering::SeqCst) as _,
@@ -583,13 +938,40 @@ impl CandidateUi {
                 )
             };
             self.window.set(window);
+            if !window.is_null() {
+                let leaked = Box::into_raw(Box::new(self.view.clone()));
+                unsafe { SetWindowLongPtrW(window, GWLP_USERDATA, leaked as _) };
+            }
         }
         if window.is_null() {
             log("候选窗未显示：CreateWindowEx 失败");
             return;
         }
-        unsafe { SetWindowTextW(window, wide(&text).as_ptr()) };
-        unsafe { InvalidateRect(window, std::ptr::null(), 1) };
+        let (width, height) = measure_view(window, &self.view.borrow());
+        unsafe {
+            SetWindowPos(
+                window,
+                HWND_TOPMOST,
+                0,
+                0,
+                width,
+                height,
+                SWP_NOACTIVATE | windows_sys::Win32::UI::WindowsAndMessaging::SWP_NOMOVE,
+            );
+            InvalidateRect(window, std::ptr::null(), 1);
+        }
+        let position = if let Some(position) = position {
+            self.last_caret.set(Some(position));
+            Some(position)
+        } else if let Some(position) = self.last_caret.get() {
+            log("候选窗：光标矩形为空，使用上次位置");
+            Some(position)
+        } else if let Some(position) = mouse_caret() {
+            log("候选窗：光标矩形为空，使用鼠标位置");
+            Some(position)
+        } else {
+            None
+        };
         if let Some(position) = position {
             place(window, position);
         } else {
@@ -652,6 +1034,11 @@ impl InlineInput {
                 manager: Rc::new(RefCell::new(None)),
                 element: Rc::new(Cell::new(None)),
                 layout: Rc::new(RefCell::new(None)),
+                view: Rc::new(RefCell::new(CandidateView {
+                    code: String::new(),
+                    rows: Vec::new(),
+                })),
+                last_caret: Rc::new(Cell::new(None)),
             },
         }
     }

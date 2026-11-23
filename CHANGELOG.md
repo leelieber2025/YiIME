@@ -17,6 +17,9 @@
 - **原文本框组字开始失败（`0x80070057`）导致所有程序都没有候选窗**：组字开始改为微软 SampleIME 的写法（`StartComposition.cpp` 的 `CStartCompositionEditSession::DoEditSession`）：先用 `TF_IAS_QUERYONLY` 取插入范围，再把实现了 `ITfCompositionSink` 的对象传给 `StartComposition`，预编辑文字写在组字范围上（`Composition.cpp` 的 `_AddComposingAndChar` / `OnCompositionTerminated`）。此前传入空 sink 并先把编码当正文插入，宿主返回 `E_INVALIDARG`，文档里没有组字、候选窗也不出现。青简 `composition/mod.rs` 的 `start_composition` 与 weasel `WeaselTSF/Composition.cpp` 与此相同。
 - **组字会话已经执行失败时不再吞掉按键**：`RequestEditSession` 被受理只说明会话已接受（SampleIME `KeyHandler.cpp` 的 `_InvokeKeyHandler` 用 `TF_ES_ASYNCDONTCARE | TF_ES_READWRITE`、不用 `TF_ES_SYNC`；青简 `edit/update.rs` 同）。若回调已经跑完并失败，按键改走草稿编辑器；草稿框也打不开则交还应用。
 - **登录后自动启动 YiIME.exe，输入法也可按需拉起**：安装程序在所有用户的「启动」文件夹加入快捷方式（同青简 `{commonstartup}`）。需要草稿框或设置、且服务不在时，DLL 按青简 `launch.rs` 用 `ShellExecute`、冷却和互斥体拉起同目录的 `YiIME.exe`。安装/卸载期间持有 `Global\YiIMEInstaller` 互斥体，不在那时拉起。拉起被拒绝时不吞键。
+- **Ctrl+Alt+T 打开的草稿框无法上屏（「输入法没有接受提交，草稿已保留」）**：用 `ShellExecute` 按需拉起 `YiIME.exe` 时拿不到进程 id，接收窗口把就绪握手和提交的 `WM_COPYDATA` 都拒掉了，输入框因而一直等不到确认。现在在会话等待就绪时，把发送方校验为同目录的 `YiIME.exe` 后绑定其进程，再按 SampleIME `Composition.cpp` 的 `_AddCharAndFinalize` / 青简 `edit/update.rs` 在记住的上下文里用 `TF_ES_READWRITE` 编辑会话插入文字，成功后回 `WM_APP+10` 确认。
+- **翻译模式没有草稿框**：语言栏「译/翻译模式」和切换热键只改了 `PlainMode` 标志，字母仍走文档内组字。现在 `PlainMode=false`（译）把字母交给草稿框，`普通五笔` 仍在文档内组字；菜单第 3 项和切换热键会切换并打开或收起草稿框；Ctrl+Alt+T 在两种模式下都打开草稿框。
+- **候选窗过小、文字被裁切、没有编码提示**：候选窗不再写死 420×62，改为按微软雅黑 UI 字号和行高（与草稿框相同：18/13 像素、行高 24、内边距 6，并按每监视器 DPI 缩放）自绘排版，白底、蓝色编码、浅橙高亮首选项、灰色编码提示和分隔线（同草稿框 `candidate.rs` 的配色与「1.字 (编码)」样式）。提示为五笔剩余/全码（与草稿框 `engine.rs` 一致）。候选遵循每页个数、模糊音、简繁、双拼和用户词（`candidates_filtered` / `%APPDATA%\YiIME\user_words.txt`）。`GetTextExt` 为空时沿用上次光标矩形（青简做法），再不行则用鼠标位置，避免把窗口藏掉。
 - 组字更新走异步编辑会话（只请求 `TF_ES_READWRITE`，不用 `TF_ES_SYNC`）；同一窗口里的焦点文档变化或上下文出入栈不再取消组字。候选窗处理 `WM_MOUSEACTIVATE`，点击不抢焦点。诊断日志记录组字各步骤的 HRESULT、开始/更新/结束/取消，以及候选窗未显示的原因（不含输入内容）。
 - 文字已经上屏时，输入框不再保留草稿并报错。
 - Chrome、Electron 在输入框重新获得焦点时换文档，不再被当成换了输入框。
@@ -25,12 +28,11 @@
 
 ### 变更
 
-- **普通输入改在原文本框里组字**：编码直接写在目标文本框，旁边显示候选；空格或回车选第一项，数字 1–9 选对应项。按 **Ctrl+Alt+T** 打开草稿编辑器再翻译。单独按 Shift 在目标文本框里切换中英。私密输入框仍组字，不学习、不记历史、不翻译。
+- **普通输入改在原文本框里组字**：编码直接写在目标文本框，旁边显示候选；空格或回车选第一项，数字 1–9 选对应项。语言栏选 **普通五笔** 时走这条路径。选 **译/翻译模式** 时字母改进入草稿编辑器再翻译；按 **Ctrl+Alt+T** 在两种模式下都打开草稿框。单独按 Shift 在目标文本框里切换中英。私密输入框仍组字，不学习、不记历史、不翻译。
 
 ### 已知问题
 
-- Windows 开始菜单搜索、设置等 UWP/沙箱应用里暂时不能使用 YiIME，计划在 0.3 支持。
-- 这一版的候选不跟随模糊音、双拼、简繁、用户词和每页候选数。
+- 部分 UWP/沙箱应用（如设置）里仍可能无法使用 YiIME，计划在 0.3 支持。开始菜单搜索和资源管理器搜索已可在文档内组字上屏。
 
 ## [0.2.1-rc.3] - 2026-11-22
 

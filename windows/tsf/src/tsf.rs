@@ -73,8 +73,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, HWND_MESSAGE, HWND_TOPMOST, IMAGE_ICON, IsChild, IsWindow, KillTimer,
     LoadImageW, PostMessageW, RegisterClassW, SM_CXSMICON, SMTO_ABORTIFHUNG, SW_HIDE,
     SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageTimeoutW, SetTimer, SetWindowLongPtrW, SetWindowPos,
-    SetWindowTextW, ShowWindow, WM_APP, WM_COPYDATA, WM_CREATE, WM_TIMER, WNDCLASSW, WS_BORDER,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    ShowWindow, WM_APP, WM_COPYDATA, WM_CREATE, WM_TIMER, WNDCLASSW, WS_BORDER, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, FindWindowExW, FindWindowW, MF_CHECKED,
@@ -91,8 +91,9 @@ mod receiver;
 mod registration;
 use inline::InlineInput;
 use lang_bar::{
-    InputModeButton, LangBarSink, chinese_punctuation, history_key_text, option, parse_hotkey,
-    plain_mode, plain_toggle_text, refresh_sink, set_plain_mode, toggle_option,
+    InputModeButton, LangBarSink, chinese_punctuation, history_key_text, option, page_size,
+    parse_hotkey, plain_mode, plain_toggle_text, refresh_sink, set_plain_mode, shuangpin_scheme,
+    toggle_option,
 };
 use registration::{register, unregister};
 
@@ -149,9 +150,11 @@ const READY_TIMEOUT_MS: u64 = 5000;
 const READY_POLL_MS: u32 = 250;
 /// The InputScope privacy of a context (see yiime_core::private_scope), None until read.
 type ScopeCache = Option<(ITfContext, Rc<Cell<Option<bool>>>)>;
-/// Receiver messages: an asynchronous InputScope read finished (12), a caret rectangle arrived (13).
+/// Receiver messages: an asynchronous InputScope read finished (12), a caret rectangle arrived (13),
+/// the language-bar or hotkey switched 译/普通五笔 (14, wParam 0 = 译, 1 = 普通五笔).
 const WM_SCOPE_READ: u32 = WM_APP + 12;
 const WM_CARET_READ: u32 = WM_APP + 13;
+const WM_TRANSLATE_MODE: u32 = WM_APP + 14;
 static MODULE: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 /// Last good caret line height (yiime_core::caret_anchor).
 static LINE_HEIGHT: AtomicI32 = AtomicI32::new(0);
@@ -255,6 +258,10 @@ const CATEGORIES: [GUID; 6] = [
 ];
 /// Small diagnostic log: %TEMP%\YiIME-tsf.log (rotated to .old over 512 KB); ignored where it
 /// cannot be written (AppContainer etc.).
+fn log_hresult(action: &str, error: &windows::core::Error) {
+    log(&format!("{action}：{:#010x}", error.code().0 as u32));
+}
+
 fn log(message: &str) {
     use std::io::Write;
     let path = std::env::temp_dir().join("YiIME-tsf.log");
@@ -310,31 +317,44 @@ impl IClassFactory_Impl for ClassFactory_Impl {
 struct CommitEdit {
     context: ITfContext,
     text: String,
+    /// None until DoEditSession finishes, then Some(success).
+    outcome: Rc<Cell<Option<bool>>>,
 }
 impl ITfEditSession_Impl for CommitEdit_Impl {
     fn DoEditSession(&self, cookie: u32) -> Result<()> {
         com_guard("DoEditSession", || {
-            let insert: ITfInsertAtSelection = self.context.cast()?;
-            let utf16: Vec<u16> = self.text.encode_utf16().collect();
-            let range = unsafe {
-                insert.InsertTextAtSelection(cookie, INSERT_TEXT_AT_SELECTION_FLAGS(0), &utf16)?
-            };
-            let caret = unsafe { range.Clone()? };
-            unsafe {
-                caret.Collapse(cookie, TF_ANCHOR_END)?;
-            }
-            let selection = TF_SELECTION {
-                range: ManuallyDrop::new(Some(caret)),
-                style: TF_SELECTIONSTYLE {
-                    ase: TF_AE_END,
-                    fInterimChar: false.into(),
-                },
-            };
-            let result = unsafe {
-                self.context
-                    .SetSelection(cookie, std::slice::from_ref(&selection))
-            };
-            drop(ManuallyDrop::into_inner(selection.range));
+            let result = (|| {
+                let insert: ITfInsertAtSelection = self
+                    .context
+                    .cast()
+                    .inspect_err(|error| log_hresult("上屏：ITfInsertAtSelection 接口", error))?;
+                let utf16: Vec<u16> = self.text.encode_utf16().collect();
+                // SampleIME Composition.cpp `_AddCharAndFinalize`: insert the committed
+                // text at the selection (flags 0), then collapse the caret to the end.
+                let range = unsafe {
+                    insert.InsertTextAtSelection(cookie, INSERT_TEXT_AT_SELECTION_FLAGS(0), &utf16)
+                }
+                .inspect_err(|error| log_hresult("上屏：InsertTextAtSelection", error))?;
+                let caret = unsafe { range.Clone()? };
+                unsafe {
+                    caret.Collapse(cookie, TF_ANCHOR_END)?;
+                }
+                let selection = TF_SELECTION {
+                    range: ManuallyDrop::new(Some(caret)),
+                    style: TF_SELECTIONSTYLE {
+                        ase: TF_AE_END,
+                        fInterimChar: false.into(),
+                    },
+                };
+                let result = unsafe {
+                    self.context
+                        .SetSelection(cookie, std::slice::from_ref(&selection))
+                }
+                .inspect_err(|error| log_hresult("上屏：SetSelection", error));
+                drop(ManuallyDrop::into_inner(selection.range));
+                result
+            })();
+            self.outcome.set(Some(result.is_ok()));
             result
         })
     }
@@ -806,6 +826,17 @@ fn open_tray_window(history: bool) {
         launch::LaunchOutcome::Refused => log("启动托盘失败：无法拉起 YiIME.exe"),
     }
 }
+
+/// Language-bar menu lives on the button (no TextService); the session receiver applies the route.
+fn notify_plain_mode(plain: bool) {
+    let receiver = SESSION_RECEIVER.with(Cell::get);
+    if !receiver.is_null() {
+        unsafe {
+            let _ = PostMessageW(receiver, WM_TRANSLATE_MODE, usize::from(plain), 0);
+        }
+    }
+}
+
 /// Longest Shift hold that counts as a Chinese/English tap.
 const SHIFT_TAP_MAX: std::time::Duration = std::time::Duration::from_millis(600);
 
@@ -970,6 +1001,19 @@ impl TextService {
     /// editor exited or did not become ready in time and the session was given up: the first
     /// letter and the buffered ones are typed into the application.
     fn check_startup(&self) -> bool {
+        // ShellExecuteW does not return a pid: bind a running companion as soon as its
+        // window appears so the ready/commit COPYDATA is not rejected (editor_pid == 0).
+        if self.editor_open.get()
+            && self.editor_pid.get() == 0
+            && let Some(editor) = companion_exe()
+            && let Some(host) = crate::process_security::process_security(0)
+            && let Some((found, pid)) = find_editor_service(&editor, &host)
+        {
+            self.editor_pid.set(pid);
+            self.starting_window.set(found);
+            self.allow_editor_foreground();
+            log(&format!("输入框服务已找到，等待就绪握手：pid={pid}"));
+        }
         let overdue = self
             .ready_deadline
             .get()
@@ -1302,6 +1346,7 @@ impl TextService {
         let session: ITfEditSession = CommitEdit {
             context: context.clone(),
             text,
+            outcome: Rc::new(Cell::new(None)),
         }
         .into();
         unsafe { context.RequestEditSession(self.client_id.get(), &session, TF_ES_READWRITE) }
@@ -1433,6 +1478,7 @@ impl TextService {
             set_keyboard_mode(manager, self.client_id.get(), true);
         }
         self.refresh_mode_button();
+        notify_plain_mode(plain);
         true
     }
     fn add_mode_button(&self, manager: &ITfThreadMgr, client_id: u32) {
@@ -1511,6 +1557,7 @@ impl TextService {
         // The input box is one resident service shared by all applications: reuse the one this
         // instance already talks to, else one found running (same EXE), else start it.
         let Some(editor) = companion_exe() else {
+            log("草稿框：找不到 YiIME.exe");
             return false;
         };
         let mut window = self.editor_window.get();
@@ -1607,14 +1654,21 @@ impl TextService {
                 && unsafe { PostMessageW(window, WM_APP + 2, target, first_key as isize) } != 0
             {
                 self.start_ready_timer();
+                log("草稿框已打开（已连接到运行中的服务）");
                 return true;
             }
+            log(if answered && !accepted {
+                "草稿框：COPYDATA 被拒绝，改启动新进程"
+            } else {
+                "草稿框：未能激活已有服务，改启动新进程"
+            });
             if let Some(child) = self.editor.borrow_mut().as_mut() {
                 let _ = child.kill();
             }
             self.reset_editor();
         }
         let Ok(path) = module_path() else {
+            log("草稿框：无法确定 DLL 路径");
             return false;
         };
         let Some(directory) = std::path::Path::new(&path).parent() else {
@@ -1877,14 +1931,86 @@ impl TextService {
         self.insert_text(&context, text)
     }
     fn insert_text(&self, context: &ITfContext, text: String) -> bool {
+        // qingjian edit/update.rs request_update: TF_ES_READWRITE only (no TF_ES_SYNC);
+        // Win11 Notepad and other immersive hosts can crash on a synchronous lock.
+        // SampleIME KeyHandler.cpp uses TF_ES_ASYNCDONTCARE | TF_ES_READWRITE for the same reason.
+        let outcome = Rc::new(Cell::new(None));
         let session: ITfEditSession = CommitEdit {
             context: context.clone(),
             text,
+            outcome: outcome.clone(),
         }
         .into();
-        unsafe { context.RequestEditSession(self.client_id.get(), &session, TF_ES_READWRITE) }
-            .and_then(|status| status.ok())
-            .is_ok()
+        let accepted = match unsafe {
+            context.RequestEditSession(self.client_id.get(), &session, TF_ES_READWRITE)
+        } {
+            Ok(status) => match status.ok() {
+                Ok(()) => {
+                    log("上屏编辑会话已受理");
+                    true
+                }
+                Err(error) => {
+                    log_hresult("上屏编辑会话返回", &error);
+                    false
+                }
+            },
+            Err(error) => {
+                log_hresult("上屏编辑会话未被受理", &error);
+                false
+            }
+        };
+        if !accepted {
+            return false;
+        }
+        match outcome.get() {
+            Some(true) => true,
+            Some(false) => {
+                log("上屏编辑会话已失败");
+                false
+            }
+            None => {
+                log("上屏编辑会话已受理，等待回调写入");
+                true
+            }
+        }
+    }
+    /// Accept COPYDATA only from the bound YiIME.exe, or bind it on the first packet of a
+    /// session started with ShellExecuteW (which does not return a process id).
+    fn bind_editor_sender(&self, sender: HWND) -> bool {
+        let pid = window_pid(sender);
+        if pid == 0 {
+            log("COPYDATA 被拒绝：无法取得发送进程");
+            return false;
+        }
+        let expected = self.editor_pid.get();
+        if expected != 0 {
+            if expected != pid {
+                log(&format!(
+                    "COPYDATA 被拒绝：发送进程 {pid} 不是已绑定的输入框 {expected}"
+                ));
+                return false;
+            }
+            return true;
+        }
+        if !self.editor_open.get() {
+            log("COPYDATA 被拒绝：当前没有输入会话");
+            return false;
+        }
+        let Some(exe) = companion_exe() else {
+            log("COPYDATA 被拒绝：找不到 YiIME.exe 路径");
+            return false;
+        };
+        let expected_path = exe.to_string_lossy().to_lowercase();
+        if process_image(pid)
+            .is_none_or(|path| path.to_string_lossy().to_lowercase() != expected_path)
+        {
+            log("COPYDATA 被拒绝：发送方不是本机 YiIME.exe");
+            return false;
+        }
+        self.editor_pid.set(pid);
+        self.allow_editor_foreground();
+        log(&format!("输入框进程已绑定：pid={pid}"));
+        true
     }
     fn finish_editor(&self) {
         self.editor_open.set(false);
@@ -1977,6 +2103,7 @@ impl TextService {
             let session: ITfEditSession = CommitEdit {
                 context: context.clone(),
                 text: pending,
+                outcome: Rc::new(Cell::new(None)),
             }
             .into();
             let _ = unsafe {
@@ -1987,6 +2114,43 @@ impl TextService {
 }
 
 impl TextService_Impl {
+    /// After the 译/普通五笔 flag changes: 译 opens (or re-uses) the draft box, 普通五笔
+    /// ends a draft session so the next letters compose in the document.
+    fn apply_plain_mode(&self, plain: bool) {
+        log(&format!(
+            "输入模式已切换：{}",
+            if plain {
+                "普通五笔"
+            } else {
+                "翻译模式"
+            }
+        ));
+        if plain {
+            if self.inline.active() {
+                // Stay in the document; just make sure a leftover session is consistent.
+            }
+            if self.buffering() {
+                self.drop_stale_session("已切换到普通五笔");
+            }
+            return;
+        }
+        if self.inline.active() {
+            self.inline.cancel(self.client_id.get());
+        }
+        if self.buffering() {
+            log("翻译模式：草稿框已在使用");
+            self.allow_editor_foreground();
+            return;
+        }
+        let Some(context) = self.focused_context() else {
+            log("翻译模式：没有焦点输入框，下一键打开草稿框");
+            return;
+        };
+        self.probe_new_field(&context);
+        if !self.open_editor(context, 0) {
+            log("翻译模式：草稿框未能打开，下一键再试");
+        }
+    }
     /// Starts reading the InputScope of a field a session opens in, unless already read.
     fn probe_new_field(&self, context: &ITfContext) {
         if !self

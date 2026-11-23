@@ -54,12 +54,9 @@ unsafe fn receiver_proc_impl(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> 
         if pointer.is_null() || l == 0 {
             return 0;
         }
-        let mut sender_pid = 0;
-        unsafe {
-            GetWindowThreadProcessId(w as HWND, &mut sender_pid);
-        }
-        // Only the editor service this instance started or verified (see find_editor_service).
-        if sender_pid == 0 || unsafe { (&(*pointer)).editor_pid.get() } != sender_pid {
+        // Only the editor service this instance started, found, or is waiting to bind
+        // after a ShellExecuteW launch (see bind_editor_sender).
+        if !unsafe { (*pointer).bind_editor_sender(w as HWND) } {
             return 0;
         }
         let packet = unsafe { &*(l as *const COPYDATASTRUCT) };
@@ -116,6 +113,9 @@ unsafe fn receiver_proc_impl(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> 
         let Ok(text) = String::from_utf16(units) else {
             return 0;
         };
+        if unsafe { (*pointer).waiting_for_editor() } {
+            let _ = unsafe { (*pointer).editor_ready(w as HWND) };
+        }
         return unsafe { (*pointer).commit(text) as LRESULT };
     }
     if message == WM_SCOPE_READ || message == WM_CARET_READ {
@@ -126,6 +126,13 @@ unsafe fn receiver_proc_impl(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> 
             } else {
                 unsafe { (*pointer).caret_arrived() };
             }
+        }
+        return 0;
+    }
+    if message == WM_TRANSLATE_MODE {
+        let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TextService_Impl };
+        if !pointer.is_null() {
+            unsafe { (*pointer).apply_plain_mode(w != 0) };
         }
         return 0;
     }
