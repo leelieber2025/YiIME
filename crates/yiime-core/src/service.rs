@@ -360,47 +360,6 @@ pub fn key_route(session_open: bool, same_context: bool) -> KeyRoute {
     }
 }
 
-/// What a change of the application's focused TSF document means for an open input session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FocusChange {
-    /// Not a move to another text field: keep the session.
-    Keep,
-    /// The user is now in another editable text field: end the session there.
-    OtherField,
-}
-
-/// Decides on ITfThreadMgrEventSink::OnSetFocus. `session_document`: the document the session's
-/// text field belongs to; `focused`: the newly focused document, whether its top context accepts
-/// input, and whether it is shown in the same window as the session's field.
-///
-/// Only a different, editable document is another field. The input box itself takes the
-/// foreground while the user types, so the host sees its focus go away and come back: to no
-/// document, or (Chromium/Electron) to a disabled "empty" document while the page is blurred,
-/// then back to the same document — with `previous` being null or that empty document. None of
-/// that is a field switch; treating it as one ended the session just before the box committed,
-/// and the commit was refused (0.2.0-rc.3).
-///
-/// A different document in the same window is not a switch either: Electron hands the field a
-/// new document when it regains focus (0.2.0 still ended every commit's session there). Separate
-/// controls (classic edit boxes, another window) have their own windows and are still detected;
-/// within one Chromium or Word window the session simply follows the caret.
-pub fn focus_change<D: PartialEq>(
-    session_open: bool,
-    session_document: Option<&D>,
-    focused: Option<&D>,
-    focused_editable: bool,
-    same_window: bool,
-) -> FocusChange {
-    match (session_open, session_document, focused) {
-        (true, Some(session), Some(focused))
-            if session != focused && focused_editable && !same_window =>
-        {
-            FocusChange::OtherField
-        }
-        _ => FocusChange::Keep,
-    }
-}
-
 /// What decides whether a text field takes the IME's letters. Only the field's own switches
 /// count, as TSF and Microsoft's SampleIME prescribe: GUID_COMPARTMENT_KEYBOARD_DISABLED,
 /// GUID_COMPARTMENT_EMPTYCONTEXT, TF_SD_READONLY, and ES_PASSWORD on a Win32 edit control. A
@@ -508,12 +467,12 @@ pub enum CommitTarget {
 }
 
 /// Commit targets in the order to try them. An open session wins, so text never lands in a field
-/// that was left; the focused field is the last resort. `moved_in_window`: the session's field is
-/// still in the focused window but its document no longer has the focus (Word replaces its first
-/// document shortly after opening, Electron gives a refocused field a new one; yiime_core::
-/// focus_change keeps the session for both). The focused context is then tried first, as
-/// qingjian commits into the context the host handed over last rather than a remembered one:
-/// the old context may accept the edit and show nothing.
+/// that was left; the focused field is the last resort. `moved_in_window`: the session's
+/// document no longer has the focus, but the focus is still inside the same top-level window
+/// (Word replaces its first document right after opening, Electron gives a refocused field a new
+/// one, Explorer's search box moves between child windows). The focused context is then tried
+/// first, as qingjian commits into the context the host handed over last rather than a
+/// remembered one: the old context may accept the edit and show nothing.
 pub fn commit_targets(
     session: bool,
     held: bool,
@@ -689,58 +648,14 @@ mod tests {
 
     use super::*;
 
-    /// Replays OnSetFocus sequences seen in Chromium/Electron hosts (documents as numbers:
-    /// 1 = the text field, 9 = Chromium's disabled empty document, 2 = another field).
-    fn replay(events: &[(Option<u32>, bool)]) -> Vec<FocusChange> {
-        events
-            .iter()
-            .map(|(focused, editable)| {
-                focus_change(true, Some(&1), focused.as_ref(), *editable, false)
-            })
-            .collect()
-    }
-
     #[test]
-    fn chromium_refocus_of_the_same_field_keeps_the_session() {
-        use FocusChange::*;
-        // The box takes the foreground: the page blurs to the empty document; the box commits
-        // and brings the host back: field 1 again (previous = empty document).
-        assert_eq!(replay(&[(Some(9), false), (Some(1), true)]), [Keep, Keep]);
-        // Classic hosts: focus goes to no document and back (previous = null).
-        assert_eq!(replay(&[(None, true), (Some(1), true)]), [Keep, Keep]);
-        // Several blur/refocus pairs during one composition.
-        assert_eq!(
-            replay(&[
-                (Some(9), false),
-                (Some(1), true),
-                (None, false),
-                (Some(1), true)
-            ]),
-            [Keep, Keep, Keep, Keep]
-        );
-        // A real click into another field ends it, even after a blur.
-        assert_eq!(
-            replay(&[(Some(9), false), (Some(2), true)]),
-            [Keep, OtherField]
-        );
-        // A read-only or disabled document is not a field to type into.
-        assert_eq!(replay(&[(Some(2), false)]), [Keep]);
-        // No session, or its document unknown: nothing to end.
-        assert_eq!(focus_change(false, Some(&1), Some(&2), true, false), Keep);
-        assert_eq!(focus_change::<u32>(true, None, Some(&2), true, false), Keep);
-    }
-
-    #[test]
-    fn electron_new_document_in_the_same_window_keeps_the_session() {
-        use FocusChange::*;
-        // Electron: blur to the empty document, then the field comes back as document 3 in the
-        // same window when the box commits.
-        assert_eq!(focus_change(true, Some(&1), Some(&3), true, true), Keep);
-        // Another window (or a separate edit control) is a real switch.
-        assert_eq!(
-            focus_change(true, Some(&1), Some(&3), true, false),
-            OtherField
-        );
+    fn focus_events_never_end_a_session_only_keys_from_another_field_do() {
+        // Explorer's search box, Chromium, Electron and Word move the focused document around
+        // (other child windows, suggestion lists, new documents) while the box has the keyboard.
+        // Only a letter typed into another field in the application ends the session.
+        assert_eq!(key_route(true, true), KeyRoute::Buffer);
+        assert_eq!(key_route(true, false), KeyRoute::StaleSession);
+        assert_eq!(key_route(false, false), KeyRoute::NewSession);
     }
 
     #[test]

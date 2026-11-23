@@ -58,12 +58,12 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow,
-    ES_PASSWORD, GWL_STYLE, GWLP_USERDATA, GetClassNameW, GetForegroundWindow, GetSystemMetrics,
-    GetWindowLongPtrW, GetWindowLongW, GetWindowThreadProcessId, HWND_MESSAGE, IMAGE_ICON,
-    IsWindow, KillTimer, LoadImageW, PostMessageW, RegisterClassW, SM_CXSMICON, SM_CXVIRTUALSCREEN,
-    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SMTO_ABORTIFHUNG,
-    SendMessageTimeoutW, SetTimer, SetWindowLongPtrW, WM_APP, WM_COPYDATA, WM_CREATE, WM_TIMER,
-    WNDCLASSW,
+    ES_PASSWORD, GA_ROOT, GWL_STYLE, GWLP_USERDATA, GetAncestor, GetClassNameW,
+    GetForegroundWindow, GetSystemMetrics, GetWindowLongPtrW, GetWindowLongW,
+    GetWindowThreadProcessId, HWND_MESSAGE, IMAGE_ICON, IsWindow, KillTimer, LoadImageW,
+    PostMessageW, RegisterClassW, SM_CXSMICON, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SMTO_ABORTIFHUNG, SendMessageTimeoutW, SetTimer,
+    SetWindowLongPtrW, WM_APP, WM_COPYDATA, WM_CREATE, WM_TIMER, WNDCLASSW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, FindWindowExW, FindWindowW, MF_CHECKED,
@@ -517,6 +517,10 @@ fn set_conversion_mode(manager: &ITfThreadMgr, client_id: u32, mode: i32) {
     let _ = unsafe { compartment.SetValue(client_id, &value) };
 }
 /// Window that shows `context` (null if unknown).
+/// Both windows are inside the same top-level window (GetAncestor GA_ROOT).
+fn same_root(a: HWND, b: HWND) -> bool {
+    !a.is_null() && !b.is_null() && unsafe { GetAncestor(a, GA_ROOT) == GetAncestor(b, GA_ROOT) }
+}
 fn context_window(context: &ITfContext) -> HWND {
     unsafe { context.GetActiveView() }
         .and_then(|view| unsafe { view.GetWnd() })
@@ -1616,12 +1620,11 @@ impl TextService {
             && focused.as_ref().is_some_and(|focused| {
                 let session_window = self.session_window.get();
                 let document = unsafe { focused.GetDocumentMgr() }.ok();
-                !session_window.is_null()
-                    && context_window(focused) == session_window
+                same_root(context_window(focused), session_window)
                     && document.as_ref() != self.session_document.borrow().as_ref()
             });
         if moved_in_window {
-            log("上屏：会话的文档已不是焦点文档（同一窗口），先上屏到焦点输入框");
+            log("上屏：会话的文档已不是焦点文档（同一顶层窗口），先上屏到焦点输入框");
         }
         let targets = yiime_core::commit_targets(
             session.is_some(),
@@ -2005,40 +2008,23 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
         _previous: Ref<ITfDocumentMgr>,
     ) -> Result<()> {
         com_guard("OnSetFocus", || {
-            // Only a move to another editable field ends the session; see
-            // yiime_core::focus_change for the refocus sequences that must not.
-            let editable = document
-                .as_ref()
-                .and_then(|document| unsafe { document.GetTop() }.ok())
-                .is_some_and(|context| !TextService::disabled(&context));
-            let window = document
-                .as_ref()
-                .and_then(|document| unsafe { document.GetTop() }.ok())
-                .map_or(null_mut(), |context| context_window(&context));
-            let session_window = self.session_window.get();
-            let same_window = !window.is_null() && window == session_window;
-            let change = yiime_core::focus_change(
-                self.buffering(),
-                self.session_document.borrow().as_ref(),
-                document.as_ref(),
-                editable,
-                same_window,
-            );
+            // A change of the focused document never ends the session (as in qingjian, which
+            // has no document-manager switch at all): Chromium, Electron, Word and Explorer's
+            // search box move it while the box has the keyboard. A letter typed into another
+            // field ends it (yiime_core::key_route), and the commit follows the focus
+            // (yiime_core::commit_targets).
             if self.buffering()
                 && document.is_some()
                 && document.as_ref() != self.session_document.borrow().as_ref()
             {
+                let window = document
+                    .as_ref()
+                    .and_then(|document| unsafe { document.GetTop() }.ok())
+                    .map_or(null_mut(), |context| context_window(&context));
+                let same_root = same_root(window, self.session_window.get());
                 log(&format!(
-                    "焦点文档变化：同一窗口={same_window} 可输入={editable} → {}",
-                    if change == yiime_core::FocusChange::OtherField {
-                        "结束会话"
-                    } else {
-                        "保持会话"
-                    }
+                    "焦点文档变化：同一顶层窗口={same_root} → 保持会话"
                 ));
-            }
-            if change == yiime_core::FocusChange::OtherField {
-                self.drop_stale_session("焦点移到另一个输入框");
             }
             self.notify_focus_moved();
             self.scope_cache.borrow_mut().take();

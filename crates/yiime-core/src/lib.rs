@@ -70,14 +70,14 @@ pub use reload::{FileStamp, UserWordsReloader};
 pub use request::RequestGate;
 pub use service::{
     APP_WINDOW_CLASS, Activation, BACKOFF_RESET, BoxView, CommitTarget, DUPLICATE_COMMIT_MS,
-    EMPTY_BOX_GRACE_MS, FIRST_BACKOFF, FieldSwitches, FocusChange, HIGH_INTEGRITY, HostOwner,
-    KeyRoute, LeftField, MAX_BACKOFF, MEDIUM_INTEGRITY, PRIVATE_SCOPES, PassReason,
-    ProcessSecurity, REQUEST_TIMEOUT_MS, ServiceHealth, ShiftTapAction, Startup, TRAY_WINDOW_TITLE,
-    TSF_PROTOCOL, TSF_RECEIVER_CLASS, UnconfirmedCommit, WATCHDOG_GRACE, WATCHDOG_LIMIT, Watchdog,
-    WatchedHosts, caret_usable, commit_digest, commit_targets, duplicate_commit,
-    english_ends_session, focus_change, hide_empty_box, key_route, keys_to_give_back,
-    late_commit_landed, left_field, may_share_service, needs_private_editor, pass_reason,
-    private_scope, service_window_title, shift_tap_action, startup_state,
+    EMPTY_BOX_GRACE_MS, FIRST_BACKOFF, FieldSwitches, HIGH_INTEGRITY, HostOwner, KeyRoute,
+    LeftField, MAX_BACKOFF, MEDIUM_INTEGRITY, PRIVATE_SCOPES, PassReason, ProcessSecurity,
+    REQUEST_TIMEOUT_MS, ServiceHealth, ShiftTapAction, Startup, TRAY_WINDOW_TITLE, TSF_PROTOCOL,
+    TSF_RECEIVER_CLASS, UnconfirmedCommit, WATCHDOG_GRACE, WATCHDOG_LIMIT, Watchdog, WatchedHosts,
+    caret_usable, commit_digest, commit_targets, duplicate_commit, english_ends_session,
+    hide_empty_box, key_route, keys_to_give_back, late_commit_landed, left_field,
+    may_share_service, needs_private_editor, pass_reason, private_scope, service_window_title,
+    shift_tap_action, startup_state,
 };
 pub use settings::{
     AZURE_KEY_FILE, ApiSettings, DEFAULT_HISTORY_KEY, DEFAULT_URL, Engine, Flag, GOOGLE_KEY_FILE,
