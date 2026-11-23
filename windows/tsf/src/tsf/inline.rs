@@ -89,30 +89,13 @@ fn refresh_user_words(input: &yiime_core::MixedInput) {
     }
 }
 
-fn hint_for(input: &yiime_core::MixedInput, candidate: &yiime_core::Candidate) -> String {
-    // Same annotations as the draft box (engine.rs Composer::set_code): Wubi matches show
-    // no hint; others get the remaining/full Wubi code, wildcard a short form, corrections
-    // a 纠错 label.
-    if candidate.source == yiime_core::Source::Wubi {
-        return String::new();
-    }
-    let Some(hint) = input.wubi_hint(&candidate.text) else {
-        return if candidate.source == yiime_core::Source::Corrected {
-            "(纠错)".to_owned()
-        } else {
-            String::new()
-        };
-    };
-    let hint = if candidate.source == yiime_core::Source::Wildcard {
-        hint.rsplit('/').next().unwrap_or(&hint).to_owned()
-    } else {
-        hint
-    };
-    if candidate.source == yiime_core::Source::Corrected {
-        format!("(纠错 {hint})")
-    } else {
-        format!("({hint})")
-    }
+fn hint_for(
+    input: &yiime_core::MixedInput,
+    typed: &str,
+    candidate: &yiime_core::Candidate,
+) -> String {
+    // Same annotations as Composer::set_code / MixedInput::candidate_hint.
+    input.candidate_hint(typed, candidate)
 }
 
 fn candidates(code: &str) -> Vec<DisplayCandidate> {
@@ -174,7 +157,7 @@ fn candidates(code: &str) -> Vec<DisplayCandidate> {
     items
         .into_iter()
         .map(|mut candidate| {
-            let hint = hint_for(input, &candidate);
+            let hint = hint_for(input, code, &candidate);
             if traditional {
                 candidate.text = yiime_core::to_traditional(&candidate.text);
             }
@@ -601,6 +584,9 @@ struct CandidateUi {
     layout: Rc<RefCell<Option<(ITfContext, u32)>>>,
     view: Rc<RefCell<CandidateView>>,
     last_caret: Rc<Cell<Option<(i32, i32, i32)>>>,
+    /// Last GetTextExt on the composition range succeeded. Grok Bot / Firefox often fail, and
+    /// a different selection GetTextExt can return a misleading rectangle.
+    last_ext_ok: Rc<Cell<bool>>,
 }
 
 #[implement(ITfEditSession)]
@@ -776,9 +762,13 @@ impl ITfEditSession_Impl for PositionEdit_Impl {
         if let Ok(view) = unsafe { self.context.GetActiveView() } {
             if let Some(position) = position_of(cookie, &view, &caret) {
                 self.ui.last_caret.set(Some(position));
+                self.ui.last_ext_ok.set(true);
                 place(window, position);
-            } else if let Some(position) = self.ui.last_caret.get() {
-                place(window, position);
+            } else {
+                self.ui.last_ext_ok.set(false);
+                if let Some(position) = self.ui.last_caret.get() {
+                    place(window, position);
+                }
             }
         }
         Ok(())
@@ -1188,14 +1178,18 @@ impl CandidateUi {
         }
         let position = if let Some(position) = position {
             self.last_caret.set(Some(position));
+            self.last_ext_ok.set(true);
             Some(position)
         } else if let Some(position) = self.last_caret.get() {
+            self.last_ext_ok.set(false);
             log("候选窗：光标矩形为空，使用上次位置");
             Some(position)
         } else if let Some(position) = mouse_caret() {
+            self.last_ext_ok.set(false);
             log("候选窗：光标矩形为空，使用鼠标位置");
             Some(position)
         } else {
+            self.last_ext_ok.set(false);
             None
         };
         if let Some(position) = position {
@@ -1316,6 +1310,7 @@ impl InlineInput {
                     page: 0,
                 })),
                 last_caret: Rc::new(Cell::new(None)),
+                last_ext_ok: Rc::new(Cell::new(false)),
             },
         }
     }
@@ -1327,6 +1322,10 @@ impl InlineInput {
     }
     pub(super) fn last_caret(&self) -> Option<(i32, i32, i32)> {
         self.ui.last_caret.get()
+    }
+    /// Whether the last composition-range GetTextExt succeeded (same source as the candidate bar).
+    pub(super) fn last_ext_ok(&self) -> bool {
+        self.ui.last_ext_ok.get()
     }
     pub(super) fn same_context(&self, context: &ITfContext) -> bool {
         self.ui

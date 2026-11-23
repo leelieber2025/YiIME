@@ -65,7 +65,7 @@ pub struct Composer {
     pub page: usize,
     /// Candidates per page (re-read from settings on every refresh).
     pub page_size: usize,
-    /// Display text → Wubi hint such as `(trwu)`; candidates matched by Wubi code get none.
+    /// Display text → hint: remaining Wubi keys for a Wubi match, or a full-code `(trwu)` for others.
     pub hints: HashMap<String, String>,
 }
 
@@ -134,30 +134,13 @@ impl Composer {
         }
         self.hints.clear();
         for candidate in &mut candidates {
-            let hint = if candidate.source == Source::Wubi {
-                None
-            } else {
-                input.wubi_hint(&candidate.text)
-            };
+            // Compute the hint from the Simplified text, then convert the display string.
+            let hint = input.candidate_hint(&code, candidate);
             if options.traditional {
                 candidate.text = to_traditional(&candidate.text);
             }
-            if let Some(hint) = hint {
-                // Wildcard candidates show only the full code, to keep the bar short.
-                let hint = if candidate.source == Source::Wildcard {
-                    hint.rsplit('/').next().unwrap_or(&hint).to_owned()
-                } else {
-                    hint
-                };
-                let hint = if candidate.source == Source::Corrected {
-                    format!("(纠错 {hint})")
-                } else {
-                    format!("({hint})")
-                };
+            if !hint.is_empty() {
                 self.hints.insert(candidate.text.clone(), hint);
-            } else if candidate.source == Source::Corrected {
-                self.hints
-                    .insert(candidate.text.clone(), "(纠错)".to_owned());
             }
         }
         if options.learn {

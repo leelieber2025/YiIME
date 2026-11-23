@@ -132,7 +132,7 @@ fn named_orderings() {
         ]
     );
     let wm = compose("wm", 9);
-    assert_eq!(wm.hint(&wm.candidates[0]), ""); // Five candidates are not marked
+    assert_eq!(wm.hint(&wm.candidates[0]), "h"); // 仙 is wmhh: remaining keys after wm
     assert_eq!(wm.hint(&wm.candidates[1]), "(trwu)");
     assert_eq!(texts(&compose("dsj", 9))[..3], ["碴", "大数据", "电视剧"]);
     assert_eq!(texts(&compose("yixinyiyi", 9))[0], "一心一意");

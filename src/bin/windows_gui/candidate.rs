@@ -20,6 +20,49 @@ pub(super) unsafe fn create_font(height: i32) -> HFONT {
         )
     }
 }
+
+pub(super) fn window_dpi(hwnd: HWND) -> u32 {
+    let dpi = if !hwnd.is_null() {
+        unsafe { GetDpiForWindow(hwnd) }
+    } else {
+        0
+    };
+    let dpi = if dpi == 0 {
+        unsafe { GetDpiForSystem() }
+    } else {
+        dpi
+    };
+    dpi.max(96)
+}
+pub(super) fn scale_px(px: i32, dpi: u32) -> i32 {
+    (i64::from(px) * i64::from(dpi) / 96).max(1) as i32
+}
+/// Recreate the draft fonts when the window's DPI changes.
+pub(super) unsafe fn ensure_fonts(hwnd: HWND, state: &State) -> u32 {
+    let dpi = window_dpi(hwnd);
+    if dpi == state.font_dpi.get() && !state.font.get().is_null() {
+        return dpi;
+    }
+    let font = unsafe { create_font(scale_px(14, dpi)) };
+    let small = unsafe { create_font(scale_px(11, dpi)) };
+    let previous = state.font.replace(font);
+    let previous_small = state.small_font.replace(small);
+    if !previous.is_null() {
+        unsafe { DeleteObject(previous as _) };
+    }
+    if !previous_small.is_null() {
+        unsafe { DeleteObject(previous_small as _) };
+    }
+    state.font_dpi.set(dpi);
+    if !state.edit.is_null() {
+        unsafe { SendMessageW(state.edit, WM_SETFONT, font as usize, 1) };
+    }
+    dpi
+}
+pub(super) fn scaled_line_h(state: &State) -> i32 {
+    scale_px(LINE_H, state.font_dpi.get().max(96))
+}
+
 unsafe fn text_width(hdc: HDC, text: &str) -> i32 {
     let units: Vec<u16> = text.encode_utf16().collect();
     let mut size = SIZE { cx: 0, cy: 0 };
@@ -36,11 +79,12 @@ unsafe fn draw_text(hdc: HDC, x: i32, y: i32, color: u32, text: &str) {
     }
 }
 /// Below the cursor, or above it if it does not fit; always inside the monitor's work area.
-unsafe fn place(anchor: RECT, width: i32, height: i32) -> (i32, i32) {
+unsafe fn place(anchor: RECT, width: i32, height: i32, dpi: u32) -> (i32, i32) {
     let work = unsafe { work_area(anchor) };
-    let mut y = anchor.bottom + 4;
+    let gap = scale_px(4, dpi);
+    let mut y = anchor.bottom + gap;
     if y + height > work.bottom {
-        y = anchor.top - height - 4;
+        y = anchor.top - height - gap;
     }
     let y = y.min(work.bottom - height).max(work.top);
     let x = anchor.left.min(work.right - width).max(work.left);
@@ -80,7 +124,8 @@ fn apply_window_shape(hwnd: HWND, width: i32, height: i32) {
         )
     } >= 0;
     if !rounded && width > 0 && height > 0 {
-        let region = unsafe { CreateRoundRectRgn(0, 0, width, height, 8, 8) };
+        let radius = scale_px(8, window_dpi(hwnd));
+        let region = unsafe { CreateRoundRectRgn(0, 0, width, height, radius, radius) };
         if !region.is_null() {
             unsafe {
                 SetWindowRgn(hwnd, region, 1);
@@ -131,16 +176,22 @@ fn stroke_border(hdc: HDC, client: RECT, color: u32, radius: i32) {
 
 /// Resizes and repositions the box for the draft, code and candidates.
 pub(super) unsafe fn relayout(hwnd: HWND, state: &State) {
+    let dpi = unsafe { ensure_fonts(hwnd, state) };
+    let pad = scale_px(PAD, dpi);
+    let gap = scale_px(GAP, dpi);
+    let line_h = scale_px(LINE_H, dpi);
+    let edit_h = scale_px(EDIT_H, dpi);
+    let min_w = scale_px(MIN_W, dpi);
     let draft = unsafe { get_text(state.edit) };
     let status = state.status.borrow().clone();
     let mut composition = state.composition.borrow_mut();
     let composing = !composition.code.is_empty();
     let hdc = unsafe { GetDC(hwnd) };
-    let old = unsafe { SelectObject(hdc, state.font as _) };
-    let mut width = (unsafe { text_width(hdc, &draft) } + 24).min(DRAFT_MAX_W) + 2 * PAD;
+    let old = unsafe { SelectObject(hdc, state.font.get() as _) };
+    let mut width = (unsafe { text_width(hdc, &draft) } + 24).min(DRAFT_MAX_W) + 2 * pad;
     composition.hits.clear();
     if composing {
-        let mut x = PAD;
+        let mut x = pad;
         let labels: Vec<(String, String)> = composition
             .page_items()
             .iter()
@@ -156,27 +207,27 @@ pub(super) unsafe fn relayout(hwnd: HWND, state: &State) {
             let mut w = unsafe { text_width(hdc, &label) };
             if !hint.is_empty() {
                 unsafe {
-                    SelectObject(hdc, state.small_font as _);
+                    SelectObject(hdc, state.small_font.get() as _);
                     w += text_width(hdc, &hint) + 2;
-                    SelectObject(hdc, state.font as _);
+                    SelectObject(hdc, state.font.get() as _);
                 }
             }
             composition.hits.push((x, x + w));
-            x += w + GAP;
+            x += w + gap;
         }
-        width = width.max(x + PAD + 4);
+        width = width.max(x + pad + 4);
         let code = unsafe { text_width(hdc, &composition.code) };
         unsafe {
-            SelectObject(hdc, state.small_font as _);
+            SelectObject(hdc, state.small_font.get() as _);
         }
         let pages = unsafe { text_width(hdc, &composition.page_label()) };
-        width = width.max(code + pages + 3 * PAD + GAP);
+        width = width.max(code + pages + 3 * pad + gap);
     } else {
         unsafe {
-            SelectObject(hdc, state.small_font as _);
+            SelectObject(hdc, state.small_font.get() as _);
         }
         let line = status.map_or(hint(state).to_owned(), |(text, _)| text);
-        width = width.max(unsafe { text_width(hdc, &line) } + 2 * PAD);
+        width = width.max(unsafe { text_width(hdc, &line) } + 2 * pad);
     }
     // Wubi hints can make the row wider than MAX_W: allow up to the work-area width so the 8th
     // and 9th candidates are not cut off.
@@ -184,12 +235,12 @@ pub(super) unsafe fn relayout(hwnd: HWND, state: &State) {
         let work = work_area(state.anchor.get());
         (work.right - work.left - 16).max(MAX_W)
     };
-    let width = width.clamp(MIN_W, max_w) + 2;
+    let width = width.clamp(min_w, max_w) + 2;
     // Multi-line draft: wrap at the edit-box width to compute its height (excluding the edit
     // control's padding).
-    let edit_w = width - 2 - 2 * PAD;
+    let edit_w = width - 2 - 2 * pad;
     let draft_h = unsafe {
-        SelectObject(hdc, state.font as _);
+        SelectObject(hdc, state.font.get() as _);
         let mut metrics: TEXTMETRICW = std::mem::zeroed();
         GetTextMetricsW(hdc, &mut metrics);
         let line = metrics.tmHeight.max(1);
@@ -211,7 +262,7 @@ pub(super) unsafe fn relayout(hwnd: HWND, state: &State) {
             DT_CALCRECT | DT_WORDBREAK | DT_EDITCONTROL | DT_NOPREFIX,
         );
         let lines = ((rect.bottom - rect.top + line - 1) / line).clamp(1, DRAFT_MAX_LINES);
-        (lines * line + 4).max(EDIT_H)
+        (lines * line + 4).max(edit_h)
     };
     unsafe {
         SelectObject(hdc, old);
@@ -219,20 +270,23 @@ pub(super) unsafe fn relayout(hwnd: HWND, state: &State) {
     }
     state.draft_h.set(draft_h);
     let lines = if composing { 2 } else { 1 };
-    let height = PAD + draft_h + 3 + lines * LINE_H + PAD + 2;
-    composition.row_top = PAD + draft_h + 3 + LINE_H;
+    let height = pad + draft_h + 3 + lines * line_h + pad + 2;
+    composition.row_top = pad + draft_h + 3 + line_h;
     drop(composition);
-    let (x, y) = unsafe { place(state.anchor.get(), width, height) };
+    let (x, y) = unsafe { place(state.anchor.get(), width, height, dpi) };
     unsafe {
         SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height, SWP_NOACTIVATE);
         apply_window_shape(hwnd, width, height);
-        MoveWindow(state.edit, PAD, PAD, edit_w, draft_h, 1);
+        MoveWindow(state.edit, pad, pad, edit_w, draft_h, 1);
         // Keep the caret visible (scroll to it when the draft exceeds the maximum lines).
         SendMessageW(state.edit, EM_SCROLLCARET, 0, 0);
         InvalidateRect(hwnd, null(), 1);
     }
 }
 pub(super) unsafe fn paint(hwnd: HWND, state: &State) {
+    let dpi = window_dpi(hwnd);
+    let pad = scale_px(PAD, dpi);
+    let line_h = scale_px(LINE_H, dpi);
     let mut paint: PAINTSTRUCT = unsafe { std::mem::zeroed() };
     let hdc = unsafe { BeginPaint(hwnd, &mut paint) };
     let mut client = RECT::default();
@@ -243,21 +297,21 @@ pub(super) unsafe fn paint(hwnd: HWND, state: &State) {
         DeleteObject(bg as _);
         let separator = CreateSolidBrush(SEPARATOR);
         let line = RECT {
-            left: PAD,
-            top: PAD + state.draft_h.get() + 1,
-            right: client.right - PAD,
-            bottom: PAD + state.draft_h.get() + 2,
+            left: pad,
+            top: pad + state.draft_h.get() + 1,
+            right: client.right - pad,
+            bottom: pad + state.draft_h.get() + 2,
         };
         FillRect(hdc, &line, separator);
         DeleteObject(separator as _);
         SetBkMode(hdc, TRANSPARENT as _);
     }
-    let top = PAD + state.draft_h.get() + 3;
+    let top = pad + state.draft_h.get() + 3;
     let composition = state.composition.borrow();
-    let old = unsafe { SelectObject(hdc, state.font as _) };
+    let old = unsafe { SelectObject(hdc, state.font.get() as _) };
     if !composition.code.is_empty() {
         unsafe {
-            draw_text(hdc, PAD, top + 2, BLUE, &composition.code);
+            draw_text(hdc, pad, top + 2, BLUE, &composition.code);
         }
         let row = composition.row_top;
         for (index, (candidate, (left, right))) in composition
@@ -271,10 +325,10 @@ pub(super) unsafe fn paint(hwnd: HWND, state: &State) {
                     left: left - 4,
                     top: row,
                     right: right + 4,
-                    bottom: row + LINE_H - 2,
+                    bottom: row + line_h - 2,
                 };
                 unsafe {
-                    fill_round(hdc, rect, HIGHLIGHT, 4);
+                    fill_round(hdc, rect, HIGHLIGHT, scale_px(4, dpi));
                     let accent = CreateSolidBrush(ACCENT);
                     let bar = RECT {
                         left: rect.left + 1,
@@ -295,7 +349,7 @@ pub(super) unsafe fn paint(hwnd: HWND, state: &State) {
             if !hint.is_empty() {
                 unsafe {
                     let x = left + text_width(hdc, &label) + 2;
-                    let previous = SelectObject(hdc, state.small_font as _);
+                    let previous = SelectObject(hdc, state.small_font.get() as _);
                     draw_text(hdc, x, row + 5, MUTED, &hint);
                     SelectObject(hdc, previous);
                 }
@@ -303,10 +357,10 @@ pub(super) unsafe fn paint(hwnd: HWND, state: &State) {
         }
         if composition.page_count() > 1 {
             unsafe {
-                SelectObject(hdc, state.small_font as _);
+                SelectObject(hdc, state.small_font.get() as _);
                 let label = composition.page_label();
                 let w = text_width(hdc, &label);
-                draw_text(hdc, client.right - PAD - w, top + 5, MUTED, &label);
+                draw_text(hdc, client.right - pad - w, top + 5, MUTED, &label);
             }
         }
     } else {
@@ -318,13 +372,13 @@ pub(super) unsafe fn paint(hwnd: HWND, state: &State) {
             None => (hint(state), MUTED),
         };
         unsafe {
-            SelectObject(hdc, state.small_font as _);
-            draw_text(hdc, PAD, top + 5, color, text);
+            SelectObject(hdc, state.small_font.get() as _);
+            draw_text(hdc, pad, top + 5, color, text);
         }
     }
     unsafe {
         SelectObject(hdc, old);
-        stroke_border(hdc, client, BORDER, 8);
+        stroke_border(hdc, client, BORDER, scale_px(8, dpi));
         EndPaint(hwnd, &paint);
     }
 }

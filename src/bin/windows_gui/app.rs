@@ -4,7 +4,7 @@ mod candidate;
 mod history;
 mod ipc;
 mod key;
-use candidate::{create_font, paint, relayout};
+use candidate::{create_font, paint, relayout, scaled_line_h};
 use ipc::{notify_tsf_ready, send_tsf_english, send_tsf_held, send_tsf_text, watch_tsf_owner};
 use key::{edit_proc, handle_char, insert_text, pick, set_code};
 mod settings;
@@ -51,6 +51,10 @@ use windows_sys::Win32::UI::Controls::Dialogs::{
 };
 use windows_sys::Win32::UI::Controls::{
     EM_GETSEL, EM_LIMITTEXT, EM_REPLACESEL, EM_SCROLLCARET, EM_SETSEL,
+};
+use windows_sys::Win32::UI::HiDpi::{
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, GetDpiForWindow,
+    SetProcessDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::Input::Ime::ImmAssociateContextEx;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -293,10 +297,12 @@ struct State {
     input: RefCell<Arc<MixedInput>>,
     full_input: Arc<OnceLock<Arc<MixedInput>>>,
     edit: HWND,
-    font: HFONT,
-    small_font: HFONT,
+    font: Cell<HFONT>,
+    small_font: Cell<HFONT>,
     /// Fill for the box and the draft edit (Win11 light gray).
     bg_brush: HBRUSH,
+    /// Last DPI used to build `font` / `small_font`.
+    font_dpi: Cell<u32>,
     /// Current draft height (grows with multi-line content).
     draft_h: Cell<i32>,
     composition: RefCell<Composition>,
@@ -1060,11 +1066,7 @@ unsafe fn activate(hwnd: HWND, state: &State, target: HWND, anchor: Option<RECT>
     }
     refresh_user_words(state);
     if state.tsf_service {
-        service_log(if code.is_empty() {
-            "session start (history)"
-        } else {
-            "session start"
-        });
+        service_log("session start");
     }
     state.target.set(target);
     state.finished.set(false);
@@ -1074,9 +1076,18 @@ unsafe fn activate(hwnd: HWND, state: &State, target: HWND, anchor: Option<RECT>
     state.history_pos.set(None);
     state.english.set(false);
     state.generation.set(state.generation.get() + 1);
-    state
-        .anchor
-        .set(anchor.unwrap_or_else(|| unsafe { caret_of(target) }));
+    let placed = anchor.unwrap_or_else(|| unsafe { caret_of(target) });
+    state.anchor.set(placed);
+    if state.tsf_service {
+        service_log(&format!(
+            "draft box anchor=({},{},{},{}) source={}",
+            placed.left,
+            placed.top,
+            placed.right,
+            placed.bottom,
+            if anchor.is_some() { "tsf" } else { "caret_of" }
+        ));
+    }
     *state.status.borrow_mut() = None;
     // Warm up the connection to the translation server while typing (no key or text; at most
     // once per 30 s).
@@ -1516,6 +1527,14 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             }
         }
         WM_ERASEBKGND => 1,
+        WM_DPICHANGED => {
+            if let Some(state) = state {
+                unsafe {
+                    relayout(hwnd, state);
+                }
+            }
+            0
+        }
         WM_MOUSEACTIVATE => MA_ACTIVATE as LRESULT,
         WM_LBUTTONDOWN => {
             if let Some(state) = state {
@@ -1523,7 +1542,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 let y = ((l >> 16) & 0xffff) as i16 as i32;
                 let hit = {
                     let composition = state.composition.borrow();
-                    (y >= composition.row_top && y < composition.row_top + LINE_H)
+                    (y >= composition.row_top && y < composition.row_top + scaled_line_h(state))
                         .then(|| {
                             composition
                                 .hits
@@ -1583,7 +1602,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             0
         }
         WM_TSF_ACTIVATE => {
-            // lParam = 1: the IME's history shortcut; open the box and load the newest entry.
+            // lParam = 1: history shortcut. 0: Ctrl+Alt+T / 译 mode with no first letter.
+            // A–Z or a–z: first key of the session. Previously only uppercase was handled, so
+            // an already-running service ignored Ctrl+Alt+T (lParam 0).
             if let Some(state) = state
                 && !state.tsf_receiver.get().is_null()
                 && l == 1
@@ -1596,17 +1617,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 }
             } else if let Some(state) = state
                 && !state.tsf_receiver.get().is_null()
-                && (0x41..=0x5a).contains(&(l as usize))
+                && (l == 0
+                    || (0x41..=0x5a).contains(&(l as usize))
+                    || (0x61..=0x7a).contains(&(l as usize)))
             {
                 let anchor = state.pending_anchor.take();
+                let code = if l == 0 {
+                    String::new()
+                } else {
+                    (l as u8 as char).to_ascii_lowercase().to_string()
+                };
                 unsafe {
-                    activate(
-                        hwnd,
-                        state,
-                        w as HWND,
-                        anchor,
-                        (l as u8 as char).to_ascii_lowercase().to_string(),
-                    );
+                    activate(hwnd, state, w as HWND, anchor, code);
                     notify_tsf_ready(state.tsf_receiver.get(), hwnd);
                 }
             }
@@ -1923,8 +1945,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     if !settings.is_null() {
                         DestroyWindow(settings);
                     }
-                    DeleteObject(state.font as _);
-                    DeleteObject(state.small_font as _);
+                    DeleteObject(state.font.get() as _);
+                    DeleteObject(state.small_font.get() as _);
                     DeleteObject(state.bg_brush as _);
                 }
                 PostQuitMessage(0);
@@ -2001,9 +2023,10 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
             input: RefCell::new(input),
             full_input,
             edit,
-            font,
-            small_font,
+            font: Cell::new(font),
+            small_font: Cell::new(small_font),
             bg_brush: CreateSolidBrush(BACKGROUND),
+            font_dpi: Cell::new(96),
             draft_h: Cell::new(EDIT_H),
             composition: RefCell::new(Composition::default()),
             status: RefCell::new(None),
@@ -2118,6 +2141,13 @@ unsafe fn self_test(hwnd: HWND) -> i32 {
     failures
 }
 pub fn run() {
+    // qingjian server `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` and weasel
+    // WeaselServer / WeaselPanel: the EXE must use the same physical screen coordinates as a
+    // Per-Monitor V2 host (Grok Bot, Chromium) or SetWindowPos treats a TSF caret as logical
+    // pixels and the box lands far from the insertion point.
+    unsafe {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
     let args: Vec<String> = std::env::args().collect();
     // Test of the watchdog: a main thread that hangs for 10 s must end the process with
     // WATCHDOG_EXIT after about 2 s.

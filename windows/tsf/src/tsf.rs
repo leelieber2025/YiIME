@@ -1165,12 +1165,13 @@ impl TextService {
             }
         }
     }
-    /// The insertion point's screen rectangle for the box. Read without TF_ES_SYNC (Word may
-    /// refuse synchronous sessions on the key path, SampleIME KeyHandler.cpp): TSF runs the read
-    /// now when it can, else later, and the box is moved when it arrives (WM_CARET_READ). If
-    /// GetTextExt is empty or still pending, fall back to the last caret rectangle (same as the
-    /// candidate window), then the system caret or mouse, so the box opens under the caret
-    /// instead of at a stale or far-away position.
+    /// The insertion point's screen rectangle for the box. Prefer the same source as the
+    /// candidate bar (qingjian `report_caret`: reuse the last-good anchor when GetTextExt on
+    /// the composition range is empty). A separate selection GetTextExt (CaretQuery) can
+    /// "succeed" with a misleading rectangle in hosts like Grok Bot, so it is only used when
+    /// the candidate bar's last GetTextExt also succeeded, or when there is no last-good caret.
+    /// The async read still runs (SampleIME KeyHandler.cpp: no TF_ES_SYNC) and may refine the
+    /// box later via WM_CARET_READ, subject to the same rule.
     fn caret_rect(&self, context: &ITfContext) -> Option<RECT> {
         self.caret_fresh.set(false);
         let mut anchor = self.caret.get();
@@ -1191,33 +1192,94 @@ impl TextService {
                 TF_ES_ASYNCDONTCARE | TF_ES_READ,
             )
         };
-        if let Some(rect) = self.caret.get().rect().map(rect_of) {
-            return Some(rect);
+        let measured = self.caret.get().rect().map(rect_of);
+        let inline = self.inline.last_caret().map(|(x, top, bottom)| RECT {
+            left: x,
+            top,
+            right: x,
+            bottom,
+        });
+        if let Some(rect) = inline {
+            if self.inline.last_ext_ok() {
+                if let Some(measured) = measured {
+                    log(&format!(
+                        "草稿框光标：GetTextExt=({},{},{},{}) 候选窗=({},{},{},{})，与候选窗同一来源",
+                        measured.left,
+                        measured.top,
+                        measured.right,
+                        measured.bottom,
+                        rect.left,
+                        rect.top,
+                        rect.right,
+                        rect.bottom
+                    ));
+                    Some(measured)
+                } else {
+                    log(&format!(
+                        "草稿框光标：GetTextExt 为空，使用候选窗位置 ({},{},{},{})",
+                        rect.left, rect.top, rect.right, rect.bottom
+                    ));
+                    Some(rect)
+                }
+            } else {
+                if let Some(measured) = measured {
+                    log(&format!(
+                        "草稿框光标：组字 GetTextExt 不可靠，忽略选区矩形 ({},{},{},{})，使用候选窗位置 ({},{},{},{})",
+                        measured.left,
+                        measured.top,
+                        measured.right,
+                        measured.bottom,
+                        rect.left,
+                        rect.top,
+                        rect.right,
+                        rect.bottom
+                    ));
+                } else {
+                    log(&format!(
+                        "草稿框光标：GetTextExt 为空，使用候选窗位置 ({},{},{},{})",
+                        rect.left, rect.top, rect.right, rect.bottom
+                    ));
+                }
+                Some(rect)
+            }
+        } else if let Some(rect) = measured {
+            log(&format!(
+                "草稿框光标：GetTextExt=({},{},{},{})",
+                rect.left, rect.top, rect.right, rect.bottom
+            ));
+            Some(rect)
+        } else if let Some(rect) = self.last_caret.get() {
+            let rect = rect_of(rect);
+            log(&format!(
+                "草稿框光标：尚未读到，使用上次位置 ({},{},{},{})",
+                rect.left, rect.top, rect.right, rect.bottom
+            ));
+            Some(rect)
+        } else if let Some(rect) = screen_caret() {
+            log(&format!(
+                "草稿框光标：尚未读到，使用系统光标或鼠标 ({},{},{},{})",
+                rect.left, rect.top, rect.right, rect.bottom
+            ));
+            Some(rect)
+        } else {
+            log("草稿框光标：没有可用矩形");
+            None
         }
-        if let Some(rect) = self.last_caret.get() {
-            log("草稿框：光标矩形尚未读到，使用上次位置");
-            return Some(rect_of(rect));
-        }
-        if let Some((x, top, bottom)) = self.inline.last_caret() {
-            log("草稿框：光标矩形尚未读到，使用组字光标");
-            return Some(RECT {
-                left: x,
-                top,
-                right: x,
-                bottom,
-            });
-        }
-        if let Some(rect) = screen_caret() {
-            log("草稿框：光标矩形尚未读到，使用系统光标或鼠标位置");
-            return Some(rect);
-        }
-        None
     }
     /// A caret rectangle read asynchronously arrived: move the open box there.
     fn caret_arrived(&self) {
         let Some(rect) = self.caret.get().rect().map(rect_of) else {
             return;
         };
+        // Same rule as caret_rect: do not let a misleading selection GetTextExt jump the box
+        // away from the candidate bar's last-good caret (Grok Bot, Firefox, …).
+        if self.inline.last_caret().is_some() && !self.inline.last_ext_ok() {
+            log(&format!(
+                "草稿框光标：忽略迟到的选区矩形 ({},{},{},{})，保持候选窗位置",
+                rect.left, rect.top, rect.right, rect.bottom
+            ));
+            return;
+        }
         if !self.buffering() {
             return;
         }

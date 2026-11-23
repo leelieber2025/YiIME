@@ -276,6 +276,16 @@ fn pinyin_key(pinyin: &str) -> std::iter::Filter<std::str::Bytes<'_>, fn(&u8) ->
     pinyin.bytes().filter(|b| *b != b' ')
 }
 
+/// Remaining Wubi keys after `typed`, using a `wubi_hint` value (`tfqb` or `r/rqyy`).
+fn remaining_wubi_keys<'a>(typed: &str, hint: &'a str) -> Option<&'a str> {
+    let full = hint.rsplit('/').next().unwrap_or(hint);
+    if !typed.is_empty() && full.starts_with(typed) && full.len() > typed.len() {
+        Some(&full[typed.len()..])
+    } else {
+        None
+    }
+}
+
 impl MixedInput {
     /// Rime Wubi and pinyin dictionaries, one `word<TAB>code<TAB>frequency` per line.
     pub fn from_rime(wubi: &str, pinyin: &str) -> Self {
@@ -601,6 +611,35 @@ impl MixedInput {
                 .as_ref()
                 .is_some_and(|words| words.code(&code).any(|line| line.text == text));
         known.then_some(code)
+    }
+
+    /// Hint drawn after a candidate. Wubi matches show the remaining keys to type; pinyin and
+    /// other sources show the full Wubi code (`(toln)` or `(r/rqyy)`), wildcard a short form,
+    /// corrections a 纠错 label.
+    pub fn candidate_hint(&self, typed: &str, candidate: &Candidate) -> String {
+        if candidate.source == Source::Wubi {
+            return self
+                .wubi_hint(&candidate.text)
+                .and_then(|hint| remaining_wubi_keys(typed, &hint).map(str::to_owned))
+                .unwrap_or_default();
+        }
+        let Some(hint) = self.wubi_hint(&candidate.text) else {
+            return if candidate.source == Source::Corrected {
+                "(纠错)".to_owned()
+            } else {
+                String::new()
+            };
+        };
+        let hint = if candidate.source == Source::Wildcard {
+            hint.rsplit('/').next().unwrap_or(&hint).to_owned()
+        } else {
+            hint
+        };
+        if candidate.source == Source::Corrected {
+            format!("(纠错 {hint})")
+        } else {
+            format!("({hint})")
+        }
     }
 
     /// Full Wubi codes first, then pinyin, then Wubi-prefix candidates.
@@ -1058,6 +1097,33 @@ mod tests {
         );
         assert_eq!(full.candidates("xi'an", 9)[0].text, "西安");
         assert_eq!(boundaries("'xi''an'", '\''), vec![2]);
+    }
+
+    #[test]
+    fn wubi_matches_show_remaining_keys_and_pinyin_keeps_full_code() {
+        let input = MixedInput::bundled();
+        let list = input.candidates("tfq", 9);
+        let xian = list
+            .iter()
+            .find(|candidate| candidate.text == "先")
+            .expect("先");
+        assert_eq!(xian.source, Source::Wubi);
+        let hint = input.candidate_hint("tfq", xian);
+        assert_eq!(hint, "b", "先 is tfqb, so tfq leaves b");
+        // Complete four-letter Wubi matches have nothing left to type.
+        let list = input.candidates("tfqb", 9);
+        let xian = list
+            .iter()
+            .find(|candidate| candidate.text == "先")
+            .expect("先");
+        assert!(input.candidate_hint("tfqb", xian).is_empty());
+        let list = input.candidates("wm", 9);
+        let women = list
+            .iter()
+            .find(|candidate| candidate.text == "我们")
+            .expect("我们");
+        assert_ne!(women.source, Source::Wubi);
+        assert_eq!(input.candidate_hint("wm", women), "(trwu)");
     }
 
     #[test]
