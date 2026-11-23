@@ -71,10 +71,10 @@ pub use request::RequestGate;
 pub use service::{
     APP_WINDOW_CLASS, Activation, BACKOFF_RESET, BoxView, EMPTY_BOX_GRACE_MS, FIRST_BACKOFF,
     HIGH_INTEGRITY, HostOwner, KeyRoute, LeftField, MAX_BACKOFF, MEDIUM_INTEGRITY, ProcessSecurity,
-    REQUEST_TIMEOUT_MS, ServiceHealth, ShiftTapAction, TRAY_WINDOW_TITLE, TSF_PROTOCOL,
+    REQUEST_TIMEOUT_MS, ServiceHealth, ShiftTapAction, Startup, TRAY_WINDOW_TITLE, TSF_PROTOCOL,
     TSF_RECEIVER_CLASS, WATCHDOG_GRACE, WATCHDOG_LIMIT, Watchdog, WatchedHosts,
-    english_ends_session, hide_empty_box, key_route, left_field, may_share_service,
-    needs_private_editor, service_window_title, shift_tap_action,
+    english_ends_session, hide_empty_box, key_route, keys_to_give_back, left_field,
+    may_share_service, needs_private_editor, service_window_title, shift_tap_action, startup_state,
 };
 pub use settings::{
     AZURE_KEY_FILE, ApiSettings, DEFAULT_HISTORY_KEY, DEFAULT_URL, Engine, Flag, GOOGLE_KEY_FILE,

@@ -125,7 +125,9 @@ const WINDOW_CLASS: &str = yiime_core::TSF_RECEIVER_CLASS;
 /// Timers: 1 = retry forwarding buffered keys to the editor; 2 = give up waiting for the editor.
 const FLUSH_TIMER: usize = 1;
 const READY_TIMER: usize = 2;
-const READY_TIMEOUT_MS: u32 = 5000;
+const READY_TIMEOUT_MS: u64 = 5000;
+/// While waiting for the editor, check this often whether it exited or hung.
+const READY_POLL_MS: u32 = 250;
 type ScopeCache = Option<(ITfContext, Rc<Cell<Option<bool>>>)>;
 static MODULE: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 
@@ -769,6 +771,10 @@ struct TextService {
     /// Process id of the editor service in use: commits are accepted only from it.
     editor_pid: Cell<u32>,
     editor_window: Cell<HWND>,
+    /// Window of the shared service a starting session waits for (cleared when it is ready).
+    starting_window: Cell<HWND>,
+    /// When a starting session gives up waiting for its editor to report ready.
+    ready_deadline: Cell<Option<std::time::Instant>>,
     pending_keys: RefCell<String>,
     first_key: Cell<Option<char>>,
     flush_attempts: Cell<u8>,
@@ -809,6 +815,8 @@ impl TextService {
             editor: RefCell::new(None),
             editor_pid: Cell::new(0),
             editor_window: Cell::new(null_mut()),
+            starting_window: Cell::new(null_mut()),
+            ready_deadline: Cell::new(None),
             pending_keys: RefCell::new(String::new()),
             first_key: Cell::new(None),
             flush_attempts: Cell::new(0),
@@ -828,6 +836,10 @@ impl TextService {
         }
     }
     fn refresh_editor(&self) {
+        // A session still starting whose editor exited or hung: give its letters back first.
+        if self.check_startup() {
+            return;
+        }
         let exited = self
             .editor
             .borrow_mut()
@@ -838,8 +850,74 @@ impl TextService {
         let gone =
             self.editor.borrow().is_none() && !window.is_null() && unsafe { IsWindow(window) } == 0;
         if exited || gone {
+            if self.editor_open.get() {
+                // The box died during a session: letters it never received go back to the
+                // application instead of vanishing.
+                log("输入框进程已退出，未发送的按键已归还");
+                self.restore_pending_keys(false);
+            }
             self.reset_editor();
         }
+    }
+    /// The session is waiting for its editor to report ready.
+    fn waiting_for_editor(&self) -> bool {
+        self.editor_open.get() && self.editor_window.get().is_null()
+    }
+    /// Checks a starting session (on every key and on the ready timer). Returns true when its
+    /// editor exited or did not become ready in time and the session was given up: the first
+    /// letter and the buffered ones are typed into the application.
+    fn check_startup(&self) -> bool {
+        let overdue = self
+            .ready_deadline
+            .get()
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline);
+        let state = yiime_core::startup_state(
+            self.editor_open.get(),
+            !self.editor_window.get().is_null(),
+            self.waiting_for_editor() && self.startup_process_gone(),
+            overdue,
+        );
+        match state {
+            yiime_core::Startup::Idle | yiime_core::Startup::Waiting => false,
+            yiime_core::Startup::Exited => {
+                self.abandon_start(false);
+                true
+            }
+            yiime_core::Startup::TimedOut => {
+                self.abandon_start(true);
+                true
+            }
+        }
+    }
+    fn startup_process_gone(&self) -> bool {
+        if let Some(child) = self.editor.borrow_mut().as_mut() {
+            return child.try_wait().ok().flatten().is_some();
+        }
+        let starting = self.starting_window.get();
+        !starting.is_null() && unsafe { IsWindow(starting) } == 0
+    }
+    fn abandon_start(&self, timed_out: bool) {
+        let owned = self.editor.borrow().is_some();
+        if owned {
+            if let Some(child) = self.editor.borrow_mut().as_mut() {
+                let _ = child.kill();
+            }
+            // Back off before starting another editor, so one that cannot start does not
+            // swallow the first letter of every word.
+            self.health
+                .borrow_mut()
+                .start_failed(std::time::Instant::now());
+        } else if timed_out {
+            // A shared service that never answers is restarted on the next activation.
+            self.health.borrow_mut().timed_out(self.editor_pid.get());
+        }
+        log(if timed_out {
+            "输入框就绪超时，已归还缓存按键"
+        } else {
+            "输入框启动失败（进程已退出），已归还缓存按键"
+        });
+        self.restore_pending_keys(true);
+        self.reset_editor();
     }
     fn reset_editor(&self) {
         self.kill_timers();
@@ -847,6 +925,8 @@ impl TextService {
         self.editor.borrow_mut().take();
         self.editor_pid.set(0);
         self.editor_window.set(null_mut());
+        self.starting_window.set(null_mut());
+        self.ready_deadline.set(None);
         self.pending_keys.borrow_mut().clear();
         self.first_key.set(None);
         self.flush_attempts.set(0);
@@ -1244,6 +1324,7 @@ impl TextService {
             );
             self.editor_open.set(true);
             self.editor_window.set(null_mut());
+            self.starting_window.set(window);
             // Send the cursor rectangle synchronously first (an empty packet if unavailable, so the
             // editor positions itself); it also makes this receiver the service's current one.
             // Then activate asynchronously.
@@ -1340,12 +1421,20 @@ impl TextService {
             self.start_ready_timer();
             true
         } else {
+            // Not started: the key goes to the application, and starting is retried later.
+            log("输入框程序无法启动");
+            self.health
+                .borrow_mut()
+                .start_failed(std::time::Instant::now());
             false
         }
     }
     fn start_ready_timer(&self) {
+        self.ready_deadline.set(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(READY_TIMEOUT_MS),
+        ));
         unsafe {
-            SetTimer(self.receiver.get(), READY_TIMER, READY_TIMEOUT_MS, None);
+            SetTimer(self.receiver.get(), READY_TIMER, READY_POLL_MS, None);
         }
     }
     fn commit(&self, text: String) -> bool {
@@ -1396,6 +1485,8 @@ impl TextService {
     }
     fn finish_editor(&self) {
         self.editor_open.set(false);
+        self.starting_window.set(null_mut());
+        self.ready_deadline.set(None);
         self.context.borrow_mut().take();
         self.pending_keys.borrow_mut().clear();
         self.first_key.set(None);
@@ -1404,6 +1495,9 @@ impl TextService {
     }
     fn editor_ready(&self, hwnd: HWND) -> bool {
         self.editor_window.set(hwnd);
+        self.starting_window.set(null_mut());
+        self.ready_deadline.set(None);
+        self.health.borrow_mut().started();
         if !self.receiver.get().is_null() {
             unsafe {
                 KillTimer(self.receiver.get(), READY_TIMER);
@@ -1459,11 +1553,12 @@ impl TextService {
         }
         sent
     }
-    fn restore_pending_keys(&self) {
-        let mut keys = std::mem::take(&mut *self.pending_keys.borrow_mut());
-        if let Some(first) = self.first_key.take() {
-            keys.insert(0, first);
-        }
+    /// Types the letters of a session that ends without its box into the application.
+    /// `include_first`: the box never received the first letter (see yiime_core::keys_to_give_back).
+    fn restore_pending_keys(&self, include_first: bool) {
+        let pending = std::mem::take(&mut *self.pending_keys.borrow_mut());
+        let first = self.first_key.take();
+        let keys = yiime_core::keys_to_give_back(first, &pending, !include_first);
         if keys.is_empty() {
             return;
         }

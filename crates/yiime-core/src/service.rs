@@ -36,6 +36,9 @@ pub struct ServiceHealth {
     unhealthy: Option<u32>,
     restarts: u32,
     last_restart: Option<Instant>,
+    /// Input boxes this DLL started that exited or never reported ready, in a row.
+    start_failures: u32,
+    last_start_failure: Option<Instant>,
 }
 
 impl ServiceHealth {
@@ -57,8 +60,46 @@ impl ServiceHealth {
         pid != 0 && self.unhealthy == Some(pid)
     }
 
+    /// An input box this DLL started exited, or never reported ready in time. Starting another
+    /// one waits [`Self::start_backoff`] (keys go to the application meanwhile), so a box that
+    /// cannot start does not swallow every first letter.
+    pub fn start_failed(&mut self, now: Instant) {
+        if self
+            .last_start_failure
+            .is_some_and(|last| now.saturating_duration_since(last) >= BACKOFF_RESET)
+        {
+            self.start_failures = 0;
+        }
+        self.start_failures = self.start_failures.saturating_add(1);
+        self.last_start_failure = Some(now);
+    }
+
+    /// An input box reported ready: starting works again.
+    pub fn started(&mut self) {
+        self.start_failures = 0;
+        self.last_start_failure = None;
+    }
+
+    /// Wait after the last failed start before starting another box: 2 s, doubling to 60 s.
+    pub fn start_backoff(&self) -> Duration {
+        match self.start_failures {
+            0 => Duration::ZERO,
+            n => FIRST_BACKOFF
+                .saturating_mul(1u32 << (n - 1).min(16))
+                .min(MAX_BACKOFF),
+        }
+    }
+
     /// Decides at activation; `running` is the pid of the service found running (if any).
     pub fn before_activation(&mut self, running: Option<u32>, now: Instant) -> Activation {
+        // Nothing running, so a box would be started: not while backing off a failed start.
+        if running.is_none()
+            && self
+                .last_start_failure
+                .is_some_and(|last| now.saturating_duration_since(last) < self.start_backoff())
+        {
+            return Activation::Wait;
+        }
         let Some(hung) = self.unhealthy else {
             return Activation::Use;
         };
@@ -344,9 +385,105 @@ pub fn shift_tap_action(
     }
 }
 
+/// State of an input box the DLL is waiting for after sending it the first letter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Startup {
+    /// No session waiting for a box (none open, or the box already reported ready).
+    Idle,
+    /// Still starting: keep buffering letters.
+    Waiting,
+    /// The box process exited (or its window disappeared) before it reported ready.
+    Exited,
+    /// The box is alive but did not report ready in time.
+    TimedOut,
+}
+
+/// Checked on every key and on a short timer while a session waits for its box, so a box that
+/// cannot start is noticed at once instead of on the next key, and one that hangs is given up.
+pub fn startup_state(
+    session_open: bool,
+    ready: bool,
+    process_gone: bool,
+    overdue: bool,
+) -> Startup {
+    if !session_open || ready {
+        Startup::Idle
+    } else if process_gone {
+        Startup::Exited
+    } else if overdue {
+        Startup::TimedOut
+    } else {
+        Startup::Waiting
+    }
+}
+
+/// Letters to type into the application when a session ends without its box: before the box was
+/// ready it saw none of them, so the first letter and everything buffered go back in order;
+/// after it was ready it already had the first letter and the sent ones, so only the letters
+/// still waiting to be sent go back. Nothing a user typed is silently dropped.
+pub fn keys_to_give_back(first: Option<char>, pending: &str, box_ready: bool) -> String {
+    let mut keys = String::with_capacity(pending.len() + 1);
+    if let Some(first) = first.filter(|_| !box_ready) {
+        keys.push(first);
+    }
+    keys.push_str(pending);
+    keys
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn letters_typed_while_the_box_starts_are_given_back() {
+        // The box process exited before it was ready: "n" (first key) and "i" (buffered) both
+        // go to the application, in order.
+        assert_eq!(keys_to_give_back(Some('n'), "i", false), "ni");
+        assert_eq!(keys_to_give_back(Some('n'), "", false), "n");
+        // After ready the box had the first letter; only unsent letters come back.
+        assert_eq!(keys_to_give_back(Some('n'), "ih", true), "ih");
+        assert_eq!(keys_to_give_back(None, "", false), "");
+    }
+
+    #[test]
+    fn startup_failures_are_noticed_and_classified() {
+        assert_eq!(startup_state(false, false, true, true), Startup::Idle);
+        assert_eq!(startup_state(true, true, true, true), Startup::Idle);
+        assert_eq!(startup_state(true, false, false, false), Startup::Waiting);
+        assert_eq!(startup_state(true, false, true, false), Startup::Exited);
+        assert_eq!(startup_state(true, false, true, true), Startup::Exited);
+        assert_eq!(startup_state(true, false, false, true), Startup::TimedOut);
+    }
+
+    #[test]
+    fn a_box_that_cannot_start_backs_off_then_recovers() {
+        let mut health = ServiceHealth::default();
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        assert_eq!(health.before_activation(None, at(0)), Activation::Use);
+        // The started box crashed: for 2 s keys go to the application instead.
+        health.start_failed(at(0));
+        assert_eq!(health.before_activation(None, at(1000)), Activation::Wait);
+        // A running shared service is still used meanwhile.
+        assert_eq!(health.before_activation(Some(5), at(1000)), Activation::Use);
+        assert_eq!(health.before_activation(None, at(2000)), Activation::Use);
+        // Failing again doubles the wait, capped at one minute.
+        health.start_failed(at(2000));
+        assert_eq!(health.start_backoff(), Duration::from_secs(4));
+        assert_eq!(health.before_activation(None, at(5999)), Activation::Wait);
+        assert_eq!(health.before_activation(None, at(6000)), Activation::Use);
+        for n in 0..10 {
+            health.start_failed(at(6000 + n));
+        }
+        assert_eq!(health.start_backoff(), MAX_BACKOFF);
+        // A box that reports ready clears it.
+        health.started();
+        assert_eq!(health.before_activation(None, at(6100)), Activation::Use);
+        // A failure long after the last one starts over at 2 s.
+        health.start_failed(at(0));
+        health.start_failed(at(400_000));
+        assert_eq!(health.start_backoff(), FIRST_BACKOFF);
+    }
 
     #[test]
     fn healthy_service_is_used() {

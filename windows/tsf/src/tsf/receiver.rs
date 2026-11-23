@@ -135,31 +135,18 @@ unsafe fn receiver_proc_impl(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> 
         return 0;
     }
     if message == WM_TIMER && w == READY_TIMER {
-        unsafe {
-            KillTimer(hwnd, READY_TIMER);
-        }
         let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TextService_Impl };
-        // The editor never became ready: end the session, give the buffered letters back to the
-        // host and return to normal.
-        if !pointer.is_null()
-            && unsafe { (&*pointer).editor_open.get() && (&*pointer).editor_window.get().is_null() }
-        {
-            unsafe {
-                // A shared service that never answers is restarted on the next activation.
+        // Polled while the editor starts: if it exited or never became ready, end the session,
+        // give the buffered letters (first one included) back to the host and return to normal.
+        let waiting = !pointer.is_null()
+            && unsafe {
                 let service = &*pointer;
-                service
-                    .health
-                    .borrow_mut()
-                    .timed_out(service.editor_pid.get());
-                OutputDebugStringW(wide("YiIME: 编辑器就绪超时，已归还缓存按键").as_ptr());
-                {
-                    let mut editor = (&*pointer).editor.borrow_mut();
-                    if let Some(child) = editor.as_mut() {
-                        let _ = child.kill();
-                    }
-                }
-                (*pointer).restore_pending_keys();
-                (*pointer).reset_editor();
+                service.check_startup();
+                service.waiting_for_editor()
+            };
+        if !waiting {
+            unsafe {
+                KillTimer(hwnd, READY_TIMER);
             }
         }
         return 0;
@@ -179,7 +166,7 @@ unsafe fn receiver_proc_impl(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> 
                         let _ = child.kill();
                     }
                 }
-                (*pointer).restore_pending_keys();
+                (*pointer).restore_pending_keys(true);
                 (*pointer).reset_editor();
             }
         } else {
