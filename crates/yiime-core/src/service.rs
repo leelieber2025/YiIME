@@ -135,9 +135,9 @@ pub fn may_share_service(host: &ProcessSecurity, service: Option<&ProcessSecurit
 /// protocol versions never find or accept each other: after an upgrade without a restart, an
 /// application still running an old DLL keeps its own old input box instead of talking to the new
 /// one. Bump it whenever a message or packet changes meaning.
-pub const TSF_PROTOCOL: u32 = 2;
+pub const TSF_PROTOCOL: u32 = 3;
 /// Window class of the TSF DLL's receiver window (the input box accepts sessions only from it).
-pub const TSF_RECEIVER_CLASS: &str = concat!("YiIMETsfReceiver.", 2);
+pub const TSF_RECEIVER_CLASS: &str = concat!("YiIMETsfReceiver.", 3);
 
 /// Window title of the input box: the shared service has one per integrity level (FindWindow only
 /// sees the caller's session and desktop, and the DLL checks the process as well); a private box
@@ -272,6 +272,24 @@ pub fn hide_empty_box(view: BoxView, host_focus_moved: bool) -> bool {
 /// 0.2.0-rc.2 the box was not told, and an empty translation box stayed up until it timed out.
 pub fn english_ends_session(view: BoxView) -> bool {
     view.visible && !view.busy
+}
+
+/// What to do with the draft when the host leaves this text field for another one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeftField {
+    /// A translation is in flight: commit the Chinese where it was typed and drop the result.
+    CommitSource,
+    /// Nothing was submitted: drop the draft. It must not be inserted into the other field.
+    Discard,
+}
+
+/// `translating`: Enter was pressed and the result has not come back.
+pub fn left_field(translating: bool) -> LeftField {
+    if translating {
+        LeftField::CommitSource
+    } else {
+        LeftField::Discard
+    }
 }
 
 /// Where a letter typed in the host goes, in the TSF DLL.
@@ -463,11 +481,11 @@ mod tests {
     fn window_titles_per_level() {
         assert_eq!(
             service_window_title(MEDIUM_INTEGRITY, false),
-            "YiIME 译 · TSF · p2"
+            "YiIME 译 · TSF · p3"
         );
         assert_eq!(
             service_window_title(0x1000, false),
-            "YiIME 译 · TSF · IL1000 · p2"
+            "YiIME 译 · TSF · IL1000 · p3"
         );
         // 0.2.0-rc.1 and earlier used unversioned names; they must not match the new ones.
         assert_ne!(
@@ -642,13 +660,15 @@ mod tests {
         assert_eq!(key_route(true, false), KeyRoute::StaleSession);
         assert_eq!(key_route(false, false), KeyRoute::NewSession);
         assert_eq!(key_route(false, true), KeyRoute::NewSession);
-        // After the DLL drops the stale session it tells the box (focus moved, session dropped):
-        // the box closes even with a draft or the foreground (draft kept), unless translating.
+        // After the DLL drops the stale session it tells the box. The box closes even with a
+        // draft, unless a translation is in flight (that Chinese is committed to the old field).
         let lingering = BoxView {
             visible: true,
             empty: false,
             ..BoxView::default()
         };
         assert!(english_ends_session(lingering));
+        assert_eq!(left_field(false), LeftField::Discard);
+        assert_eq!(left_field(true), LeftField::CommitSource);
     }
 }

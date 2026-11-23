@@ -39,6 +39,8 @@ pub struct Candidate {
     pub complete: bool,
     /// Code left after picking this candidate; non-empty only for [`Source::Partial`].
     pub rest: String,
+    /// Typed or imported by the user. Stays ahead of learned dictionary words.
+    pub user: bool,
 }
 
 pub struct MixedInput {
@@ -689,6 +691,7 @@ impl MixedInput {
         } else {
             Source::Wubi
         };
+        let user_set: HashSet<Arc<str>> = user.iter().cloned().collect();
         if raw.contains('\'') {
             let mut seen = HashSet::new();
             let separated = user
@@ -705,6 +708,7 @@ impl MixedInput {
                 )
                 .filter(|text| seen.insert(text.clone()))
                 .map(|text| Candidate {
+                    user: user_set.contains(text.as_ref()),
                     text: text.to_string(),
                     source: Source::Pinyin,
                     complete: true,
@@ -745,6 +749,7 @@ impl MixedInput {
                 }
                 if result.len() < limit && seen.insert(text.clone()) {
                     result.push(Candidate {
+                        user: user_set.contains(text.as_ref()),
                         text: text.to_string(),
                         source,
                         complete,

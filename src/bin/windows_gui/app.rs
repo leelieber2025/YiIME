@@ -5,7 +5,7 @@ mod history;
 mod ipc;
 mod key;
 use candidate::{create_font, paint, relayout};
-use ipc::{notify_tsf_ready, send_tsf_english, send_tsf_text, watch_tsf_owner};
+use ipc::{notify_tsf_ready, send_tsf_english, send_tsf_held, send_tsf_text, watch_tsf_owner};
 use key::{edit_proc, handle_char, insert_text, pick, set_code};
 mod settings;
 mod tray;
@@ -1156,9 +1156,20 @@ fn watch_receiver(hwnd: HWND, state: &State, receiver: HWND) {
     }
 }
 /// Another application starts a session: end the current one (telling its DLL), drop its draft
-/// (text never moves between applications) and serve `receiver` from now on.
+/// (text never moves between applications) and serve `receiver` from now on. A translation still
+/// in flight commits its Chinese into the application being left; the result is dropped.
 unsafe fn switch_receiver(hwnd: HWND, state: &State, receiver: HWND) {
     unsafe {
+        if yiime_core::left_field(state.pending.get()) == yiime_core::LeftField::CommitSource {
+            let old = state.tsf_receiver.get();
+            let draft = single_line(&get_text(state.edit));
+            if !old.is_null() && !draft.is_empty() {
+                let _ = send_tsf_text(old, hwnd, &draft);
+            }
+            state.pending.set(false);
+            state.generation.set(state.generation.get() + 1);
+            service_log("session moved: translation source back to the previous application");
+        }
         if IsWindowVisible(hwnd) != 0 {
             deactivate(hwnd, state);
         } else {
@@ -1650,20 +1661,35 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 && w != 0
                 && w as HWND == state.tsf_receiver.get()
             {
-                if l == 1 {
-                    // The DLL already ended this session (focus moved to another text field):
-                    // close the box whatever it shows (draft kept), so the next letter opens a
-                    // fresh one there.
-                    if yiime_core::english_ends_session(yiime_core::BoxView {
-                        visible: unsafe { IsWindowVisible(hwnd) } != 0,
-                        busy: state.pending.get(),
-                        ..Default::default()
-                    }) {
-                        service_log("session end: host focus moved to another field");
-                        // Not told back: the DLL may already have opened the next session,
-                        // which an empty commit would end.
-                        state.finished.set(true);
-                        unsafe { deactivate(hwnd, state) };
+                if l != 0 {
+                    // The DLL parked this text field (lParam is that id) and may already have
+                    // opened the next session. Commit a translation's Chinese there and drop the
+                    // draft either way, so neither follows the new field. An empty commit would
+                    // end the next session, so the DLL is not told with one.
+                    let translating = yiime_core::left_field(state.pending.get())
+                        == yiime_core::LeftField::CommitSource;
+                    let draft = if translating {
+                        single_line(&unsafe { get_text(state.edit) })
+                    } else {
+                        String::new()
+                    };
+                    service_log(if translating {
+                        "session end: translation source back to the previous field"
+                    } else {
+                        "session end: host focus moved to another field"
+                    });
+                    // Always: an empty packet releases the parked field, so a later commit in the
+                    // new session is not inserted into the old one.
+                    let accepted =
+                        unsafe { send_tsf_held(state.tsf_receiver.get(), hwnd, l as u64, &draft) };
+                    if translating && !accepted {
+                        service_log("previous field did not accept the text");
+                    }
+                    state.pending.set(false);
+                    state.finished.set(true);
+                    unsafe {
+                        clear_box(hwnd, state);
+                        hide_box(hwnd, state);
                     }
                 } else {
                     unsafe { hide_if_empty(hwnd, state, true) };

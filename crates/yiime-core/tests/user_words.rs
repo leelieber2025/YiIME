@@ -3,7 +3,10 @@
 //! picks up an import without restarting.
 
 use std::sync::Arc;
-use yiime_core::{MixedInput, Source, UserWordsReloader, merge_user_words, parse_text_export};
+use yiime_core::{
+    ComposeOptions, Composer, Learned, MixedInput, Source, UserWordsReloader, merge_user_words,
+    parse_text_export,
+};
 
 fn first(input: &MixedInput, code: &str, pinyin_first: bool) -> (String, Source) {
     let candidate = input
@@ -78,4 +81,55 @@ fn import_reaches_a_running_service_without_restart() {
     input.set_user_words(&reloader.check().unwrap());
     assert_ne!(first(&held, "shiyou", true).0, "诗友");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn learning_does_not_pass_user_words() {
+    let bare = MixedInput::bundled();
+    let pinyin = first(&bare, "shiyou", true).0;
+    let wubi = first(&bare, "wqvb", false).0;
+    let input = bare.with_user_words("诗友 shiyou\n拟号 wqvb\n");
+    let mut learned = Learned::default();
+    for _ in 0..3 {
+        learned.record("shiyou", &pinyin);
+        learned.record("wqvb", &wubi);
+    }
+    let options = ComposeOptions {
+        page_size: 9,
+        traditional: false,
+        learn: true,
+        fuzzy: false,
+        pinyin_first: false,
+        common_only: true,
+        shuangpin: None,
+    };
+    let mut composer = Composer::default();
+    for pinyin_first in [false, true] {
+        let options = ComposeOptions {
+            pinyin_first,
+            ..options
+        };
+        composer.set_code(&input, "shiyou".into(), &options, &learned);
+        assert_eq!(
+            composer.candidates[0].text, "诗友",
+            "pinyin_first = {pinyin_first}"
+        );
+        assert!(
+            composer
+                .candidates
+                .iter()
+                .any(|candidate| candidate.text == pinyin)
+        );
+        composer.set_code(&input, "wqvb".into(), &options, &learned);
+        assert_eq!(
+            composer.candidates[0].text, "拟号",
+            "pinyin_first = {pinyin_first}"
+        );
+        assert!(
+            composer
+                .candidates
+                .iter()
+                .any(|candidate| candidate.text == wubi)
+        );
+    }
 }

@@ -571,9 +571,9 @@ impl TextService {
         }
     }
     /// Ends this application's input session on the DLL side because the focus moved to another
-    /// text field, and tells the box to close (WM_APP + 8 with lParam 1). The context is kept, so
-    /// a translation still in flight lands where it was started unless a new session begins
-    /// (the box then drops the stale result).
+    /// text field, and tells the box to close (WM_APP + 8, lParam = the id from [`Self::hold_context`]).
+    /// The context is parked, not dropped: the box commits a translation's Chinese there, and a
+    /// newer session's context is left alone.
     fn drop_stale_session(&self, reason: &str) {
         if !self.buffering() {
             return;
@@ -584,13 +584,45 @@ impl TextService {
         self.pending_keys.borrow_mut().clear();
         self.first_key.set(None);
         self.flush_attempts.set(0);
+        let id = self.hold_context();
         let editor_window = self.editor_window.get();
         let receiver = self.receiver.get();
-        if !editor_window.is_null() && !receiver.is_null() {
+        if editor_window.is_null() || receiver.is_null() {
+            return;
+        }
+        // Synchronous, so a translation result already queued on the box is applied only after
+        // this session's Chinese has been committed and the draft cleared. If the box does not
+        // answer, post it; a second delivery only releases an id that was already used.
+        let answered = unsafe {
+            let mut result = 0usize;
+            SendMessageTimeoutW(
+                editor_window,
+                WM_APP + 8,
+                receiver as usize,
+                id as isize,
+                SMTO_ABORTIFHUNG,
+                1000,
+                &mut result,
+            ) != 0
+        };
+        if !answered {
             unsafe {
-                let _ = PostMessageW(editor_window, WM_APP + 8, receiver as usize, 1);
+                let _ = PostMessageW(editor_window, WM_APP + 8, receiver as usize, id as isize);
             }
         }
+    }
+    /// Moves the current text field aside so a new session can replace it. Returns the id the box
+    /// sends back with the Chinese source (never 0).
+    fn hold_context(&self) -> u64 {
+        let id = self.next_held.get().wrapping_add(1).max(1);
+        self.next_held.set(id);
+        *self.held_context.borrow_mut() = self.context.borrow_mut().take();
+        self.held_id.set(id);
+        id
+    }
+    fn clear_held(&self) {
+        self.held_context.borrow_mut().take();
+        self.held_id.set(0);
     }
     /// Tells the shared input box that the focus in this application moved (another text field,
     /// the page, another window), so an empty box is hidden at once instead of lingering
@@ -719,6 +751,10 @@ type ModeButton = Option<(ITfLangBarItemButton, Vec<(ITfSource, u32)>, LangBarSi
 struct TextService {
     thread_manager: RefCell<Option<ITfThreadMgr>>,
     context: RefCell<Option<ITfContext>>,
+    /// Text field a dropped session was typing into, and the id the box echoes to commit there.
+    held_context: RefCell<Option<ITfContext>>,
+    held_id: Cell<u64>,
+    next_held: Cell<u64>,
     client_id: Cell<u32>,
     receiver: Cell<HWND>,
     editor_open: Cell<bool>,
@@ -758,6 +794,9 @@ impl TextService {
         Self {
             thread_manager: RefCell::new(None),
             context: RefCell::new(None),
+            held_context: RefCell::new(None),
+            held_id: Cell::new(0),
+            next_held: Cell::new(0),
             client_id: Cell::new(0),
             receiver: Cell::new(null_mut()),
             editor_open: Cell::new(false),
@@ -806,6 +845,7 @@ impl TextService {
         self.first_key.set(None);
         self.flush_attempts.set(0);
         self.context.borrow_mut().take();
+        self.clear_held();
     }
     fn kill_timers(&self) {
         if !self.receiver.get().is_null() {
@@ -1303,6 +1343,11 @@ impl TextService {
         }
     }
     fn commit(&self, text: String) -> bool {
+        // A session was already dropped for another text field. This text (a translation that
+        // finished in between) belongs there, not in the session that may have started since.
+        if self.held_id.get() != 0 {
+            return self.commit_held(self.held_id.get(), text);
+        }
         if text.is_empty() {
             self.finish_editor();
             return true;
@@ -1311,19 +1356,37 @@ impl TextService {
         let Some(context) = context else {
             return false;
         };
+        if !self.insert_text(&context, text) {
+            return false;
+        }
+        self.finish_editor();
+        true
+    }
+    /// Inserts `text` into the parked text field `id` and releases it. Does not touch a session
+    /// that started afterwards. Empty text only releases the field.
+    fn commit_held(&self, id: u64, text: String) -> bool {
+        if id == 0 || id != self.held_id.get() {
+            return false;
+        }
+        let context = self.held_context.borrow_mut().take();
+        self.held_id.set(0);
+        if text.is_empty() {
+            return true;
+        }
+        let Some(context) = context else {
+            return false;
+        };
+        self.insert_text(&context, text)
+    }
+    fn insert_text(&self, context: &ITfContext, text: String) -> bool {
         let session: ITfEditSession = CommitEdit {
             context: context.clone(),
             text,
         }
         .into();
-        if unsafe { context.RequestEditSession(self.client_id.get(), &session, TF_ES_READWRITE) }
+        unsafe { context.RequestEditSession(self.client_id.get(), &session, TF_ES_READWRITE) }
             .and_then(|status| status.ok())
-            .is_err()
-        {
-            return false;
-        }
-        self.finish_editor();
-        true
+            .is_ok()
     }
     fn finish_editor(&self) {
         self.editor_open.set(false);
@@ -1580,6 +1643,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             }
             self.scope_cache.borrow_mut().take();
             self.tested_key.borrow_mut().take();
+            self.clear_held();
             let receiver = self.receiver.replace(null_mut());
             if !receiver.is_null() {
                 unsafe {

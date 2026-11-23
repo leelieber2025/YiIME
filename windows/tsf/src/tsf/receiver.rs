@@ -77,6 +77,27 @@ unsafe fn receiver_proc_impl(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> 
         if packet.dwData == 4 {
             return unsafe { (*pointer).switch_to_english() } as LRESULT;
         }
+        // Chinese source of a translation whose text field was left (u64 id, then UTF-16 text).
+        // Empty text only releases that field. A newer session is not finished.
+        if packet.dwData == 5 {
+            if packet.lpData.is_null()
+                || (packet.cbData as usize) < 8
+                || !(packet.cbData - 8).is_multiple_of(2)
+            {
+                return 0;
+            }
+            let id = unsafe { std::ptr::read_unaligned(packet.lpData as *const u64) };
+            let units = unsafe {
+                std::slice::from_raw_parts(
+                    packet.lpData.cast::<u8>().add(8).cast::<u16>(),
+                    (packet.cbData as usize - 8) / 2,
+                )
+            };
+            let Ok(text) = String::from_utf16(units) else {
+                return 0;
+            };
+            return unsafe { (*pointer).commit_held(id, text) } as LRESULT;
+        }
         if packet.dwData != 0 {
             return 0;
         }

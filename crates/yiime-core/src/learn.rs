@@ -311,6 +311,7 @@ impl Learned {
 
     /// Ranks confident exact matches first by current score (stable: candidates below
     /// [`PROMOTE_SCORE`] keep dictionary order after them); prefix candidates stay behind.
+    /// User words stay ahead of every learned dictionary word.
     pub fn reorder(&self, code: &str, candidates: &mut [Candidate]) {
         self.reorder_at(code, candidates, now_secs());
     }
@@ -334,6 +335,7 @@ impl Learned {
         candidates.sort_by(|a, b| {
             let rank = |candidate: &Candidate| {
                 (
+                    !candidate.user,
                     !candidate.complete,
                     candidate
                         .complete
@@ -341,10 +343,11 @@ impl Learned {
                         .flatten(),
                 )
             };
-            let (a_partial, a_score) = rank(a);
-            let (b_partial, b_score) = rank(b);
-            a_partial
-                .cmp(&b_partial)
+            let (a_user, a_partial, a_score) = rank(a);
+            let (b_user, b_partial, b_score) = rank(b);
+            a_user
+                .cmp(&b_user)
+                .then_with(|| a_partial.cmp(&b_partial))
                 .then_with(|| match (a_score, b_score) {
                     (Some(x), Some(y)) => y.total_cmp(&x),
                     (Some(_), None) => std::cmp::Ordering::Less,
@@ -486,6 +489,7 @@ mod tests {
                     source: crate::Source::Wubi,
                     complete: true,
                     rest: String::new(),
+                    user: false,
                 })
                 .collect::<Vec<_>>()
         };
@@ -518,6 +522,11 @@ mod tests {
         learned.record_at("aaaa", "甲", later);
         learned.reorder_at("aaaa", &mut list, later);
         assert_eq!(texts(&list)[2], "甲");
+        // A user word stays first even when a dictionary word has a higher score.
+        let mut list = candidates();
+        list[2].user = true;
+        learned.reorder_at("aaaa", &mut list, later);
+        assert_eq!(texts(&list)[0], "丙");
     }
 
     #[test]

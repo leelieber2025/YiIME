@@ -38,6 +38,34 @@ pub(super) unsafe fn send_tsf_text(receiver: HWND, sender: HWND, text: &str) -> 
             && accepted != 0
     }
 }
+/// Commits `text` into the text field the DLL parked under `id` (COPYDATA dwData 5). Empty text
+/// only releases that field. A session that started afterwards is left running.
+pub(super) unsafe fn send_tsf_held(receiver: HWND, sender: HWND, id: u64, text: &str) -> bool {
+    let bytes = id.to_le_bytes();
+    let mut units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    units.extend(text.encode_utf16());
+    let packet = COPYDATASTRUCT {
+        dwData: 5,
+        cbData: (units.len() * 2) as u32,
+        lpData: units.as_mut_ptr() as _,
+    };
+    let mut accepted = 0usize;
+    unsafe {
+        SendMessageTimeoutW(
+            receiver,
+            WM_COPYDATA,
+            sender as usize,
+            &packet as *const _ as isize,
+            SMTO_ABORTIFHUNG,
+            3000,
+            &mut accepted,
+        ) != 0
+            && accepted != 0
+    }
+}
 /// Asks the TSF DLL to switch its application to English input (COPYDATA dwData 4), as a Shift
 /// tap there would.
 pub(super) unsafe fn send_tsf_english(receiver: HWND, sender: HWND) -> bool {
