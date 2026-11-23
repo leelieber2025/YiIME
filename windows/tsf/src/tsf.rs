@@ -8,7 +8,7 @@ use std::mem::ManuallyDrop;
 use std::ptr::null_mut;
 use std::rc::Rc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 use windows::Win32::Foundation::{
     CLASS_E_CLASSNOTAVAILABLE, CLASS_E_NOAGGREGATION, E_FAIL, HINSTANCE, HMODULE, RECT, S_FALSE,
     S_OK,
@@ -44,9 +44,11 @@ use windows::core::{
 };
 use windows_registry::{CLASSES_ROOT, CURRENT_USER, LOCAL_MACHINE};
 use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Foundation::POINT;
 use windows_sys::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
 };
+use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromPoint};
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows_sys::Win32::System::Threading::{
@@ -61,8 +63,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     ES_PASSWORD, GA_ROOT, GWL_STYLE, GWLP_USERDATA, GetAncestor, GetClassNameW,
     GetForegroundWindow, GetSystemMetrics, GetWindowLongPtrW, GetWindowLongW,
     GetWindowThreadProcessId, HWND_MESSAGE, IMAGE_ICON, IsWindow, KillTimer, LoadImageW,
-    PostMessageW, RegisterClassW, SM_CXSMICON, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SMTO_ABORTIFHUNG, SendMessageTimeoutW, SetTimer,
+    PostMessageW, RegisterClassW, SM_CXSMICON, SMTO_ABORTIFHUNG, SendMessageTimeoutW, SetTimer,
     SetWindowLongPtrW, WM_APP, WM_COPYDATA, WM_CREATE, WM_TIMER, WNDCLASSW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -134,6 +135,8 @@ type ScopeCache = Option<(ITfContext, Rc<Cell<Option<bool>>>)>;
 const WM_SCOPE_READ: u32 = WM_APP + 12;
 const WM_CARET_READ: u32 = WM_APP + 13;
 static MODULE: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+/// Last good caret line height (yiime_core::caret_anchor).
+static LINE_HEIGHT: AtomicI32 = AtomicI32::new(0);
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -418,21 +421,31 @@ impl ITfEditSession_Impl for CaretQuery_Impl {
                 range.Collapse(cookie, TF_ANCHOR_START)?;
                 view.GetTextExt(cookie, &range, &mut rect, &mut clipped)?;
             }
-            let screen = unsafe {
-                let left = GetSystemMetrics(SM_XVIRTUALSCREEN);
-                let top = GetSystemMetrics(SM_YVIRTUALSCREEN);
-                [
-                    left,
-                    top,
-                    left + GetSystemMetrics(SM_CXVIRTUALSCREEN),
-                    top + GetSystemMetrics(SM_CYVIRTUALSCREEN),
-                ]
+            let Some((anchor, height)) = yiime_core::caret_anchor(
+                [rect.left, rect.top, rect.right, rect.bottom],
+                LINE_HEIGHT.load(Ordering::Relaxed),
+            ) else {
+                return Ok(());
             };
-            if yiime_core::caret_usable([rect.left, rect.top, rect.right, rect.bottom], screen) {
-                self.result.set(Some(rect));
-                unsafe {
-                    PostMessageW(self.receiver as HWND, WM_CARET_READ, 0, 0);
-                }
+            // Hosts without a real text store (some full-screen games) answer a rectangle off
+            // every monitor, e.g. (-1000,-1000,…): not a place for the box.
+            let center = POINT {
+                x: anchor[0] + (anchor[2] - anchor[0]) / 2,
+                y: anchor[1] + (anchor[3] - anchor[1]) / 2,
+            };
+            if unsafe { MonitorFromPoint(center, MONITOR_DEFAULTTONULL) }.is_null() {
+                log("光标矩形不在任何显示器上，忽略");
+                return Ok(());
+            }
+            LINE_HEIGHT.store(height, Ordering::Relaxed);
+            self.result.set(Some(RECT {
+                left: anchor[0],
+                top: anchor[1],
+                right: anchor[2],
+                bottom: anchor[3],
+            }));
+            unsafe {
+                PostMessageW(self.receiver as HWND, WM_CARET_READ, 0, 0);
             }
             Ok(())
         })

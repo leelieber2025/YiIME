@@ -394,18 +394,29 @@ pub fn private_scope(scopes: &[i32]) -> bool {
     scopes.iter().any(|scope| PRIVATE_SCOPES.contains(scope))
 }
 
-/// A caret rectangle (left, top, right, bottom) worth placing the box at: not empty (some hosts
-/// answer zeros before layout) and overlapping the virtual screen `screen`.
-pub fn caret_usable(rect: [i32; 4], screen: [i32; 4]) -> bool {
+/// Line heights (physical pixels) trusted as one text line: smaller is a caret sliver, larger
+/// most likely the whole edit box (qingjian anchor.rs MIN/MAX_LINE_HEIGHT).
+pub const MIN_LINE_HEIGHT: i32 = 8;
+pub const MAX_LINE_HEIGHT: i32 = 200;
+
+/// The caret rectangle (left, top, right, bottom) to place the box at, and the line height to
+/// remember. None for an empty rectangle (zeros before layout). A sliver (WeChat answers a
+/// 1-pixel strip for some ranges) is grown to the last good line height, so the box neither
+/// jumps nor covers the line. Whether it lies on a monitor is checked by the caller. Follows
+/// qingjian apps/windows/tsf/src/com/edit/anchor.rs (range_rect, repair_degenerate).
+pub fn caret_anchor(rect: [i32; 4], last_height: i32) -> Option<([i32; 4], i32)> {
     let [left, top, right, bottom] = rect;
-    let [screen_left, screen_top, screen_right, screen_bottom] = screen;
-    bottom > top
-        && right >= left
-        && !(left == 0 && top == 0 && right == 0 && bottom == 0)
-        && right >= screen_left
-        && left < screen_right
-        && bottom > screen_top
-        && top < screen_bottom
+    if (right <= left && bottom <= top) || rect == [0; 4] {
+        return None;
+    }
+    let height = bottom - top;
+    if (MIN_LINE_HEIGHT..=MAX_LINE_HEIGHT).contains(&height) {
+        return Some((rect, height));
+    }
+    if height < MIN_LINE_HEIGHT && last_height >= MIN_LINE_HEIGHT {
+        return Some(([left, top, right, top + last_height], last_height));
+    }
+    Some((rect, last_height))
 }
 
 /// Why a plain letter went to the application instead of the input box (logged when it changes).
@@ -707,14 +718,28 @@ mod tests {
     }
 
     #[test]
-    fn empty_or_off_screen_caret_is_ignored() {
-        let screen = [-1920, 0, 1920, 1080];
-        assert!(caret_usable([100, 200, 101, 220], screen));
-        assert!(caret_usable([-500, 300, -499, 320], screen));
-        assert!(!caret_usable([0, 0, 0, 0], screen));
-        assert!(!caret_usable([100, 200, 100, 200], screen));
-        assert!(!caret_usable([5000, 200, 5001, 220], screen));
-        assert!(!caret_usable([100, -3000, 101, -2980], screen));
+    fn empty_caret_is_ignored_and_a_sliver_gets_the_line_height() {
+        assert_eq!(caret_anchor([0, 0, 0, 0], 20), None);
+        assert_eq!(caret_anchor([100, 200, 100, 200], 20), None);
+        // A normal line: kept, its height remembered.
+        assert_eq!(
+            caret_anchor([100, 200, 101, 220], 0),
+            Some(([100, 200, 101, 220], 20))
+        );
+        // WeChat's 1-pixel sliver: grown to the remembered line.
+        assert_eq!(
+            caret_anchor([100, 1063, 101, 1064], 20),
+            Some(([100, 1063, 101, 1083], 20))
+        );
+        // A sliver before any good line, or the whole edit box: used as is, not remembered.
+        assert_eq!(
+            caret_anchor([100, 1063, 101, 1064], 0),
+            Some(([100, 1063, 101, 1064], 0))
+        );
+        assert_eq!(
+            caret_anchor([0, 0, 800, 600], 20),
+            Some(([0, 0, 800, 600], 20))
+        );
     }
 
     #[test]
