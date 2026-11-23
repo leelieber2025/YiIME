@@ -6,12 +6,16 @@
 
 ## [Unreleased]
 
-## [0.2.0-rc.3] - 2026-11-22
+## [0.2.0-rc.4] - 2026-11-22
 
 候选版本（预发布），修复 0.2.0-rc.2 的问题。升级后请重启电脑。
 
+0.2.0-rc.3 已撤回（在 Chrome、Electron 等应用中无法上屏），其改动全部并入本版。装过 rc.3 的请直接升级到本版并重启。
+
 ### 修复
 
+- **修复 0.2.0-rc.3 无法上屏**：输入框打字时会拿走前台，提交时再切回应用；Chrome、Electron 等应用在这期间会把焦点切到一个禁用的空文档或无文档，再回到原输入框。rc.3 的输入法把这一来一回当成“换了输入框”，提交前一刻结束了会话并把输入框暂存，输入框随后的提交被拒绝（“输入法没有接受提交，草稿已保留”），翻译模式和普通五笔/拼音都打不了字。现在只有焦点真正移到另一个可输入的文档时才结束会话，回到同一个输入框、焦点短暂离开、切到禁用的空文档都不算；按键来自同一输入框的另一个上下文也算同一个输入框。
+- 输入框的提交不再被拒绝：会话已结束时先提交到暂存的输入框，再不行就提交到当前有焦点的输入框，只有找不到任何可输入的输入框时才失败。
 - 翻译进行中换到另一个输入框（或另一个应用）时，中文原文提交回原来的位置，译文不再上屏到新的位置；没按 Enter 的草稿也不再跟着新输入框走。
 - 打开自学习后，用户词仍然排在该编码的最前面。
 - 换到另一个输入框后，如果输入框服务没能及时回应（忙、正在服务别的应用或已退出），下一次上屏不再插到上一个输入框里。
@@ -193,8 +197,8 @@ Linux：
 
 - 命令行工具 `yiime`（`query` 查候选、`translate` 测试翻译），提供 tar.gz 与 .deb。
 
-[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.3...HEAD
-[0.2.0-rc.3]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.2...v0.2.0-rc.3
+[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.4...HEAD
+[0.2.0-rc.4]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.2...v0.2.0-rc.4
 [0.2.0-rc.2]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.1...v0.2.0-rc.2
 [0.2.0-rc.1]: https://github.com/leelieber2025/YiIME/compare/v0.1.5...v0.2.0-rc.1
 [0.1.5]: https://github.com/leelieber2025/YiIME/compare/v0.1.4...v0.1.5
