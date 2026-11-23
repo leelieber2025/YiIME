@@ -332,15 +332,9 @@ impl Table {
             Bytes::Owned(data) => data,
         }
     }
+    #[cfg(test)]
     pub fn as_bytes(&self) -> &[u8] {
         self.data()
-    }
-    /// Size of the blob in bytes.
-    pub fn len(&self) -> usize {
-        self.data().len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.key_count == [0, 0]
     }
     fn word(&self, at: usize) -> u32 {
         read_u32(self.data(), at)

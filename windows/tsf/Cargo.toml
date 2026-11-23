@@ -16,6 +16,7 @@ embed-resource = "3"
 # Platform-independent core: setting names and defaults, shortcut parsing, punctuation mapping (no
 # translation client or dictionaries).
 yiime-core = { path = "../../crates/yiime-core", default-features = false }
+# Needed by the #[implement] macro, which expands to ::windows_core paths.
 windows-core = "0.62.2"
 windows-registry = "0.6"
 windows = { version = "0.62.2", features = [

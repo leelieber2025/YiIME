@@ -862,7 +862,6 @@ name = "yiime-app"
 version = "0.2.0-rc.3"
 dependencies = [
  "embed-resource",
- "serde_json",
  "windows-sys 0.61.2",
  "yiime-core",
 ]

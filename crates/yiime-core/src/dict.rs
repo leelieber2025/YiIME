@@ -299,11 +299,6 @@ impl MixedInput {
         }
     }
 
-    /// Size in bytes of the dictionary index (precompiled for [`Self::bundled`]).
-    pub fn index_bytes(&self) -> usize {
-        self.table.len()
-    }
-
     /// Dictionaries compiled into the binary: Wubi 86, pinyin and supplementary words. The large
     /// lexicon and user words are loaded at runtime.
     #[cfg(feature = "bundled")]
