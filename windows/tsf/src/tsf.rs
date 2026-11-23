@@ -26,10 +26,10 @@ use windows::Win32::UI::TextServices::{
     GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, GUID_LBI_INPUTMODE, GUID_PROP_INPUTSCOPE,
     GUID_TFCAT_TIP_KEYBOARD, GUID_TFCAT_TIPCAP_COMLESS, GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
     GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT, GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
-    INSERT_TEXT_AT_SELECTION_FLAGS, ITfCategoryMgr, ITfCompartmentEventSink,
-    ITfCompartmentEventSink_Impl, ITfCompartmentMgr, ITfContext, ITfDocumentMgr, ITfEditRecord,
-    ITfEditSession, ITfEditSession_Impl, ITfInputProcessorProfiles, ITfInputScope,
-    ITfInsertAtSelection, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
+    GUID_TFCAT_TIPCAP_UIELEMENTENABLED, INSERT_TEXT_AT_SELECTION_FLAGS, ITfCategoryMgr,
+    ITfCompartmentEventSink, ITfCompartmentEventSink_Impl, ITfCompartmentMgr, ITfContext,
+    ITfDocumentMgr, ITfEditRecord, ITfEditSession, ITfEditSession_Impl, ITfInputProcessorProfiles,
+    ITfInputScope, ITfInsertAtSelection, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
     ITfLangBarItem_Impl, ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItemMgr,
     ITfLangBarItemSink, ITfMenu, ITfSource, ITfSource_Impl, ITfTextEditSink, ITfTextEditSink_Impl,
     ITfTextInputProcessor, ITfTextInputProcessor_Impl, ITfThreadFocusSink, ITfThreadFocusSink_Impl,
@@ -226,17 +226,20 @@ fn absent_is_ok(result: Result<()>) -> Result<()> {
     }
 }
 
-/// Registered TIP categories. SYSTRAYSUPPORT is required for the Win8+ taskbar input indicator to
-/// show this IME's mode icon (GUID_LBI_INPUTMODE) and forward clicks to it; without it only the
-/// brand icon appears. IMMERSIVESUPPORT is not registered: UWP/AppContainer hosts cannot launch the
-/// input-box EXE, write HKCU or message across integrity levels, so claiming support would break
-/// those apps (Microsoft documents SYSTRAYSUPPORT for IMEs that are not immersive but work in the
-/// system tray).
-const CATEGORIES: [GUID; 4] = [
+/// Registered TIP categories, compared with qingjian's list (com/registry/mod.rs CATEGORIES).
+/// SYSTRAYSUPPORT is required for the Win8+ taskbar input indicator to show this IME's mode icon
+/// (GUID_LBI_INPUTMODE) and forward clicks to it. UIELEMENTENABLED lets TSF activate the IME in
+/// applications that ask for UI-less mode (games); the input box is a window of its own, so it
+/// does not depend on the application drawing anything. Not registered, unlike qingjian:
+/// IMMERSIVESUPPORT (UWP/AppContainer hosts cannot launch the input-box EXE or message it across
+/// integrity levels), SECUREMODE (the logon and UAC desktops must not start the box), and
+/// DISPLAYATTRIBUTEPROVIDER (no in-document composition yet).
+const CATEGORIES: [GUID; 5] = [
     GUID_TFCAT_TIP_KEYBOARD,
     GUID_TFCAT_TIPCAP_COMLESS,
     GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT,
     GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
+    GUID_TFCAT_TIPCAP_UIELEMENTENABLED,
 ];
 /// Small diagnostic log: %TEMP%\YiIME-tsf.log (rotated to .old over 512 KB); ignored where it
 /// cannot be written (AppContainer etc.).
