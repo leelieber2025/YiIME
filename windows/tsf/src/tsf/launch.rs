@@ -135,6 +135,13 @@ fn remember(outcome: LaunchOutcome) {
     }
 }
 
+/// Whether this host can use the shared draft-box service. AppContainer hosts such as
+/// SearchHost / Start menu cannot launch or talk to YiIME.exe (and often cannot read
+/// HKCU\Software\YiIME, so PlainMode falls back to its default, 译).
+pub(super) fn draft_box_usable() -> bool {
+    host_is_plain_desktop_app()
+}
+
 fn host_is_plain_desktop_app() -> bool {
     crate::process_security::process_security(0)
         .is_some_and(|host| !host.elevated && host.integrity == MEDIUM_INTEGRITY)

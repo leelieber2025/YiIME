@@ -1,4 +1,7 @@
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static NOTED_INLINE_FALLBACK: AtomicBool = AtomicBool::new(false);
 
 impl ITfKeyEventSink_Impl for TextService_Impl {
     fn OnSetFocus(&self, foreground: BOOL) -> Result<()> {
@@ -99,8 +102,11 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 return Ok(true.into());
             }
             // 译 mode (PlainMode=false): letters go to the draft box. 普通五笔 keeps
-            // in-document composition.
-            if !plain_mode() && (0x41..=0x5a).contains(&key.0) {
+            // in-document composition. AppContainer hosts (SearchHost / Start menu) cannot
+            // open the box and often cannot read PlainMode from HKCU, so they would otherwise
+            // stay in 译 and hand Latin letters back to the search box. Keep SampleIME-style
+            // in-document composition there, as e255d84 did.
+            if !plain_mode() && (0x41..=0x5a).contains(&key.0) && launch::draft_box_usable() {
                 if self.inline.active() {
                     self.inline.cancel(self.client_id.get());
                 }
@@ -112,12 +118,21 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 }
                 return Ok(opened.into());
             }
+            if !plain_mode()
+                && (0x41..=0x5a).contains(&key.0)
+                && !launch::draft_box_usable()
+                && !NOTED_INLINE_FALLBACK.swap(true, Ordering::Relaxed)
+            {
+                log("翻译模式：此宿主不能打开草稿框，改在文档内组字");
+            }
             if self.inline.key(context, self.client_id.get(), key.0) {
                 return Ok(true.into());
             }
             // The host did not accept the composition session. Fall back to the draft box
-            // rather than swallowing a key OnTestKeyDown already claimed.
-            if !self.inline.active() && (0x41..=0x5a).contains(&key.0) {
+            // rather than swallowing a key OnTestKeyDown already claimed. Skip the box in
+            // hosts that cannot use it, and give the key back.
+            if !self.inline.active() && (0x41..=0x5a).contains(&key.0) && launch::draft_box_usable()
+            {
                 self.probe_new_field(context);
                 let opened = self.open_editor(context.clone(), key.0 as u8);
                 if !opened {
