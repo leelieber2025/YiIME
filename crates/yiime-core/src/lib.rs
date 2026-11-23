@@ -79,7 +79,7 @@ pub use service::{
 pub use settings::{
     AZURE_KEY_FILE, ApiSettings, DEFAULT_HISTORY_KEY, DEFAULT_URL, Engine, Flag, GOOGLE_KEY_FILE,
     KEY_FILE, MemoryStore, OptionStore, Options, PAGE_SIZE, PAGE_SIZE_RANGE, PlainSealer,
-    SETTINGS_FILE, Sealer, USER_WORDS_FILE, parse_page_size,
+    SETTINGS_FILE, Sealer, USER_WORDS_FILE, llm_url_allowed, parse_page_size,
 };
 pub use shuangpin::Shuangpin;
 pub use style::{TranslationStyle, system_prompt};

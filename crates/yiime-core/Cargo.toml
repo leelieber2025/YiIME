@@ -14,12 +14,13 @@ engine = []
 # Compile the Wubi/pinyin/supplementary dictionaries into the binary (MixedInput::bundled).
 bundled = ["engine"]
 # OpenAI-compatible and Google translation client (network). Not needed by the TSF DLL.
-translate = ["dep:ureq", "dep:url"]
+translate = ["dep:ureq"]
 
 [dependencies]
 serde_json = "1"
 ureq = { version = "2", features = ["json", "proxy-from-env"], optional = true }
-url = { version = "2", optional = true }
+# Parses API addresses in settings validation (also without the translate feature).
+url = "2"
 
 [lints.clippy]
 # Errors are propagated or defaulted; tests may unwrap (clippy.toml).

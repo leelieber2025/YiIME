@@ -653,6 +653,13 @@ fn llm(
     if endpoint.is_empty() || model.is_empty() || key.is_empty() {
         return Err(Fail::new("config", "请填写 API 地址、模型和密钥"));
     }
+    // The key goes in a header: never to plain HTTP off this machine, whoever calls this.
+    if !crate::settings::llm_url_allowed(endpoint) {
+        return Err(Fail::new(
+            "config",
+            "API 地址请使用 HTTPS（不能带用户名或密码）；仅本机测试允许 HTTP",
+        ));
+    }
     let messages = json!([
         {"role": "system", "content": system_prompt(style, custom)},
         {"role": "user", "content": source}
@@ -1085,6 +1092,32 @@ mod tests {
         assert!(outcome.result.unwrap_err().contains("HTTP 429"));
         assert_eq!(outcome.attempts[0].failure.as_deref(), Some("http 429"));
         assert!(!outcome.attempts[0].log_line().contains("slow down"));
+    }
+
+    #[test]
+    fn llm_key_never_goes_to_a_disguised_host() {
+        // Even when called directly with an address the settings check would reject (the CLI
+        // reads settings.json without the GUI's check), nothing is sent: `localhost:80@` is user
+        // info and the real host is the one after it.
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let settings = ApiSettings {
+            engine: Engine::Llm,
+            url: format!("http://localhost:80@{address}/v1/chat/completions"),
+            model: "m".into(),
+            key: "secret".into(),
+            ..ApiSettings::default()
+        };
+        assert!(settings.validate_llm().is_err());
+        let outcome = translate(&settings, "伪装主机测试");
+        let error = outcome.result.unwrap_err();
+        assert!(error.contains("HTTPS"), "{error}");
+        assert!(matches!(
+            listener.accept(),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock
+        ));
     }
 
     #[test]

@@ -12,6 +12,10 @@
 - 换输入框时等待输入框服务的时间从 1 秒缩短到 0.3 秒（与其他请求一致），输入框服务忙时应用不再卡顿。
 - 导入搜狗细胞词库（.scel）时跳过含空格、换行等非汉字字符的词条，不再打乱 `user_words.txt` 的格式。
 
+### 安全
+
+- 大模型 API 地址改为按 URL 解析后检查协议和主机，不再按字符串前缀判断：`http://localhost:80@evil.example/v1` 这类带用户名/密码的地址（真实主机是 `evil.example`）以及 `localhost.evil.com` 等仿冒主机不再被当成本机，API 密钥不会以明文 HTTP 发往外部。HTTP 只允许 `localhost`、`127.0.0.0/8` 和 `[::1]`，任何带用户名或密码的地址都拒绝；翻译模块发送请求前也会再检查一次（命令行直接读取 settings.json 时同样生效）。
+
 ### 变更
 
 - 主程序的窗口类名改为 `YiIMEWindow`、`YiIMEHistory`、`YiIMESettings`；输入法 DLL 和主程序共用的类名、托盘标题统一定义在 `yiime-core`。

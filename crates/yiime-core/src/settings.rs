@@ -445,27 +445,86 @@ impl ApiSettings {
             Engine::Llm => self.validate_llm(),
         }
     }
-    /// LLM usable: URL, model and key are set; HTTPS only, except HTTP to localhost for testing.
+    /// LLM usable: URL, model and key are set; HTTPS only, except HTTP to this machine for
+    /// testing (see [`llm_url_allowed`]).
     pub fn validate_llm(&self) -> Result<(), &'static str> {
-        let lower = self.url.trim().to_ascii_lowercase();
         if self.url.trim().is_empty() || self.model.trim().is_empty() || self.key.trim().is_empty()
         {
             Err("请先在“设置”中填写 API 地址、模型和密钥")
-        } else if !lower.starts_with("https://")
-            && !lower.starts_with("http://127.0.0.1:")
-            && !lower.starts_with("http://localhost:")
-            && !lower.starts_with("http://[::1]:")
-        {
-            Err("API 地址请使用 HTTPS；仅本机测试允许 HTTP")
+        } else if !llm_url_allowed(&self.url) {
+            Err("API 地址请使用 HTTPS（不能带用户名或密码）；仅本机测试允许 HTTP")
         } else {
             Ok(())
         }
     }
 }
 
+/// Whether the API key may be sent to `address`: parsed as a URL (not prefix-matched, so
+/// `http://localhost:80@evil.example/` is the host `evil.example`). `https://` with a host is
+/// allowed; `http://` only when the host really is this machine (`localhost`, 127.0.0.0/8 or
+/// `[::1]`). Addresses with a user name or password are refused either way.
+pub fn llm_url_allowed(address: &str) -> bool {
+    let Ok(url) = url::Url::parse(address.trim()) else {
+        return false;
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        return false;
+    }
+    match (url.scheme(), url.host()) {
+        ("https", Some(_)) => true,
+        ("http", Some(url::Host::Domain(host))) => host.eq_ignore_ascii_case("localhost"),
+        ("http", Some(url::Host::Ipv4(ip))) => ip.is_loopback(),
+        ("http", Some(url::Host::Ipv6(ip))) => ip.is_loopback(),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn llm_url_is_parsed_not_prefix_matched() {
+        for good in [
+            "https://api.example.com/v1",
+            "HTTPS://API.EXAMPLE.COM/v1",
+            "http://localhost:8080/v1",
+            "http://LOCALHOST/v1",
+            "http://127.0.0.1:11434/v1",
+            "http://127.1.2.3:8080/v1",
+            "http://[::1]:8765/v1",
+            "  http://localhost:1234/v1  ",
+        ] {
+            assert!(llm_url_allowed(good), "{good}");
+        }
+        for bad in [
+            // Prefix tricks: user info hides the real host.
+            "http://localhost:80@evil.example/v1",
+            "http://127.0.0.1:80@evil.example/v1",
+            "http://[::1]:80@evil.example/v1",
+            "http://localhost@evil.example/v1",
+            "http://user:pass@localhost:8080/v1",
+            "https://user:pass@api.example.com/v1",
+            // Lookalike hosts.
+            "http://localhost.evil.com/v1",
+            "http://localhost.evil.com:8080/v1",
+            "http://127.0.0.1.evil.com/v1",
+            "http://evil.com/localhost/v1",
+            "http://evil.com?http://localhost:1/",
+            "http://[::ffff:8.8.8.8]/v1",
+            "http://0.0.0.0:8080/v1",
+            "http://10.0.0.1:8080/v1",
+            "http://example.com",
+            // Other schemes and junk.
+            "ftp://localhost/v1",
+            "file:///etc/passwd",
+            "localhost:8080/v1",
+            "https://",
+            "",
+        ] {
+            assert!(!llm_url_allowed(bad), "{bad}");
+        }
+    }
 
     #[test]
     fn flags_defaults_page_size_and_hotkeys() {
