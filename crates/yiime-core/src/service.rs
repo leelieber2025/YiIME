@@ -507,13 +507,25 @@ pub enum CommitTarget {
     Focused,
 }
 
-/// Commit targets in the order to try them. An open session always wins, so text never lands in
-/// a field that was left; the focused field is the last resort.
-pub fn commit_targets(session: bool, held: bool, focused: bool) -> Vec<CommitTarget> {
+/// Commit targets in the order to try them. An open session wins, so text never lands in a field
+/// that was left; the focused field is the last resort. `moved_in_window`: the session's field is
+/// still in the focused window but its document no longer has the focus (Word replaces its first
+/// document shortly after opening, Electron gives a refocused field a new one; yiime_core::
+/// focus_change keeps the session for both). The focused context is then tried first, as
+/// qingjian commits into the context the host handed over last rather than a remembered one:
+/// the old context may accept the edit and show nothing.
+pub fn commit_targets(
+    session: bool,
+    held: bool,
+    focused: bool,
+    moved_in_window: bool,
+) -> Vec<CommitTarget> {
+    let first_focused = session && focused && moved_in_window;
     [
+        (first_focused, CommitTarget::Focused),
         (session, CommitTarget::Session),
         (held, CommitTarget::Held),
-        (focused, CommitTarget::Focused),
+        (focused && !first_focused, CommitTarget::Focused),
     ]
     .into_iter()
     .filter_map(|(available, target)| available.then_some(target))
@@ -813,12 +825,30 @@ mod tests {
     #[test]
     fn a_commit_is_never_refused_while_a_field_is_known() {
         use CommitTarget::*;
-        assert_eq!(commit_targets(true, true, true), [Session, Held, Focused]);
+        assert_eq!(
+            commit_targets(true, true, true, false),
+            [Session, Held, Focused]
+        );
         // Session ended by a focus event before the box committed: the parked field, then the
         // focused one; never nothing while the user is in a text field.
-        assert_eq!(commit_targets(false, true, true), [Held, Focused]);
-        assert_eq!(commit_targets(false, false, true), [Focused]);
-        assert!(commit_targets(false, false, false).is_empty());
+        assert_eq!(commit_targets(false, true, true, false), [Held, Focused]);
+        assert_eq!(commit_targets(false, false, true, false), [Focused]);
+        assert!(commit_targets(false, false, false, false).is_empty());
+    }
+
+    #[test]
+    fn a_document_replaced_in_the_same_window_gets_the_commit() {
+        use CommitTarget::*;
+        // Fresh Word: the first key opened the session on the start-up document, Word then
+        // focused its real one in the same window. The commit goes to the focused context, the
+        // remembered one only if that fails.
+        assert_eq!(commit_targets(true, false, true, true), [Focused, Session]);
+        assert_eq!(
+            commit_targets(true, true, true, true),
+            [Focused, Session, Held]
+        );
+        // Nothing focused: the session's own context.
+        assert_eq!(commit_targets(true, false, false, true), [Session]);
     }
 
     #[test]

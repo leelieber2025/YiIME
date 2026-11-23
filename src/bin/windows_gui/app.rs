@@ -1373,6 +1373,7 @@ unsafe fn commit_to_target(hwnd: HWND, state: &State, text: &str) {
     match result {
         Ok(()) => unsafe { clear_box(hwnd, state) },
         Err(error) => unsafe {
+            service_log(&format!("commit failed: {error}"));
             *state.status.borrow_mut() = Some((format!("{error}，草稿已保留"), true));
             show_box(hwnd, state);
         },
@@ -1448,6 +1449,8 @@ unsafe fn on_translated(hwnd: HWND, state: &State, response: TranslationResult) 
             commit_to_target(hwnd, state, &english);
         },
         Err(error) => unsafe {
+            // The reason's category is in YiIME-translate.log; provider text is not logged.
+            service_log("translation failed");
             set_status(hwnd, state, Some((format!("翻译失败：{error}"), true)));
         },
     }

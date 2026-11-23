@@ -1612,8 +1612,23 @@ impl TextService {
             return true;
         }
         let focused = self.focused_context();
-        let targets =
-            yiime_core::commit_targets(session.is_some(), held.is_some(), focused.is_some());
+        let moved_in_window = session.is_some()
+            && focused.as_ref().is_some_and(|focused| {
+                let session_window = self.session_window.get();
+                let document = unsafe { focused.GetDocumentMgr() }.ok();
+                !session_window.is_null()
+                    && context_window(focused) == session_window
+                    && document.as_ref() != self.session_document.borrow().as_ref()
+            });
+        if moved_in_window {
+            log("上屏：会话的文档已不是焦点文档（同一窗口），先上屏到焦点输入框");
+        }
+        let targets = yiime_core::commit_targets(
+            session.is_some(),
+            held.is_some(),
+            focused.is_some(),
+            moved_in_window,
+        );
         for target in targets {
             let (context, which) = match target {
                 yiime_core::CommitTarget::Session => (session.clone(), "session"),
@@ -1628,6 +1643,7 @@ impl TextService {
                 match target {
                     yiime_core::CommitTarget::Session => self.finish_editor(),
                     yiime_core::CommitTarget::Held => self.clear_held(),
+                    yiime_core::CommitTarget::Focused if moved_in_window => self.finish_editor(),
                     yiime_core::CommitTarget::Focused => {
                         log("上屏到当前焦点输入框（原会话已结束）");
                         self.clear_held();
