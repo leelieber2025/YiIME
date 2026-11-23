@@ -6,15 +6,19 @@
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-11-22
+
+修复 0.2.0 的问题。0.2.0 已撤回（Office 刚打开时无法输入），装过 0.2.0 的请升级到本版。**升级后请重启电脑**。0.1.5 以来的全部变化见下方 0.2.0 一节。
+
 ### 修复
 
-- **Word 刚打开时无法输入**：输入法按“输入框类型”（InputScope）判断是不是密码框，查询以前只在焦点事件时异步发出，结果没出来（或按键来自没查询过的上下文）时一律按密码框处理，字母直接交给应用。刚打开的 Word 里这个查询没有生效，打字全是英文字母，直到切换一次焦点才恢复。现在按键时如果还不知道该输入框的类型，就当场同步查询；仍然读不到时按普通输入框处理（`Edit` 密码框仍按窗口样式识别）。
+- **Office 应用刚打开时无法输入**（如 Word；切换一次窗口后才恢复）：输入法按“输入框类型”（InputScope）判断是不是密码框，查询以前只在焦点事件时异步发出，结果没出来（或按键来自没查询过的上下文）时一律按密码框处理，字母直接交给应用。刚打开的 Word 里这个查询没有生效，打字全是英文字母，直到切换一次焦点才恢复。现在按键时如果还不知道该输入框的类型，就当场同步查询；仍然读不到时按普通输入框处理（`Edit` 密码框仍按窗口样式识别）。
 - Chrome、Electron 应用提交时仍会误判“换了输入框”（0.2.0 靠回退仍能上屏，但每次都结束会话）：Electron 在输入框重新获得焦点时给它一个新的文档。现在同一窗口里的文档变化不算换输入框，独立的输入控件或另一个窗口仍会识别。
 - 诊断日志 `%TEMP%\YiIME-tsf.log` 记录字母交给应用的原因（只读/禁用、英文模式、密码框、输入框打不开，原因变化时记一次）、按键时查询 InputScope 的结果，以及焦点文档变化的判断；不含输入内容。
 
-## [0.2.0] - 2026-11-22
+## [0.2.0] - 2026-11-22 [已撤回]
 
-正式版。汇总自 0.1.5 以来的变化（各候选版本的详细记录见下方 0.2.0-rc.4、rc.2、rc.1；rc.3 已撤回，内容并入 rc.4）。**升级后请重启电脑**；从 0.1.x 升级时设置、用户词库和输入记忆自动迁移。
+已撤回（Office 刚打开时无法输入），请使用 0.2.1。以下汇总 0.1.5 以来的变化，0.2.1 同样包含（各候选版本的详细记录见下方 0.2.0-rc.4、rc.2、rc.1；rc.3 已撤回，内容并入 rc.4）。**升级后请重启电脑**；从 0.1.x 升级时设置、用户词库和输入记忆自动迁移。
 
 ### 新增
 
@@ -236,9 +240,10 @@ Linux：
 
 - 命令行工具 `yiime`（`query` 查候选、`translate` 测试翻译），提供 tar.gz 与 .deb。
 
-[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.0...HEAD
-[0.2.0]: https://github.com/leelieber2025/YiIME/compare/v0.1.5...v0.2.0
-[0.2.0-rc.4]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.2...v0.2.0
+[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.1...HEAD
+[0.2.1]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.2...v0.2.1
+[0.2.0]: https://github.com/leelieber2025/YiIME/compare/v0.1.5...6246776275301d7881677fec385fe35df71003a5
+[0.2.0-rc.4]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.2...161f51922f35bbe926f0b92e9c7f90a415eef690
 [0.2.0-rc.2]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.1...v0.2.0-rc.2
 [0.2.0-rc.1]: https://github.com/leelieber2025/YiIME/compare/v0.1.5...v0.2.0-rc.1
 [0.1.5]: https://github.com/leelieber2025/YiIME/compare/v0.1.4...v0.1.5
