@@ -505,6 +505,12 @@ fn set_conversion_mode(manager: &ITfThreadMgr, client_id: u32, mode: i32) {
     inner.Anonymous.lVal = mode;
     let _ = unsafe { compartment.SetValue(client_id, &value) };
 }
+/// Window that shows `context` (null if unknown).
+fn context_window(context: &ITfContext) -> HWND {
+    unsafe { context.GetActiveView() }
+        .and_then(|view| unsafe { view.GetWnd() })
+        .map_or(null_mut(), |window| window.0 as HWND)
+}
 /// Input-box/tray EXE next to this DLL, or else in the current version directory recorded by the
 /// installer.
 fn companion_exe() -> Option<std::path::PathBuf> {
@@ -626,6 +632,7 @@ impl TextService {
         self.next_held.set(id);
         *self.held_context.borrow_mut() = self.context.borrow_mut().take();
         self.session_document.borrow_mut().take();
+        self.session_window.set(null_mut());
         self.held_id.set(id);
         id
     }
@@ -764,6 +771,10 @@ struct TextService {
     held_context: RefCell<Option<ITfContext>>,
     /// Document (text field) of the open session; focus events compare against it.
     session_document: RefCell<Option<ITfDocumentMgr>>,
+    /// Window showing the session's field (0 if unknown).
+    session_window: Cell<HWND>,
+    /// Last reason logged for letters passed to the application (logged again only on change).
+    pass_logged: Cell<Option<yiime_core::PassReason>>,
     held_id: Cell<u64>,
     next_held: Cell<u64>,
     client_id: Cell<u32>,
@@ -811,6 +822,8 @@ impl TextService {
             context: RefCell::new(None),
             held_context: RefCell::new(None),
             session_document: RefCell::new(None),
+            session_window: Cell::new(null_mut()),
+            pass_logged: Cell::new(None),
             held_id: Cell::new(0),
             next_held: Cell::new(0),
             client_id: Cell::new(0),
@@ -936,6 +949,7 @@ impl TextService {
         self.flush_attempts.set(0);
         self.context.borrow_mut().take();
         self.session_document.borrow_mut().take();
+        self.session_window.set(null_mut());
         self.clear_held();
     }
     fn kill_timers(&self) {
@@ -1009,12 +1023,55 @@ impl TextService {
                 return true;
             }
         }
-        self.scope_cache
+        let slot = self
+            .scope_cache
             .borrow()
             .as_ref()
             .filter(|(cached, _)| cached == context)
-            .and_then(|(_, result)| result.get())
-            .unwrap_or(true)
+            .map(|(_, result)| result.clone());
+        let cached = slot.as_ref().and_then(|result| result.get());
+        // Not known yet (key before any focus event, the asynchronous query not run, or a context
+        // that was never queried; a freshly opened Word stayed so until the next focus change):
+        // read it now, synchronously, which key handling allows.
+        let (password, source) = yiime_core::password_field(cached, || {
+            let result = slot.clone().unwrap_or_else(|| Rc::new(Cell::new(None)));
+            let session: ITfEditSession = ScopeCheck {
+                context: context.clone(),
+                result: result.clone(),
+            }
+            .into();
+            let _ = unsafe {
+                context.RequestEditSession(self.client_id.get(), &session, TF_ES_SYNC | TF_ES_READ)
+            };
+            let known = result.get();
+            *self.scope_cache.borrow_mut() = Some((context.clone(), result));
+            known
+        });
+        match source {
+            yiime_core::ScopeSource::Cached => {}
+            yiime_core::ScopeSource::QueriedNow => log(if password {
+                "InputScope 按键时查询：密码或 PIN 输入框"
+            } else {
+                "InputScope 按键时查询：普通输入框"
+            }),
+            yiime_core::ScopeSource::Unknown => {
+                // Remember the decision so this is logged once; a later asynchronous query of
+                // the same field still overwrites it.
+                if let Some((_, result)) = self.scope_cache.borrow().as_ref() {
+                    result.set(Some(false));
+                }
+                log("InputScope 无法读取，按普通输入框处理");
+            }
+        }
+        password
+    }
+    /// Logs why a plain letter went to the application, once per change of reason.
+    fn note_pass(&self, reason: Option<yiime_core::PassReason>) {
+        if self.pass_logged.replace(reason) != reason
+            && let Some(reason) = reason
+        {
+            log(&format!("按键交给应用：{}", reason.describe()));
+        }
     }
     fn wants_key(&self, context: &ITfContext, key: usize) -> bool {
         if running_in_editor() {
@@ -1096,7 +1153,27 @@ impl TextService {
             .is_ok()
     }
     fn should_consume(&self, context: &ITfContext, key: usize) -> bool {
-        self.wants_key(context, key) && (self.buffering() || !self.password_scope(context))
+        let consume =
+            self.wants_key(context, key) && (self.buffering() || !self.password_scope(context));
+        if consume {
+            self.note_pass(None);
+        } else if (0x41..=0x5a).contains(&key) && !running_in_editor() {
+            let modifier = |vk| unsafe { GetKeyState(vk as i32) } < 0;
+            let read_only = Self::disabled(context);
+            let english = !self.keyboard_open();
+            let modifier_or_caps = caps_lock()
+                || [VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN, VK_SHIFT]
+                    .into_iter()
+                    .any(modifier);
+            let password = !read_only && !english && self.password_scope(context);
+            self.note_pass(yiime_core::pass_reason(
+                read_only,
+                english,
+                modifier_or_caps,
+                password,
+            ));
+        }
+        consume
     }
     fn keyboard_open(&self) -> bool {
         let manager = self.thread_manager.borrow();
@@ -1332,6 +1409,7 @@ impl TextService {
             self.allow_editor_foreground();
             *self.context.borrow_mut() = Some(context.clone());
             *self.session_document.borrow_mut() = unsafe { context.GetDocumentMgr() }.ok();
+            self.session_window.set(context_window(&context));
             self.first_key.set(
                 first_key
                     .is_ascii_alphabetic()
@@ -1424,6 +1502,7 @@ impl TextService {
         }
         if let Ok(child) = command.spawn() {
             *self.session_document.borrow_mut() = unsafe { context.GetDocumentMgr() }.ok();
+            self.session_window.set(context_window(&context));
             *self.context.borrow_mut() = Some(context);
             self.first_key.set(
                 first_key
@@ -1533,6 +1612,7 @@ impl TextService {
     fn finish_editor(&self) {
         self.editor_open.set(false);
         self.session_document.borrow_mut().take();
+        self.session_window.set(null_mut());
         self.starting_window.set(null_mut());
         self.ready_deadline.set(None);
         self.context.borrow_mut().take();
@@ -1824,12 +1904,32 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
                 .as_ref()
                 .and_then(|document| unsafe { document.GetTop() }.ok())
                 .is_some_and(|context| !TextService::disabled(&context));
+            let window = document
+                .as_ref()
+                .and_then(|document| unsafe { document.GetTop() }.ok())
+                .map_or(null_mut(), |context| context_window(&context));
+            let session_window = self.session_window.get();
+            let same_window = !window.is_null() && window == session_window;
             let change = yiime_core::focus_change(
                 self.buffering(),
                 self.session_document.borrow().as_ref(),
                 document.as_ref(),
                 editable,
+                same_window,
             );
+            if self.buffering()
+                && document.is_some()
+                && document.as_ref() != self.session_document.borrow().as_ref()
+            {
+                log(&format!(
+                    "焦点文档变化：同一窗口={same_window} 可输入={editable} → {}",
+                    if change == yiime_core::FocusChange::OtherField {
+                        "结束会话"
+                    } else {
+                        "保持会话"
+                    }
+                ));
+            }
             if change == yiime_core::FocusChange::OtherField {
                 self.drop_stale_session("焦点移到另一个输入框");
             }

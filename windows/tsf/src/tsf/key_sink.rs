@@ -93,7 +93,11 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 }
                 return Ok(true.into());
             }
-            Ok(self.open_editor(context.clone(), key.0 as u8).into())
+            let opened = self.open_editor(context.clone(), key.0 as u8);
+            if !opened {
+                self.note_pass(Some(yiime_core::PassReason::BoxUnavailable));
+            }
+            Ok(opened.into())
         })
     }
     fn OnTestKeyUp(

@@ -370,8 +370,8 @@ pub enum FocusChange {
 }
 
 /// Decides on ITfThreadMgrEventSink::OnSetFocus. `session_document`: the document the session's
-/// text field belongs to; `focused`: the newly focused document and whether its top context
-/// accepts input.
+/// text field belongs to; `focused`: the newly focused document, whether its top context accepts
+/// input, and whether it is shown in the same window as the session's field.
 ///
 /// Only a different, editable document is another field. The input box itself takes the
 /// foreground while the user types, so the host sees its focus go away and come back: to no
@@ -379,17 +379,100 @@ pub enum FocusChange {
 /// then back to the same document — with `previous` being null or that empty document. None of
 /// that is a field switch; treating it as one ended the session just before the box committed,
 /// and the commit was refused (0.2.0-rc.3).
+///
+/// A different document in the same window is not a switch either: Electron hands the field a
+/// new document when it regains focus (0.2.0 still ended every commit's session there). Separate
+/// controls (classic edit boxes, another window) have their own windows and are still detected;
+/// within one Chromium or Word window the session simply follows the caret.
 pub fn focus_change<D: PartialEq>(
     session_open: bool,
     session_document: Option<&D>,
     focused: Option<&D>,
     focused_editable: bool,
+    same_window: bool,
 ) -> FocusChange {
     match (session_open, session_document, focused) {
-        (true, Some(session), Some(focused)) if session != focused && focused_editable => {
+        (true, Some(session), Some(focused))
+            if session != focused && focused_editable && !same_window =>
+        {
             FocusChange::OtherField
         }
         _ => FocusChange::Keep,
+    }
+}
+
+/// Where a key's password decision came from (diagnostics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeSource {
+    /// The InputScope of this field was already known.
+    Cached,
+    /// Not known yet (the key arrived before any focus event or before the asynchronous query
+    /// ran): read synchronously while handling the key.
+    QueriedNow,
+    /// Could not be read at all.
+    Unknown,
+}
+
+/// Whether the text field a key comes from is a password/PIN field. Uses the cached InputScope,
+/// else queries it now. A field whose scope cannot be read is a normal text field: defaulting to
+/// "password" passed every letter of a freshly opened Word document to the application until
+/// some later event happened to run the query (0.2.0). Edit controls with ES_PASSWORD are
+/// recognised separately, without InputScope.
+pub fn password_field(
+    cached: Option<bool>,
+    query_now: impl FnOnce() -> Option<bool>,
+) -> (bool, ScopeSource) {
+    if let Some(password) = cached {
+        return (password, ScopeSource::Cached);
+    }
+    match query_now() {
+        Some(password) => (password, ScopeSource::QueriedNow),
+        None => (false, ScopeSource::Unknown),
+    }
+}
+
+/// Why a plain letter went to the application instead of the input box (logged when it changes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PassReason {
+    /// The field is read-only, keyboard-disabled or an empty context.
+    ReadOnly,
+    /// The IME is in English mode.
+    English,
+    /// A password or PIN field.
+    Password,
+    /// The input box could not be opened (service unavailable or backing off).
+    BoxUnavailable,
+}
+
+impl PassReason {
+    pub fn describe(self) -> &'static str {
+        match self {
+            PassReason::ReadOnly => "输入框只读、禁用或为空上下文",
+            PassReason::English => "英文模式",
+            PassReason::Password => "密码或 PIN 输入框",
+            PassReason::BoxUnavailable => "输入框暂时打不开",
+        }
+    }
+}
+
+/// The reason to log for a plain letter that is not taken, or None when taking it is expected
+/// to be left to the application anyway (Caps Lock, Shift, Ctrl, Alt, Win).
+pub fn pass_reason(
+    read_only: bool,
+    english: bool,
+    modifier_or_caps: bool,
+    password: bool,
+) -> Option<PassReason> {
+    if read_only {
+        Some(PassReason::ReadOnly)
+    } else if english {
+        Some(PassReason::English)
+    } else if modifier_or_caps {
+        None
+    } else if password {
+        Some(PassReason::Password)
+    } else {
+        None
     }
 }
 
@@ -513,7 +596,9 @@ mod tests {
     fn replay(events: &[(Option<u32>, bool)]) -> Vec<FocusChange> {
         events
             .iter()
-            .map(|(focused, editable)| focus_change(true, Some(&1), focused.as_ref(), *editable))
+            .map(|(focused, editable)| {
+                focus_change(true, Some(&1), focused.as_ref(), *editable, false)
+            })
             .collect()
     }
 
@@ -543,8 +628,66 @@ mod tests {
         // A read-only or disabled document is not a field to type into.
         assert_eq!(replay(&[(Some(2), false)]), [Keep]);
         // No session, or its document unknown: nothing to end.
-        assert_eq!(focus_change(false, Some(&1), Some(&2), true), Keep);
-        assert_eq!(focus_change::<u32>(true, None, Some(&2), true), Keep);
+        assert_eq!(focus_change(false, Some(&1), Some(&2), true, false), Keep);
+        assert_eq!(focus_change::<u32>(true, None, Some(&2), true, false), Keep);
+    }
+
+    #[test]
+    fn electron_new_document_in_the_same_window_keeps_the_session() {
+        use FocusChange::*;
+        // Electron: blur to the empty document, then the field comes back as document 3 in the
+        // same window when the box commits.
+        assert_eq!(focus_change(true, Some(&1), Some(&3), true, true), Keep);
+        // Another window (or a separate edit control) is a real switch.
+        assert_eq!(
+            focus_change(true, Some(&1), Some(&3), true, false),
+            OtherField
+        );
+    }
+
+    #[test]
+    fn first_key_before_any_focus_event_is_not_treated_as_a_password() {
+        // Fresh Word: no InputScope cached yet; the query made with the key decides.
+        assert_eq!(
+            password_field(None, || Some(false)),
+            (false, ScopeSource::QueriedNow)
+        );
+        assert_eq!(
+            password_field(None, || Some(true)),
+            (true, ScopeSource::QueriedNow)
+        );
+        // Unreadable scope: a normal field, not a silent pass-through.
+        assert_eq!(password_field(None, || None), (false, ScopeSource::Unknown));
+        // Known fields are not queried again.
+        let mut asked = false;
+        assert_eq!(
+            password_field(Some(true), || {
+                asked = true;
+                None
+            }),
+            (true, ScopeSource::Cached)
+        );
+        assert!(!asked);
+    }
+
+    #[test]
+    fn letters_passed_to_the_application_carry_a_reason() {
+        assert_eq!(
+            pass_reason(true, false, false, false),
+            Some(PassReason::ReadOnly)
+        );
+        assert_eq!(
+            pass_reason(false, true, false, false),
+            Some(PassReason::English)
+        );
+        assert_eq!(
+            pass_reason(false, false, false, true),
+            Some(PassReason::Password)
+        );
+        // Capitals and shortcuts are expected to reach the application: not logged.
+        assert_eq!(pass_reason(false, false, true, true), None);
+        assert_eq!(pass_reason(false, false, false, false), None);
+        assert!(!PassReason::BoxUnavailable.describe().is_empty());
     }
 
     #[test]
