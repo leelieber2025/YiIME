@@ -93,6 +93,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 }
                 return Ok(true.into());
             }
+            self.probe_new_field(context);
             let opened = self.open_editor(context.clone(), key.0 as u8);
             if !opened {
                 self.note_pass(Some(yiime_core::PassReason::BoxUnavailable));
@@ -143,10 +144,12 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     || self.buffering()
                     || !self.keyboard_open()
                     || TextService::disabled(context)
-                    || self.password_scope(context)
+                    || self.es_password()
+                    || self.private_field(context)
                 {
                     return Ok(false.into());
                 }
+                self.probe_new_field(context);
                 return Ok(self.open_editor(context.clone(), RECALL).into());
             }
             let toggled = (guid == TOGGLE_KEY && self.toggle_keyboard_mode())

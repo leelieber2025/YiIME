@@ -26,19 +26,18 @@ use windows::Win32::UI::TextServices::{
     GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, GUID_LBI_INPUTMODE, GUID_PROP_INPUTSCOPE,
     GUID_TFCAT_TIP_KEYBOARD, GUID_TFCAT_TIPCAP_COMLESS, GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
     GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT, GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
-    INSERT_TEXT_AT_SELECTION_FLAGS, IS_ALPHANUMERIC_PIN, IS_ALPHANUMERIC_PIN_SET, IS_NUMERIC_PIN,
-    IS_PASSWORD, ITfCategoryMgr, ITfCompartmentEventSink, ITfCompartmentEventSink_Impl,
-    ITfCompartmentMgr, ITfContext, ITfDocumentMgr, ITfEditRecord, ITfEditSession,
-    ITfEditSession_Impl, ITfInputProcessorProfiles, ITfInputScope, ITfInsertAtSelection,
-    ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr, ITfLangBarItem_Impl,
-    ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItemMgr, ITfLangBarItemSink,
-    ITfMenu, ITfSource, ITfSource_Impl, ITfTextEditSink, ITfTextEditSink_Impl,
+    INSERT_TEXT_AT_SELECTION_FLAGS, ITfCategoryMgr, ITfCompartmentEventSink,
+    ITfCompartmentEventSink_Impl, ITfCompartmentMgr, ITfContext, ITfDocumentMgr, ITfEditRecord,
+    ITfEditSession, ITfEditSession_Impl, ITfInputProcessorProfiles, ITfInputScope,
+    ITfInsertAtSelection, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
+    ITfLangBarItem_Impl, ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItemMgr,
+    ITfLangBarItemSink, ITfMenu, ITfSource, ITfSource_Impl, ITfTextEditSink, ITfTextEditSink_Impl,
     ITfTextInputProcessor, ITfTextInputProcessor_Impl, ITfThreadMgr, ITfThreadMgrEventSink,
-    ITfThreadMgrEventSink_Impl, TF_AE_END, TF_ANCHOR_END, TF_CONVERSIONMODE_NATIVE,
-    TF_DEFAULT_SELECTION, TF_E_NOOBJECT, TF_ES_ASYNC, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC,
-    TF_LANGBARITEMINFO, TF_LBI_CLK_RIGHT, TF_LBI_ICON, TF_LBI_STYLE_BTN_BUTTON, TF_LBI_TEXT,
-    TF_LBI_TOOLTIP, TF_MOD_ALT, TF_MOD_CONTROL, TF_MOD_SHIFT, TF_PRESERVEDKEY, TF_SD_READONLY,
-    TF_SELECTION, TF_SELECTIONSTYLE, TfLBIClick,
+    ITfThreadMgrEventSink_Impl, TF_AE_END, TF_ANCHOR_END, TF_ANCHOR_START,
+    TF_CONVERSIONMODE_NATIVE, TF_DEFAULT_SELECTION, TF_E_NOOBJECT, TF_ES_ASYNCDONTCARE, TF_ES_READ,
+    TF_ES_READWRITE, TF_LANGBARITEMINFO, TF_LBI_CLK_RIGHT, TF_LBI_ICON, TF_LBI_STYLE_BTN_BUTTON,
+    TF_LBI_TEXT, TF_LBI_TOOLTIP, TF_MOD_ALT, TF_MOD_CONTROL, TF_MOD_SHIFT, TF_PRESERVEDKEY,
+    TF_SD_READONLY, TF_SELECTION, TF_SELECTIONSTYLE, TfLBIClick,
 };
 use windows::core::{
     BOOL, BSTR, GUID, HRESULT, IUnknown, IUnknownImpl, Interface, Ref, Result, implement,
@@ -61,7 +60,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow,
     ES_PASSWORD, GWL_STYLE, GWLP_USERDATA, GetClassNameW, GetForegroundWindow, GetSystemMetrics,
     GetWindowLongPtrW, GetWindowLongW, GetWindowThreadProcessId, HWND_MESSAGE, IMAGE_ICON,
-    IsWindow, KillTimer, LoadImageW, PostMessageW, RegisterClassW, SM_CXSMICON, SMTO_ABORTIFHUNG,
+    IsWindow, KillTimer, LoadImageW, PostMessageW, RegisterClassW, SM_CXSMICON, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SMTO_ABORTIFHUNG,
     SendMessageTimeoutW, SetTimer, SetWindowLongPtrW, WM_APP, WM_COPYDATA, WM_CREATE, WM_TIMER,
     WNDCLASSW,
 };
@@ -128,7 +128,11 @@ const READY_TIMER: usize = 2;
 const READY_TIMEOUT_MS: u64 = 5000;
 /// While waiting for the editor, check this often whether it exited or hung.
 const READY_POLL_MS: u32 = 250;
+/// The InputScope privacy of a context (see yiime_core::private_scope), None until read.
 type ScopeCache = Option<(ITfContext, Rc<Cell<Option<bool>>>)>;
+/// Receiver messages: an asynchronous InputScope read finished (12), a caret rectangle arrived (13).
+const WM_SCOPE_READ: u32 = WM_APP + 12;
+const WM_CARET_READ: u32 = WM_APP + 13;
 static MODULE: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
 
 fn wide(s: &str) -> Vec<u16> {
@@ -322,6 +326,7 @@ impl ITfEditSession_Impl for CommitEdit_Impl {
 struct ScopeCheck {
     context: ITfContext,
     result: Rc<Cell<Option<bool>>>,
+    receiver: usize,
 }
 impl ITfEditSession_Impl for ScopeCheck_Impl {
     fn DoEditSession(&self, cookie: u32) -> Result<()> {
@@ -337,16 +342,11 @@ impl ITfEditSession_Impl for ScopeCheck_Impl {
                 )
             };
             if selected.is_err() || fetched == 0 {
-                // If the selection cannot be read, treat it as a normal text field; otherwise the IME
-                // would never activate here.
                 drop(ManuallyDrop::into_inner(selection.range));
-                unsafe {
-                    OutputDebugStringW(wide("YiIME: 读取选区失败，按非密码输入框处理").as_ptr());
-                }
                 self.result.set(Some(false));
                 return Ok(());
             }
-            let mut password = false;
+            let mut private = false;
             let range = ManuallyDrop::into_inner(selection.range);
             if let Some(range) = range
                 && let Ok(property) = unsafe { self.context.GetAppProperty(&GUID_PROP_INPUTSCOPE) }
@@ -363,15 +363,8 @@ impl ITfEditSession_Impl for ScopeCheck_Impl {
                         let read = unsafe { scope.GetInputScopes(&mut ptr, &mut count) }.is_ok();
                         if read && !ptr.is_null() {
                             let scopes = unsafe { std::slice::from_raw_parts(ptr, count as usize) };
-                            password = scopes.iter().any(|scope| {
-                                [
-                                    IS_PASSWORD,
-                                    IS_NUMERIC_PIN,
-                                    IS_ALPHANUMERIC_PIN,
-                                    IS_ALPHANUMERIC_PIN_SET,
-                                ]
-                                .contains(scope)
-                            });
+                            let values: Vec<i32> = scopes.iter().map(|scope| scope.0).collect();
+                            private = yiime_core::private_scope(&values);
                         }
                         if !ptr.is_null() {
                             unsafe {
@@ -382,7 +375,10 @@ impl ITfEditSession_Impl for ScopeCheck_Impl {
                 }
                 let _ = unsafe { VariantClear(&mut value) };
             }
-            self.result.set(Some(password));
+            self.result.set(Some(private));
+            unsafe {
+                PostMessageW(self.receiver as HWND, WM_SCOPE_READ, 0, 0);
+            }
             Ok(())
         })
     }
@@ -394,6 +390,7 @@ impl ITfEditSession_Impl for ScopeCheck_Impl {
 struct CaretQuery {
     context: ITfContext,
     result: Rc<Cell<Option<RECT>>>,
+    receiver: usize,
 }
 impl ITfEditSession_Impl for CaretQuery_Impl {
     fn DoEditSession(&self, cookie: u32) -> Result<()> {
@@ -416,12 +413,26 @@ impl ITfEditSession_Impl for CaretQuery_Impl {
             let view = unsafe { self.context.GetActiveView()? };
             let mut rect = RECT::default();
             let mut clipped = BOOL::default();
+            // The start of the selection: where the typed text goes.
             unsafe {
-                range.Collapse(cookie, TF_ANCHOR_END)?;
+                range.Collapse(cookie, TF_ANCHOR_START)?;
                 view.GetTextExt(cookie, &range, &mut rect, &mut clipped)?;
             }
-            if rect.bottom > rect.top && rect.right >= rect.left {
+            let screen = unsafe {
+                let left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+                let top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                [
+                    left,
+                    top,
+                    left + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                    top + GetSystemMetrics(SM_CYVIRTUALSCREEN),
+                ]
+            };
+            if yiime_core::caret_usable([rect.left, rect.top, rect.right, rect.bottom], screen) {
                 self.result.set(Some(rect));
+                unsafe {
+                    PostMessageW(self.receiver as HWND, WM_CARET_READ, 0, 0);
+                }
             }
             Ok(())
         })
@@ -777,6 +788,10 @@ struct TextService {
     pass_logged: Cell<Option<yiime_core::PassReason>>,
     /// Digest and time of the last text inserted for the box (see yiime_core::duplicate_commit).
     last_commit: Cell<Option<(u32, std::time::Instant)>>,
+    /// Last good caret rectangle (shared with the asynchronous CaretQuery).
+    caret: Rc<Cell<Option<RECT>>>,
+    /// A rectangle arrived while the box was starting; sent once it is ready.
+    caret_fresh: Cell<bool>,
     held_id: Cell<u64>,
     next_held: Cell<u64>,
     client_id: Cell<u32>,
@@ -827,6 +842,8 @@ impl TextService {
             session_window: Cell::new(null_mut()),
             pass_logged: Cell::new(None),
             last_commit: Cell::new(None),
+            caret: Rc::new(Cell::new(None)),
+            caret_fresh: Cell::new(false),
             held_id: Cell::new(0),
             next_held: Cell::new(0),
             client_id: Cell::new(0),
@@ -980,93 +997,126 @@ impl TextService {
             }
         }
     }
-    /// Reads the insertion point's screen rectangle synchronously; only where the document lock is
-    /// available, e.g. key handling.
+    /// The insertion point's screen rectangle for the box. Read without TF_ES_SYNC (Word may
+    /// refuse synchronous sessions on the key path, SampleIME KeyHandler.cpp): TSF runs the read
+    /// now when it can, else later, and the box is moved when it arrives (WM_CARET_READ). Until
+    /// then the last good rectangle is used.
     fn caret_rect(&self, context: &ITfContext) -> Option<RECT> {
-        let result = Rc::new(Cell::new(None));
+        self.caret_fresh.set(false);
         let session: ITfEditSession = CaretQuery {
             context: context.clone(),
-            result: result.clone(),
+            result: self.caret.clone(),
+            receiver: self.receiver.get() as usize,
         }
         .into();
+        let _ = unsafe {
+            context.RequestEditSession(
+                self.client_id.get(),
+                &session,
+                TF_ES_ASYNCDONTCARE | TF_ES_READ,
+            )
+        };
+        self.caret.get()
+    }
+    /// A caret rectangle read asynchronously arrived: move the open box there.
+    fn caret_arrived(&self) {
+        let Some(rect) = self.caret.get() else {
+            return;
+        };
+        if !self.buffering() {
+            return;
+        }
+        let window = self.editor_window.get();
+        if window.is_null() {
+            // Still starting: sent once it is ready.
+            self.caret_fresh.set(true);
+            return;
+        }
+        self.caret_fresh.set(false);
+        let mut values = [rect.left, rect.top, rect.right, rect.bottom];
+        let packet = COPYDATASTRUCT {
+            dwData: 3,
+            cbData: 16,
+            lpData: values.as_mut_ptr() as _,
+        };
+        let mut result = 0usize;
         unsafe {
-            context.RequestEditSession(self.client_id.get(), &session, TF_ES_SYNC | TF_ES_READ)
+            SendMessageTimeoutW(
+                window,
+                WM_COPYDATA,
+                self.receiver.get() as usize,
+                &packet as *const _ as isize,
+                SMTO_ABORTIFHUNG,
+                yiime_core::REQUEST_TIMEOUT_MS,
+                &mut result,
+            );
         }
-        .and_then(|status| status.ok())
-        .ok()
-        .and_then(|_| result.get())
     }
-    fn compartment_on(manager: &ITfCompartmentMgr, id: &GUID) -> bool {
-        let Ok(compartment) = (unsafe { manager.GetCompartment(id) }) else {
-            return false;
-        };
-        let Ok(value) = (unsafe { compartment.GetValue() }) else {
-            return false;
-        };
+    /// Unreadable compartments do not disable (yiime_core::FieldSwitches).
+    fn compartment_on(manager: &ITfCompartmentMgr, id: &GUID) -> Option<bool> {
+        let compartment = unsafe { manager.GetCompartment(id) }.ok()?;
+        let value = unsafe { compartment.GetValue() }.ok()?;
         let inner = unsafe { &*value.Anonymous.Anonymous };
-        inner.vt.0 == 3 && unsafe { inner.Anonymous.lVal != 0 }
+        Some(inner.vt.0 == 3 && unsafe { inner.Anonymous.lVal != 0 })
     }
+    /// The field refuses IME input: TF_SD_READONLY, KEYBOARD_DISABLED or EMPTYCONTEXT.
     fn disabled(context: &ITfContext) -> bool {
-        unsafe { context.GetStatus() }
-            .is_ok_and(|status| status.dwDynamicFlags & TF_SD_READONLY != 0)
-            || context.cast::<ITfCompartmentMgr>().is_ok_and(|manager| {
-                Self::compartment_on(&manager, &GUID_COMPARTMENT_KEYBOARD_DISABLED)
-                    || Self::compartment_on(&manager, &GUID_COMPARTMENT_EMPTYCONTEXT)
-            })
-    }
-    fn password_scope(&self, context: &ITfContext) -> bool {
-        let focus = unsafe { GetFocus() };
-        if !focus.is_null() {
-            let mut class = [0u16; 16];
-            let len =
-                unsafe { GetClassNameW(focus, class.as_mut_ptr(), class.len() as i32) } as usize;
-            if String::from_utf16_lossy(&class[..len]).eq_ignore_ascii_case("Edit")
-                && unsafe { GetWindowLongW(focus, GWL_STYLE) } & ES_PASSWORD != 0
-            {
-                return true;
-            }
+        let manager = context.cast::<ITfCompartmentMgr>().ok();
+        yiime_core::FieldSwitches {
+            read_only: unsafe { context.GetStatus() }
+                .is_ok_and(|status| status.dwDynamicFlags & TF_SD_READONLY != 0),
+            keyboard_disabled: manager.as_ref().and_then(|manager| {
+                Self::compartment_on(manager, &GUID_COMPARTMENT_KEYBOARD_DISABLED)
+            }),
+            empty_context: manager
+                .as_ref()
+                .and_then(|manager| Self::compartment_on(manager, &GUID_COMPARTMENT_EMPTYCONTEXT)),
+            es_password: false,
         }
-        let slot = self
-            .scope_cache
+        .blocked()
+    }
+    /// A Win32 edit control with ES_PASSWORD has the keyboard (the bit means something else in
+    /// other window classes).
+    fn es_password(&self) -> bool {
+        let focus = unsafe { GetFocus() };
+        if focus.is_null() {
+            return false;
+        }
+        let mut class = [0u16; 32];
+        let len = unsafe { GetClassNameW(focus, class.as_mut_ptr(), class.len() as i32) } as usize;
+        let class = String::from_utf16_lossy(&class[..len]).to_ascii_lowercase();
+        (class == "edit" || class.starts_with("richedit"))
+            && unsafe { GetWindowLongW(focus, GWL_STYLE) } & ES_PASSWORD != 0
+    }
+    /// The field declared a private InputScope (as far as read so far). Only privacy follows
+    /// from it, never whether letters are taken.
+    fn private_field(&self, context: &ITfContext) -> bool {
+        self.scope_cache
             .borrow()
             .as_ref()
             .filter(|(cached, _)| cached == context)
-            .map(|(_, result)| result.clone());
-        let cached = slot.as_ref().and_then(|result| result.get());
-        // Not known yet (key before any focus event, the asynchronous query not run, or a context
-        // that was never queried; a freshly opened Word stayed so until the next focus change):
-        // read it now, synchronously, which key handling allows.
-        let (password, source) = yiime_core::password_field(cached, || {
-            let result = slot.clone().unwrap_or_else(|| Rc::new(Cell::new(None)));
-            let session: ITfEditSession = ScopeCheck {
-                context: context.clone(),
-                result: result.clone(),
-            }
-            .into();
-            let _ = unsafe {
-                context.RequestEditSession(self.client_id.get(), &session, TF_ES_SYNC | TF_ES_READ)
-            };
-            let known = result.get();
-            *self.scope_cache.borrow_mut() = Some((context.clone(), result));
-            known
-        });
-        match source {
-            yiime_core::ScopeSource::Cached => {}
-            yiime_core::ScopeSource::QueriedNow => log(if password {
-                "InputScope 按键时查询：密码或 PIN 输入框"
-            } else {
-                "InputScope 按键时查询：普通输入框"
-            }),
-            yiime_core::ScopeSource::Unknown => {
-                // Remember the decision so this is logged once; a later asynchronous query of
-                // the same field still overwrites it.
-                if let Some((_, result)) = self.scope_cache.borrow().as_ref() {
-                    result.set(Some(false));
-                }
-                log("InputScope 无法读取，按普通输入框处理");
-            }
+            .is_some_and(|(_, result)| result.get() == Some(true))
+    }
+    /// Tells the box whether the session's field is private (WM_APP + 11, wParam = receiver,
+    /// lParam 1 = private): no learning, history or translation service there.
+    fn notify_privacy(&self) {
+        let window = self.editor_window.get();
+        if !self.buffering() || window.is_null() {
+            return;
         }
-        password
+        let private = self
+            .context
+            .borrow()
+            .as_ref()
+            .is_some_and(|context| self.private_field(context));
+        unsafe {
+            PostMessageW(
+                window,
+                WM_APP + 11,
+                self.receiver.get() as usize,
+                private as isize,
+            );
+        }
     }
     /// Logs why a plain letter went to the application, once per change of reason.
     fn note_pass(&self, reason: Option<yiime_core::PassReason>) {
@@ -1131,7 +1181,7 @@ impl TextService {
             || !self.keyboard_open()
             || option(Flag::PunctEnglish)
             || Self::disabled(context)
-            || self.password_scope(context)
+            || self.es_password()
         {
             return None;
         }
@@ -1156,8 +1206,7 @@ impl TextService {
             .is_ok()
     }
     fn should_consume(&self, context: &ITfContext, key: usize) -> bool {
-        let consume =
-            self.wants_key(context, key) && (self.buffering() || !self.password_scope(context));
+        let consume = self.wants_key(context, key) && (self.buffering() || !self.es_password());
         if consume {
             self.note_pass(None);
         } else if (0x41..=0x5a).contains(&key) && !running_in_editor() {
@@ -1168,7 +1217,7 @@ impl TextService {
                 || [VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN, VK_SHIFT]
                     .into_iter()
                     .any(modifier);
-            let password = !read_only && !english && self.password_scope(context);
+            let password = !read_only && !english && self.es_password();
             self.note_pass(yiime_core::pass_reason(
                 read_only,
                 english,
@@ -1664,6 +1713,13 @@ impl TextService {
                 KillTimer(self.receiver.get(), READY_TIMER);
             }
         }
+        // After the box activated the session (it resets privacy then).
+        unsafe {
+            PostMessageW(self.receiver.get(), WM_SCOPE_READ, 0, 0);
+            if self.caret_fresh.get() {
+                PostMessageW(self.receiver.get(), WM_CARET_READ, 0, 0);
+            }
+        }
         true
     }
     fn flush_keys(&self) -> bool {
@@ -1740,6 +1796,18 @@ impl TextService {
 }
 
 impl TextService_Impl {
+    /// Starts reading the InputScope of a field a session opens in, unless already read.
+    fn probe_new_field(&self, context: &ITfContext) {
+        if !self
+            .scope_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|(cached, _)| cached == context)
+        {
+            self.probe_scope(context.clone());
+        }
+    }
+    /// Reads the field's InputScope for privacy, asynchronously when TSF cannot do it now.
     fn probe_scope(&self, context: ITfContext) {
         let result = self
             .scope_cache
@@ -1751,27 +1819,17 @@ impl TextService_Impl {
         *self.scope_cache.borrow_mut() = Some((context.clone(), result.clone()));
         let session: ITfEditSession = ScopeCheck {
             context: context.clone(),
-            result: result.clone(),
+            result,
+            receiver: self.receiver.get() as usize,
         }
         .into();
-        let requested = unsafe {
-            context.RequestEditSession(self.client_id.get(), &session, TF_ES_ASYNC | TF_ES_READ)
-        }
-        .and_then(|status| status.ok())
-        .is_ok();
-        if !requested && result.get().is_none() {
-            let mut path = [0u16; 1024];
-            let len = unsafe { GetModuleFileNameW(None, &mut path) } as usize;
-            let host = String::from_utf16_lossy(&path[..len.min(path.len())]);
-            unsafe {
-                OutputDebugStringW(
-                    wide(&format!(
-                        "YiIME: InputScope 查询失败；此输入框中输入法暂不可用。宿主：{host}"
-                    ))
-                    .as_ptr(),
-                );
-            }
-        }
+        let _ = unsafe {
+            context.RequestEditSession(
+                self.client_id.get(),
+                &session,
+                TF_ES_ASYNCDONTCARE | TF_ES_READ,
+            )
+        };
         let mut attached = self.edit_sink.borrow_mut();
         if attached.as_ref().is_some_and(|(old, _)| old == &context) {
             return;
@@ -1978,32 +2036,12 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
             Ok(())
         })
     }
-    fn OnPushContext(&self, context: Ref<ITfContext>) -> Result<()> {
-        com_guard("OnPushContext", || {
-            if let Some(context) = context.as_ref() {
-                self.probe_scope(context.clone());
-            }
-            Ok(())
-        })
+    fn OnPushContext(&self, _context: Ref<ITfContext>) -> Result<()> {
+        com_guard("OnPushContext", || Ok(()))
     }
-    fn OnPopContext(&self, context: Ref<ITfContext>) -> Result<()> {
+    fn OnPopContext(&self, _context: Ref<ITfContext>) -> Result<()> {
         com_guard("OnPopContext", || {
-            self.scope_cache.borrow_mut().take();
             self.tested_key.borrow_mut().take();
-            // Query the context now on top (the original text field), as OnSetFocus does:
-            // without a known InputScope its letters would be passed through as if it were a
-            // password field until some later edit happened to probe it.
-            let popped = context.as_ref();
-            let document = popped.and_then(|popped| unsafe { popped.GetDocumentMgr() }.ok());
-            let top = document
-                .as_ref()
-                .and_then(|document| unsafe { document.GetTop() }.ok());
-            let base = document
-                .as_ref()
-                .and_then(|document| unsafe { document.GetBase() }.ok());
-            if let Some(top) = yiime_core::context_after_pop(popped, top, base) {
-                self.probe_scope(top);
-            }
             Ok(())
         })
     }
@@ -2016,7 +2054,14 @@ impl ITfTextEditSink_Impl for TextService_Impl {
         _record: Ref<ITfEditRecord>,
     ) -> Result<()> {
         com_guard("OnEndEdit", || {
-            if let Some(context) = context.as_ref() {
+            // Only a field whose InputScope is not read yet.
+            if let Some(context) = context.as_ref()
+                && !self
+                    .scope_cache
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|(cached, result)| cached == context && result.get().is_some())
+            {
                 self.probe_scope(context.clone());
             }
             Ok(())

@@ -153,6 +153,10 @@ const WM_TSF_ENGLISH: u32 = WM_APP + 9;
 /// From the TSF DLL (wParam = receiver, lParam = yiime_core::commit_digest): a commit landed. Sent
 /// besides the COPYDATA reply, which can be lost to a timeout while the focus moves.
 const WM_TSF_COMMITTED: u32 = WM_APP + 10;
+/// From the TSF DLL (wParam = receiver, lParam 1 = private): the session's field declared a
+/// private InputScope (password, PIN, or a browser's private window). Nothing typed there is
+/// learned, kept in the history or sent to a translation service.
+const WM_TSF_PRIVATE: u32 = WM_APP + 11;
 /// Tray (portable) and TSF editor instances use different titles so each can find its single
 /// instance.
 const TRAY_TITLE: &str = yiime_core::TRAY_WINDOW_TITLE;
@@ -320,6 +324,8 @@ struct State {
     finished: Cell<bool>,
     /// A TSF commit that got no reply, kept as a draft until the DLL confirms it landed.
     unconfirmed: Cell<Option<yiime_core::UnconfirmedCommit>>,
+    /// The current session's field is private (WM_TSF_PRIVATE); reset at each session start.
+    private_field: Cell<bool>,
     /// The plain-mode shortcut was pressed in the box: swallow the WM_CHAR it produces.
     swallow_char: Cell<bool>,
     /// Mode last shown in the tray tooltip.
@@ -610,7 +616,7 @@ fn user_words_path() -> Option<PathBuf> {
 }
 /// Records a pick (unless learning is off).
 fn remember_pick(state: &State, code: &str, word: &str) {
-    if option(Flag::Learn) {
+    if option(Flag::Learn) && !state.private_field.get() {
         state.learned.borrow_mut().record(code, word);
     }
 }
@@ -1055,6 +1061,7 @@ unsafe fn activate(hwnd: HWND, state: &State, target: HWND, anchor: Option<RECT>
     state.finished.set(false);
     state.pending.set(false);
     state.recall_session.set(false);
+    state.private_field.set(false);
     state.history_pos.set(None);
     state.english.set(false);
     state.generation.set(state.generation.get() + 1);
@@ -1274,7 +1281,8 @@ unsafe fn submit(hwnd: HWND, state: &State, chinese: bool) {
         }
         return;
     }
-    if chinese || (plain_mode() && !state.recall_session.get()) {
+    // A private field never goes to a translation service: its Chinese is committed as is.
+    if chinese || state.private_field.get() || (plain_mode() && !state.recall_session.get()) {
         unsafe {
             commit_to_target(hwnd, state, &draft);
         }
@@ -1434,7 +1442,9 @@ unsafe fn on_translated(hwnd: HWND, state: &State, response: TranslationResult) 
     match response.result {
         Ok(english) => unsafe {
             *state.status.borrow_mut() = None;
-            remember_translation(&response.source, &english);
+            if !state.private_field.get() {
+                remember_translation(&response.source, &english);
+            }
             commit_to_target(hwnd, state, &english);
         },
         Err(error) => unsafe {
@@ -1616,6 +1626,18 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 }
                 // Screen rectangle of the target's text cursor (4 i32s), followed by
                 // WM_TSF_ACTIVATE.
+                // During a session: the caret read asynchronously by the DLL; move the box there.
+                3 if IsWindowVisible(hwnd) != 0 && !state.finished.get() => {
+                    if let Some(rect) = (packet.cbData as usize == size_of::<RECT>()
+                        && !packet.lpData.is_null())
+                    .then(|| std::ptr::read_unaligned(packet.lpData as *const RECT))
+                    .filter(valid_rect)
+                    {
+                        state.anchor.set(rect);
+                        relayout(hwnd, state);
+                    }
+                    1
+                }
                 3 => {
                     let rect = (packet.cbData as usize == size_of::<RECT>()
                         && !packet.lpData.is_null())
@@ -1688,6 +1710,21 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 // away). While a translation is in flight the box stays so the result lands.
                 service_log("session end: host switched to English");
                 unsafe { deactivate(hwnd, state) };
+            }
+            0
+        }
+        WM_TSF_PRIVATE => {
+            if let Some(state) = state
+                && state.tsf_service
+                && w != 0
+                && w as HWND == state.tsf_receiver.get()
+                && state.private_field.replace(l != 0) != (l != 0)
+            {
+                service_log(if l != 0 {
+                    "session: private field (no learning, history or translation)"
+                } else {
+                    "session: normal field"
+                });
             }
             0
         }
@@ -1943,6 +1980,7 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
             shown_at: Cell::new(None),
             finished: Cell::new(false),
             unconfirmed: Cell::new(None),
+            private_field: Cell::new(false),
             swallow_char: Cell::new(false),
             last_plain: Cell::new(plain_mode()),
             learned: RefCell::new(Learned::load(learned_path(), Box::new(Dpapi))),

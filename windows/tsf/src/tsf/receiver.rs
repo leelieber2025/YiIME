@@ -118,6 +118,17 @@ unsafe fn receiver_proc_impl(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> 
         };
         return unsafe { (*pointer).commit(text) as LRESULT };
     }
+    if message == WM_SCOPE_READ || message == WM_CARET_READ {
+        let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TextService_Impl };
+        if !pointer.is_null() {
+            if message == WM_SCOPE_READ {
+                unsafe { (*pointer).notify_privacy() };
+            } else {
+                unsafe { (*pointer).caret_arrived() };
+            }
+        }
+        return 0;
+    }
     if message == WM_APP + 9 {
         let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TextService_Impl };
         if !pointer.is_null() {

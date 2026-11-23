@@ -401,34 +401,52 @@ pub fn focus_change<D: PartialEq>(
     }
 }
 
-/// Where a key's password decision came from (diagnostics).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScopeSource {
-    /// The InputScope of this field was already known.
-    Cached,
-    /// Not known yet (the key arrived before any focus event or before the asynchronous query
-    /// ran): read synchronously while handling the key.
-    QueriedNow,
-    /// Could not be read at all.
-    Unknown,
+/// What decides whether a text field takes the IME's letters. Only the field's own switches
+/// count, as TSF and Microsoft's SampleIME prescribe: GUID_COMPARTMENT_KEYBOARD_DISABLED,
+/// GUID_COMPARTMENT_EMPTYCONTEXT, TF_SD_READONLY, and ES_PASSWORD on a Win32 edit control. A
+/// compartment that cannot be read (None) does not disable. InputScope never decides this: it is
+/// read asynchronously and late in some hosts (a freshly opened Word passed every letter to the
+/// document in 0.2.0), so it only drives [`private_scope`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FieldSwitches {
+    pub keyboard_disabled: Option<bool>,
+    pub empty_context: Option<bool>,
+    pub read_only: bool,
+    pub es_password: bool,
 }
 
-/// Whether the text field a key comes from is a password/PIN field. Uses the cached InputScope,
-/// else queries it now. A field whose scope cannot be read is a normal text field: defaulting to
-/// "password" passed every letter of a freshly opened Word document to the application until
-/// some later event happened to run the query (0.2.0). Edit controls with ES_PASSWORD are
-/// recognised separately, without InputScope.
-pub fn password_field(
-    cached: Option<bool>,
-    query_now: impl FnOnce() -> Option<bool>,
-) -> (bool, ScopeSource) {
-    if let Some(password) = cached {
-        return (password, ScopeSource::Cached);
+impl FieldSwitches {
+    /// The field refuses IME input (read-only, disabled or empty context).
+    pub fn blocked(self) -> bool {
+        self.read_only
+            || self.keyboard_disabled.unwrap_or(false)
+            || self.empty_context.unwrap_or(false)
     }
-    match query_now() {
-        Some(password) => (password, ScopeSource::QueriedNow),
-        None => (false, ScopeSource::Unknown),
-    }
+}
+
+/// InputScope values that mark a private field: password and PIN scopes, and IS_PRIVATE, which
+/// Chromium reports for password fields and for every field of a private window. Values from
+/// InputScope.h.
+pub const PRIVATE_SCOPES: [i32; 6] = [31, 61, 63, 64, 65, 66];
+
+/// Whether a field's InputScope list marks it private. Such a field is still typed in through
+/// the box, but nothing is learned, kept in the history or sent to a translation service.
+pub fn private_scope(scopes: &[i32]) -> bool {
+    scopes.iter().any(|scope| PRIVATE_SCOPES.contains(scope))
+}
+
+/// A caret rectangle (left, top, right, bottom) worth placing the box at: not empty (some hosts
+/// answer zeros before layout) and overlapping the virtual screen `screen`.
+pub fn caret_usable(rect: [i32; 4], screen: [i32; 4]) -> bool {
+    let [left, top, right, bottom] = rect;
+    let [screen_left, screen_top, screen_right, screen_bottom] = screen;
+    bottom > top
+        && right >= left
+        && !(left == 0 && top == 0 && right == 0 && bottom == 0)
+        && right >= screen_left
+        && left < screen_right
+        && bottom > screen_top
+        && top < screen_bottom
 }
 
 /// Why a plain letter went to the application instead of the input box (logged when it changes).
@@ -438,7 +456,7 @@ pub enum PassReason {
     ReadOnly,
     /// The IME is in English mode.
     English,
-    /// A password or PIN field.
+    /// A Win32 edit control with ES_PASSWORD.
     Password,
     /// The input box could not be opened (service unavailable or backing off).
     BoxUnavailable,
@@ -449,7 +467,7 @@ impl PassReason {
         match self {
             PassReason::ReadOnly => "输入框只读、禁用或为空上下文",
             PassReason::English => "英文模式",
-            PassReason::Password => "密码或 PIN 输入框",
+            PassReason::Password => "密码输入框（ES_PASSWORD）",
             PassReason::BoxUnavailable => "输入框暂时打不开",
         }
     }
@@ -610,21 +628,6 @@ pub fn keys_to_give_back(first: Option<char>, pending: &str, box_ready: bool) ->
     keys
 }
 
-/// The input context whose InputScope must be queried after a nested context (e.g. a
-/// reconversion or a host's inline editor) was popped: the one now on top of the document, or,
-/// if the popped one is still reported on top (the pop not applied yet), the base context.
-/// Generic so it is testable without TSF.
-pub fn context_after_pop<C: PartialEq>(
-    popped: Option<&C>,
-    top: Option<C>,
-    base: Option<C>,
-) -> Option<C> {
-    [top, base]
-        .into_iter()
-        .flatten()
-        .find(|context| popped != Some(context))
-}
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -729,28 +732,62 @@ mod tests {
     }
 
     #[test]
-    fn first_key_before_any_focus_event_is_not_treated_as_a_password() {
-        // Fresh Word: no InputScope cached yet; the query made with the key decides.
-        assert_eq!(
-            password_field(None, || Some(false)),
-            (false, ScopeSource::QueriedNow)
+    fn only_the_fields_own_switches_block_letters() {
+        // Fresh Word: nothing known about the field yet, compartments unreadable: letters go to
+        // the box.
+        assert!(!FieldSwitches::default().blocked());
+        assert!(
+            FieldSwitches {
+                keyboard_disabled: Some(true),
+                ..Default::default()
+            }
+            .blocked()
         );
-        assert_eq!(
-            password_field(None, || Some(true)),
-            (true, ScopeSource::QueriedNow)
+        assert!(
+            FieldSwitches {
+                empty_context: Some(true),
+                ..Default::default()
+            }
+            .blocked()
         );
-        // Unreadable scope: a normal field, not a silent pass-through.
-        assert_eq!(password_field(None, || None), (false, ScopeSource::Unknown));
-        // Known fields are not queried again.
-        let mut asked = false;
-        assert_eq!(
-            password_field(Some(true), || {
-                asked = true;
-                None
-            }),
-            (true, ScopeSource::Cached)
+        assert!(
+            FieldSwitches {
+                read_only: true,
+                ..Default::default()
+            }
+            .blocked()
         );
-        assert!(!asked);
+        assert!(
+            !FieldSwitches {
+                keyboard_disabled: Some(false),
+                empty_context: Some(false),
+                ..Default::default()
+            }
+            .blocked()
+        );
+    }
+
+    #[test]
+    fn private_scopes_only_mark_privacy() {
+        assert!(private_scope(&[31])); // IS_PASSWORD
+        assert!(private_scope(&[1, 61])); // IS_PRIVATE (Chromium)
+        assert!(private_scope(&[63])); // IS_NUMERIC_PASSWORD
+        assert!(private_scope(&[64])); // IS_NUMERIC_PIN
+        assert!(private_scope(&[65])); // IS_ALPHANUMERIC_PIN
+        assert!(private_scope(&[66])); // IS_ALPHANUMERIC_PIN_SET
+        assert!(!private_scope(&[]));
+        assert!(!private_scope(&[0, 1, 5])); // default, URL, e-mail
+    }
+
+    #[test]
+    fn empty_or_off_screen_caret_is_ignored() {
+        let screen = [-1920, 0, 1920, 1080];
+        assert!(caret_usable([100, 200, 101, 220], screen));
+        assert!(caret_usable([-500, 300, -499, 320], screen));
+        assert!(!caret_usable([0, 0, 0, 0], screen));
+        assert!(!caret_usable([100, 200, 100, 200], screen));
+        assert!(!caret_usable([5000, 200, 5001, 220], screen));
+        assert!(!caret_usable([100, -3000, 101, -2980], screen));
     }
 
     #[test]
@@ -782,19 +819,6 @@ mod tests {
         assert_eq!(commit_targets(false, true, true), [Held, Focused]);
         assert_eq!(commit_targets(false, false, true), [Focused]);
         assert!(commit_targets(false, false, false).is_empty());
-    }
-
-    #[test]
-    fn the_field_under_a_popped_context_is_queried_again() {
-        // Field 1 had context 2 pushed on it; after 2 pops, 1 is on top and is probed.
-        assert_eq!(context_after_pop(Some(&2), Some(1), Some(1)), Some(1));
-        assert_eq!(context_after_pop(None, Some(1), None), Some(1));
-        // Called before the stack changed: the popped context is still on top, the base is the
-        // field that remains.
-        assert_eq!(context_after_pop(Some(&2), Some(2), Some(1)), Some(1));
-        // Nothing else left on the document.
-        assert_eq!(context_after_pop(Some(&2), None, None), None);
-        assert_eq!(context_after_pop(Some(&2), Some(2), Some(2)), None);
     }
 
     #[test]
