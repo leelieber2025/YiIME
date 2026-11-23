@@ -10,6 +10,10 @@ fn main() {
 mod process_security;
 
 #[cfg(windows)]
+#[path = "../../windows/plain_cell.rs"]
+mod plain_cell;
+
+#[cfg(windows)]
 #[path = "windows_gui/dictionary.rs"]
 mod dictionary;
 

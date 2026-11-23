@@ -97,6 +97,65 @@ impl Flag {
     }
 }
 
+/// 译/普通五笔 mode as kept in a session-wide shared cell next to the registry. Packaged desktop
+/// apps such as Win11 Notepad get a private copy of HKCU writes, so a switch made in another
+/// process (the language bar on the taskbar runs in explorer.exe) never reaches them through the
+/// registry, and their own switches never leave. The cell carries the mode between all of them.
+pub mod plain_cell {
+    /// No process has published the mode yet.
+    pub const UNSET: u32 = 0;
+    const TRANSLATE: u32 = 1;
+    const PLAIN: u32 = 2;
+    /// Written by a host whose registry writes are private; the next ordinary process stores it
+    /// in HKCU.
+    const PENDING: u32 = 0x100;
+
+    pub fn encode(plain: bool, private_registry: bool) -> u32 {
+        (if plain { PLAIN } else { TRANSLATE }) | if private_registry { PENDING } else { 0 }
+    }
+    /// The mode in a cell, or None when unset or unreadable.
+    pub fn decode(cell: u32) -> Option<bool> {
+        match cell & !PENDING {
+            TRANSLATE => Some(false),
+            PLAIN => Some(true),
+            _ => None,
+        }
+    }
+    /// Result of reading the mode: the mode, the cell value to store (if it changes) and whether
+    /// the registry should take the cell's mode.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Read {
+        pub plain: bool,
+        pub store: Option<u32>,
+        pub adopt: bool,
+    }
+    /// Mode from the cell and this process's registry view. An ordinary process trusts HKCU and
+    /// publishes it, except for a pending switch from a private-registry host, which it adopts. A
+    /// private-registry host trusts the cell once someone has published it.
+    pub fn read(cell: u32, registry: bool, private_registry: bool) -> Read {
+        let shared = decode(cell);
+        if private_registry {
+            return Read {
+                plain: shared.unwrap_or(registry),
+                store: None,
+                adopt: false,
+            };
+        }
+        match shared {
+            Some(plain) if cell & PENDING != 0 => Read {
+                plain,
+                store: Some(encode(plain, false)),
+                adopt: true,
+            },
+            _ => Read {
+                plain: registry,
+                store: (cell != encode(registry, false)).then(|| encode(registry, false)),
+                adopt: false,
+            },
+        }
+    }
+}
+
 /// Key-value storage (DWORDs and short strings). Implementations handle the platform; reads return
 /// None on failure.
 pub trait OptionStore {
@@ -483,6 +542,31 @@ pub fn llm_url_allowed(address: &str) -> bool {
 mod tests {
     use super::*;
 
+    #[test]
+    fn plain_cell_carries_mode_across_private_registries() {
+        use super::plain_cell::{UNSET, encode, read};
+        // An ordinary process publishes HKCU; a packaged host follows the cell, not its copy.
+        let first = read(UNSET, true, false);
+        assert_eq!((first.plain, first.adopt), (true, false));
+        let cell = first.store.unwrap_or(UNSET);
+        assert!(read(cell, false, true).plain);
+        assert!(!read(UNSET, false, true).plain);
+        // Same value: nothing to store.
+        assert_eq!(read(cell, true, false).store, None);
+        // The language bar in explorer.exe switches to 译 (registry and cell).
+        let cell = encode(false, false);
+        assert!(!read(cell, true, true).plain);
+        // A packaged host switches to 普通五笔: the next ordinary reader adopts it into HKCU.
+        let cell = encode(true, true);
+        let adopted = read(cell, false, false);
+        assert_eq!(
+            (adopted.plain, adopted.adopt, adopted.store),
+            (true, true, Some(encode(true, false)))
+        );
+        // Stale or unknown cells give way to HKCU in ordinary processes.
+        assert!(!read(0x7, false, false).plain);
+        assert_eq!(read(0x7, false, false).store, Some(encode(false, false)));
+    }
     #[test]
     fn llm_url_is_parsed_not_prefix_matched() {
         for good in [

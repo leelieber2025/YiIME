@@ -497,11 +497,16 @@ fn option(flag: Flag) -> bool {
 fn set_option(flag: Flag, on: bool) -> bool {
     OPTIONS.set_flag(flag, on)
 }
+/// 译/普通五笔, shared with packaged hosts through the session cell (see windows/plain_cell.rs).
 fn plain_mode() -> bool {
-    option(Flag::PlainMode)
+    crate::plain_cell::read(option(Flag::PlainMode), |plain| {
+        set_option(Flag::PlainMode, plain);
+    })
 }
 fn set_plain_mode(on: bool) -> bool {
-    set_option(Flag::PlainMode, on)
+    let ok = set_option(Flag::PlainMode, on);
+    crate::plain_cell::wrote(on);
+    ok
 }
 /// Shortcut for toggling plain mode; Ctrl+Shift+Space when unset or invalid.
 fn plain_toggle_text() -> String {

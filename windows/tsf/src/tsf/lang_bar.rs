@@ -189,11 +189,17 @@ pub(super) fn option(flag: Flag) -> bool {
 pub(super) fn toggle_option(flag: Flag) -> bool {
     OPTIONS.toggle(flag).is_some()
 }
+/// 译/普通五笔, read through the session cell so packaged hosts (Notepad), whose HKCU is a
+/// private copy, follow a switch made in explorer.exe's language bar or anywhere else.
 pub(super) fn plain_mode() -> bool {
-    option(Flag::PlainMode)
+    crate::plain_cell::read(option(Flag::PlainMode), |plain| {
+        OPTIONS.set_flag(Flag::PlainMode, plain);
+    })
 }
 pub(super) fn set_plain_mode(on: bool) -> bool {
-    OPTIONS.set_flag(Flag::PlainMode, on)
+    let ok = OPTIONS.set_flag(Flag::PlainMode, on);
+    crate::plain_cell::wrote(on);
+    ok
 }
 pub(super) fn page_size() -> usize {
     OPTIONS.page_size()
