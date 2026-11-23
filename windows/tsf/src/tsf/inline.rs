@@ -47,6 +47,43 @@ fn request_session(
     }
 }
 
+/// Microsoft SampleIME `CSampleIME` implements `ITfCompositionSink` and passes `this` to
+/// `StartComposition` (`StartComposition.cpp` `CStartCompositionEditSession::DoEditSession`;
+/// `Composition.cpp` `OnCompositionTerminated`). Weasel and qingjian do the same.
+#[implement(ITfCompositionSink)]
+struct CompositionSink {
+    ui: CandidateUi,
+}
+impl ITfCompositionSink_Impl for CompositionSink_Impl {
+    fn OnCompositionTerminated(
+        &self,
+        _ecwrite: u32,
+        composition: Ref<'_, ITfComposition>,
+    ) -> Result<()> {
+        // weasel WeaselTSF::OnCompositionTerminated: ignore our own EndComposition.
+        let ours = self.ui.state.borrow().as_ref().is_some_and(|active| {
+            composition
+                .as_ref()
+                .is_some_and(|ended| ended == &active.composition)
+        });
+        if !ours {
+            return Ok(());
+        }
+        log("组句被应用终止，清本地状态");
+        self.ui.state.borrow_mut().take();
+        self.ui.end_ui();
+        self.ui.destroy_window();
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SessionOutcome {
+    Pending,
+    Succeeded,
+    Failed,
+}
+
 struct Composition {
     context: ITfContext,
     composition: ITfComposition,
@@ -147,14 +184,17 @@ struct ComposeEdit {
     action: Action,
     ui: CandidateUi,
     client_id: u32,
+    outcome: Rc<Cell<SessionOutcome>>,
 }
 impl ITfEditSession_Impl for ComposeEdit_Impl {
     fn DoEditSession(&self, cookie: u32) -> Result<()> {
         com_guard("ComposeEdit", || {
             if let Err(error) = self.apply(cookie) {
+                self.outcome.set(SessionOutcome::Failed);
                 log_hresult("组字更新失败", &error);
                 return Err(error);
             }
+            self.outcome.set(SessionOutcome::Succeeded);
             Ok(())
         })
     }
@@ -163,19 +203,36 @@ impl ComposeEdit_Impl {
     fn apply(&self, cookie: u32) -> Result<()> {
         let range = match &self.action {
             Action::Start(code) => {
+                // SampleIME StartComposition.cpp CStartCompositionEditSession::DoEditSession:
+                // InsertTextAtSelection(TF_IAS_QUERYONLY, empty) then StartComposition with a
+                // real ITfCompositionSink. Preedit is written on the composition range (qingjian
+                // update_preedit / SampleIME _AddComposingAndChar).
                 log("组字开始");
-                let insert: ITfInsertAtSelection = self.context.cast()?;
-                let range = unsafe {
-                    insert.InsertTextAtSelection(
-                        cookie,
-                        INSERT_TEXT_AT_SELECTION_FLAGS(0),
-                        &code.encode_utf16().collect::<Vec<_>>(),
-                    )?
-                };
-                let context: ITfContextComposition = self.context.cast()?;
-                let composition = unsafe {
-                    context.StartComposition(cookie, &range, None::<&ITfCompositionSink>)?
-                };
+                let insert: ITfInsertAtSelection = self.context.cast().inspect_err(|error| {
+                    log_hresult("ITfInsertAtSelection 接口", error);
+                })?;
+                let _range = unsafe { insert.InsertTextAtSelection(cookie, TF_IAS_QUERYONLY, &[]) }
+                    .inspect_err(|error| {
+                        log_hresult("InsertTextAtSelection(QUERYONLY)", error);
+                    })?;
+                let context: ITfContextComposition = self.context.cast().inspect_err(|error| {
+                    log_hresult("ITfContextComposition 接口", error);
+                })?;
+                let sink: ITfCompositionSink = CompositionSink {
+                    ui: self.ui.clone(),
+                }
+                .into();
+                let composition = unsafe { context.StartComposition(cookie, &_range, &sink) }
+                    .inspect_err(|error| {
+                        log_hresult("StartComposition", error);
+                    })?;
+                let range = unsafe { composition.GetRange() }.inspect_err(|error| {
+                    log_hresult("GetRange", error);
+                })?;
+                unsafe { range.SetText(cookie, 0, &code.encode_utf16().collect::<Vec<_>>()) }
+                    .inspect_err(|error| {
+                        log_hresult("SetText", error);
+                    })?;
                 *self.ui.state.borrow_mut() = Some(Composition {
                     context: self.context.clone(),
                     composition,
@@ -189,18 +246,27 @@ impl ComposeEdit_Impl {
                 } else {
                     "组字更新"
                 });
-                let mut state = self.ui.state.borrow_mut();
-                let active = state
-                    .as_mut()
-                    .filter(|active| active.context == self.context)
-                    .ok_or(E_FAIL)?;
-                let range = unsafe { active.composition.GetRange()? };
-                unsafe { range.SetText(cookie, 0, &code.encode_utf16().collect::<Vec<_>>())? };
-                if matches!(self.action, Action::Finish(_)) {
-                    unsafe { active.composition.EndComposition(cookie)? };
-                    state.take();
-                } else {
-                    active.code = code.clone();
+                // Drop the state borrow before EndComposition: OnCompositionTerminated may run
+                // synchronously (weasel notes this) and also borrows state.
+                let finishing = matches!(self.action, Action::Finish(_));
+                let (range, ended) = {
+                    let mut state = self.ui.state.borrow_mut();
+                    let active = state
+                        .as_mut()
+                        .filter(|active| active.context == self.context)
+                        .ok_or(E_FAIL)?;
+                    let range = unsafe { active.composition.GetRange()? };
+                    unsafe { range.SetText(cookie, 0, &code.encode_utf16().collect::<Vec<_>>())? };
+                    if finishing {
+                        let composition = state.take().map(|active| active.composition);
+                        (range, composition)
+                    } else {
+                        active.code = code.clone();
+                        (range, None)
+                    }
+                };
+                if let Some(composition) = ended {
+                    unsafe { composition.EndComposition(cookie)? };
                 }
                 range
             }
@@ -657,16 +723,25 @@ impl InlineInput {
             Action::Update(_) => "组字更新",
             Action::Finish(_) => "组字结束",
         };
+        let outcome = Rc::new(Cell::new(SessionOutcome::Pending));
         let session: ITfEditSession = ComposeEdit {
             context: context.clone(),
             action,
             ui: self.ui.clone(),
             client_id,
+            outcome: outcome.clone(),
         }
         .into();
-        // qingjian apps/windows/tsf/src/com/edit/update.rs: TF_ES_READWRITE only, no
-        // TF_ES_SYNC; Ok means the session was accepted, the write happens in the callback.
-        request_session(context, client_id, session, name)
+        // SampleIME KeyHandler.cpp _InvokeKeyHandler: TF_ES_ASYNCDONTCARE | TF_ES_READWRITE,
+        // no TF_ES_SYNC (Word). qingjian edit/update.rs: TF_ES_READWRITE only; Ok means accepted,
+        // the write happens in the callback. A session that already ran and failed is not handled.
+        let accepted = request_session(context, client_id, session, name);
+        if accepted && outcome.get() == SessionOutcome::Failed {
+            log("组字会话已跑完但失败，交回按键");
+            false
+        } else {
+            accepted
+        }
     }
     pub(super) fn cancel(&self, client_id: u32) {
         let Some(state) = self.ui.state.borrow_mut().take() else {

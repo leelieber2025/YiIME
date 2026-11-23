@@ -29,8 +29,8 @@ use windows::Win32::UI::TextServices::{
     GUID_TFCAT_TIPCAP_UIELEMENTENABLED, INSERT_TEXT_AT_SELECTION_FLAGS, ITfCandidateListUIElement,
     ITfCandidateListUIElement_Impl, ITfCategoryMgr, ITfCompartmentEventSink,
     ITfCompartmentEventSink_Impl, ITfCompartmentMgr, ITfComposition, ITfCompositionSink,
-    ITfContext, ITfContextComposition, ITfContextView, ITfDocumentMgr, ITfEditRecord,
-    ITfEditSession, ITfEditSession_Impl, ITfInputProcessorProfiles, ITfInputScope,
+    ITfCompositionSink_Impl, ITfContext, ITfContextComposition, ITfContextView, ITfDocumentMgr,
+    ITfEditRecord, ITfEditSession, ITfEditSession_Impl, ITfInputProcessorProfiles, ITfInputScope,
     ITfInsertAtSelection, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
     ITfLangBarItem_Impl, ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItemMgr,
     ITfLangBarItemSink, ITfMenu, ITfSource, ITfSource_Impl, ITfTextEditSink, ITfTextEditSink_Impl,
@@ -40,9 +40,10 @@ use windows::Win32::UI::TextServices::{
     ITfUIElement_Impl, ITfUIElementMgr, TF_AE_END, TF_ANCHOR_END, TF_ANCHOR_START, TF_CLUIE_COUNT,
     TF_CLUIE_CURRENTPAGE, TF_CLUIE_DOCUMENTMGR, TF_CLUIE_PAGEINDEX, TF_CLUIE_SELECTION,
     TF_CLUIE_STRING, TF_CONVERSIONMODE_NATIVE, TF_DEFAULT_SELECTION, TF_E_NOOBJECT, TF_ES_ASYNC,
-    TF_ES_ASYNCDONTCARE, TF_ES_READ, TF_ES_READWRITE, TF_LANGBARITEMINFO, TF_LBI_CLK_RIGHT,
-    TF_LBI_ICON, TF_LBI_STYLE_BTN_BUTTON, TF_LBI_TEXT, TF_LBI_TOOLTIP, TF_MOD_ALT, TF_MOD_CONTROL,
-    TF_MOD_SHIFT, TF_PRESERVEDKEY, TF_SD_READONLY, TF_SELECTION, TF_SELECTIONSTYLE, TfLBIClick,
+    TF_ES_ASYNCDONTCARE, TF_ES_READ, TF_ES_READWRITE, TF_IAS_QUERYONLY, TF_LANGBARITEMINFO,
+    TF_LBI_CLK_RIGHT, TF_LBI_ICON, TF_LBI_STYLE_BTN_BUTTON, TF_LBI_TEXT, TF_LBI_TOOLTIP,
+    TF_MOD_ALT, TF_MOD_CONTROL, TF_MOD_SHIFT, TF_PRESERVEDKEY, TF_SD_READONLY, TF_SELECTION,
+    TF_SELECTIONSTYLE, TfLBIClick,
 };
 use windows::core::{
     BOOL, BSTR, GUID, HRESULT, IUnknown, IUnknownImpl, Interface, Ref, Result, implement,
@@ -85,6 +86,7 @@ use yiime_core::{Flag, OptionStore, Options, Quotes, full_width, us_key_char};
 mod inline;
 mod key_sink;
 mod lang_bar;
+mod launch;
 mod receiver;
 mod registration;
 use inline::InlineInput;
@@ -575,6 +577,19 @@ fn context_window(context: &ITfContext) -> HWND {
         .and_then(|view| unsafe { view.GetWnd() })
         .map_or(null_mut(), |window| window.0 as HWND)
 }
+/// Quote arguments for `ShellExecuteW` (empty values become `""`).
+fn shell_parameters(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| {
+            if arg.is_empty() || arg.contains(' ') || arg.contains('\\') || arg.contains('"') {
+                format!("\"{arg}\"")
+            } else {
+                arg.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 /// Input-box/tray EXE next to this DLL, or else in the current version directory recorded by the
 /// installer.
 fn companion_exe() -> Option<std::path::PathBuf> {
@@ -785,16 +800,10 @@ fn open_tray_window(history: bool) {
         }
         return;
     }
-    if let Some(exe) = companion_exe() {
-        let directory = exe.parent().map(std::path::Path::to_path_buf);
-        let mut command = std::process::Command::new(&exe);
-        command.arg(if history { "--history" } else { "--settings" });
-        if let Some(directory) = directory {
-            command.current_dir(directory);
-        }
-        if let Err(error) = command.spawn() {
-            log(&format!("启动托盘失败：{error}"));
-        }
+    // qingjian launch.rs: ShellExecute + mutex/cooldown; refused launches are only logged.
+    match launch::launch_companion(if history { "--history" } else { "--settings" }) {
+        launch::LaunchOutcome::Requested | launch::LaunchOutcome::InFlight => {}
+        launch::LaunchOutcome::Refused => log("启动托盘失败：无法拉起 YiIME.exe"),
     }
 }
 /// Longest Shift hold that counts as a Chinese/English tap.
@@ -1612,57 +1621,90 @@ impl TextService {
             return false;
         };
         let directory = editor.parent().unwrap_or(directory).to_path_buf();
-        let mut command = std::process::Command::new(editor);
-        command
-            .args([
-                "--tsf-hwnd",
-                &format!("{}", self.receiver.get() as usize),
-                "--target-hwnd",
-                &format!("{target}"),
-                "--initial",
-                &if first_key == 0 {
-                    String::new()
-                } else if first_key == RECALL {
-                    "-".to_owned()
-                } else {
-                    format!("{}", first_key as char)
-                },
-            ])
-            // Do not inherit the host's working directory or standard handles.
-            .current_dir(directory)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
+        let initial = if first_key == 0 {
+            String::new()
+        } else if first_key == RECALL {
+            "-".to_owned()
+        } else {
+            format!("{}", first_key as char)
+        };
+        let mut args = vec![
+            "--tsf-hwnd".into(),
+            format!("{}", self.receiver.get() as usize),
+            "--target-hwnd".into(),
+            format!("{target}"),
+            "--initial".into(),
+            initial,
+        ];
         if first_key == RECALL {
-            command.arg("--recall");
-        }
-        if self.private_editor() {
-            // Serves only this application and exits with it.
-            command.arg("--private");
+            args.push("--recall".into());
         }
         if let Some(rect) = caret {
-            command.args([
-                "--caret".to_owned(),
-                format!("{},{},{},{}", rect.left, rect.top, rect.right, rect.bottom),
-            ]);
+            args.push("--caret".into());
+            args.push(format!(
+                "{},{},{},{}",
+                rect.left, rect.top, rect.right, rect.bottom
+            ));
         }
-        if let Ok(child) = command.spawn() {
-            *self.session_document.borrow_mut() = unsafe { context.GetDocumentMgr() }.ok();
-            self.session_window.set(context_window(&context));
-            *self.context.borrow_mut() = Some(context);
-            self.editor_pid.set(child.id());
-            *self.editor.borrow_mut() = Some(child);
-            self.allow_editor_foreground();
-            self.editor_open.set(true);
-            self.start_ready_timer();
-            true
-        } else {
-            // Not started: the key goes to the application, and starting is retried later.
-            log("输入框程序无法启动");
-            self.health
-                .borrow_mut()
-                .start_failed(std::time::Instant::now());
-            false
+        // Elevated / high-integrity hosts keep a private instance (CreateProcess is fine;
+        // qingjian launch.rs only starts the shared Medium-integrity server).
+        if self.private_editor() {
+            args.push("--private".into());
+            let mut command = std::process::Command::new(editor);
+            command
+                .args(&args)
+                .current_dir(directory)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+            return if let Ok(child) = command.spawn() {
+                *self.session_document.borrow_mut() = unsafe { context.GetDocumentMgr() }.ok();
+                self.session_window.set(context_window(&context));
+                *self.context.borrow_mut() = Some(context);
+                self.editor_pid.set(child.id());
+                *self.editor.borrow_mut() = Some(child);
+                self.allow_editor_foreground();
+                self.editor_open.set(true);
+                self.start_ready_timer();
+                true
+            } else {
+                log("输入框程序无法启动");
+                self.health
+                    .borrow_mut()
+                    .start_failed(std::time::Instant::now());
+                false
+            };
+        }
+        match launch::launch_companion(&shell_parameters(&args)) {
+            launch::LaunchOutcome::Requested => {
+                *self.session_document.borrow_mut() = unsafe { context.GetDocumentMgr() }.ok();
+                self.session_window.set(context_window(&context));
+                *self.context.borrow_mut() = Some(context);
+                self.allow_editor_foreground();
+                self.editor_open.set(true);
+                self.start_ready_timer();
+                true
+            }
+            launch::LaunchOutcome::InFlight => {
+                // Another launch is already on the way (no --initial for this key).
+                if first_key != 0 && first_key != RECALL {
+                    self.pending_keys.borrow_mut().push(typed_letter(first_key));
+                }
+                *self.session_document.borrow_mut() = unsafe { context.GetDocumentMgr() }.ok();
+                self.session_window.set(context_window(&context));
+                *self.context.borrow_mut() = Some(context);
+                self.allow_editor_foreground();
+                self.editor_open.set(true);
+                self.start_ready_timer();
+                true
+            }
+            launch::LaunchOutcome::Refused => {
+                log("输入框程序无法启动");
+                self.health
+                    .borrow_mut()
+                    .start_failed(std::time::Instant::now());
+                false
+            }
         }
     }
     fn start_ready_timer(&self) {

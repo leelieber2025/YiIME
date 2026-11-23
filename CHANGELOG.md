@@ -14,7 +14,10 @@
 
 - **Office 刚打开时可以输入**：是否接管按键只看输入框自己的开关，不再等 InputScope 查询。密码、PIN 和私密输入框照常输入，但不学习、不记入历史、不翻译。
 - **32 位程序可以输入**：安装包同时注册 32 位 DLL（`yiime_tsf_x86.dll`），与 64 位程序共用输入框服务。
-- **原文本框组字不再把按键吃掉**：组字更新改走异步编辑会话（只请求 `TF_ES_READWRITE`，不用 `TF_ES_SYNC`，做法同青简）；同一窗口里的焦点文档变化或上下文出入栈不再取消组字。组字会话如果没有被宿主受理，改走原来的草稿编辑器，避免字母既不能组字也不进应用。候选窗处理 `WM_MOUSEACTIVATE`，点击不抢焦点。诊断日志记录会话 HRESULT、开始/更新/结束/取消，以及候选窗未显示的原因（不含输入内容）。
+- **原文本框组字开始失败（`0x80070057`）导致所有程序都没有候选窗**：组字开始改为微软 SampleIME 的写法（`StartComposition.cpp` 的 `CStartCompositionEditSession::DoEditSession`）：先用 `TF_IAS_QUERYONLY` 取插入范围，再把实现了 `ITfCompositionSink` 的对象传给 `StartComposition`，预编辑文字写在组字范围上（`Composition.cpp` 的 `_AddComposingAndChar` / `OnCompositionTerminated`）。此前传入空 sink 并先把编码当正文插入，宿主返回 `E_INVALIDARG`，文档里没有组字、候选窗也不出现。青简 `composition/mod.rs` 的 `start_composition` 与 weasel `WeaselTSF/Composition.cpp` 与此相同。
+- **组字会话已经执行失败时不再吞掉按键**：`RequestEditSession` 被受理只说明会话已接受（SampleIME `KeyHandler.cpp` 的 `_InvokeKeyHandler` 用 `TF_ES_ASYNCDONTCARE | TF_ES_READWRITE`、不用 `TF_ES_SYNC`；青简 `edit/update.rs` 同）。若回调已经跑完并失败，按键改走草稿编辑器；草稿框也打不开则交还应用。
+- **登录后自动启动 YiIME.exe，输入法也可按需拉起**：安装程序在所有用户的「启动」文件夹加入快捷方式（同青简 `{commonstartup}`）。需要草稿框或设置、且服务不在时，DLL 按青简 `launch.rs` 用 `ShellExecute`、冷却和互斥体拉起同目录的 `YiIME.exe`。安装/卸载期间持有 `Global\YiIMEInstaller` 互斥体，不在那时拉起。拉起被拒绝时不吞键。
+- 组字更新走异步编辑会话（只请求 `TF_ES_READWRITE`，不用 `TF_ES_SYNC`）；同一窗口里的焦点文档变化或上下文出入栈不再取消组字。候选窗处理 `WM_MOUSEACTIVATE`，点击不抢焦点。诊断日志记录组字各步骤的 HRESULT、开始/更新/结束/取消，以及候选窗未显示的原因（不含输入内容）。
 - 文字已经上屏时，输入框不再保留草稿并报错。
 - Chrome、Electron 在输入框重新获得焦点时换文档，不再被当成换了输入框。
 - 光标位置异步读取；1 像素残片按正常行高补齐；屏幕外的矩形不用。

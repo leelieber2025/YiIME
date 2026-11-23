@@ -13,8 +13,9 @@
 ; error restore the old registration and abort, so Setup rolls back and reports failure instead of
 ; "completed"; ② grant ALL APPLICATION PACKAGES read+execute (UWP/AppContainer apps need it to load
 ; the DLL); ④ add the IME to
-; the original user's Chinese input list; ⑤ Start menu (settings, history, guide, uninstall); ⑥
-; launch the tray as the original user. Uninstall reverses this: stop our processes, unregister,
+; the original user's Chinese input list; ⑤ Start menu (settings, history, guide, uninstall) and an all-users Startup shortcut so a
+; login starts YiIME.exe (qingjian.iss `{commonstartup}`); ⑥ launch the tray as the original user.
+; Uninstall reverses this: stop our processes, unregister,
 ; remove from the input list, delete files. %APPDATA%\YiIME and HKCU\Software\YiIME (settings,
 ; keys, history, learned data; migrated from the 0.1.x InputTranslation names by the EXE) are kept.
 ;
@@ -129,6 +130,9 @@ Name: "{group}\YiIME 译 设置"; Filename: "{app}\{#VersionDir}\{#Exe}"; Parame
 Name: "{group}\YiIME 译 输入记忆"; Filename: "{app}\{#VersionDir}\{#Exe}"; Parameters: "--history"; WorkingDir: "{app}\{#VersionDir}"; Comment: "查看翻译过的中文与译文"
 Name: "{group}\YiIME 译 使用说明"; Filename: "{app}\{#VersionDir}\TSF-使用说明.txt"
 Name: "{group}\卸载 YiIME 译"; Filename: "{uninstallexe}"
+; Login autostart: machine-level install, Explorer starts the EXE per user via ShellExecute
+; (qingjian.iss `{commonstartup}`). Inno removes this shortcut on uninstall.
+Name: "{commonstartup}\YiIME 译"; Filename: "{app}\{#VersionDir}\{#Exe}"; WorkingDir: "{app}\{#VersionDir}"; Comment: "登录时启动 YiIME 译（托盘与草稿框服务）"
 
 [InstallDelete]
 ; Shortcut left by the script install (Install-YiIME.ps1) in the runner's Start
@@ -164,6 +168,29 @@ const
 var
   PreviousDll: String;
   PreviousDll32: String;
+
+function CreateMutex(Attributes: Longint; InitialOwner: BOOL; Name: String): THandle;
+  external 'CreateMutexW@kernel32.dll stdcall';
+
+{ Held for the whole setup/uninstall; name matches tsf launch.rs INSTALLER_MUTEX.
+  The handle is left open and released when the process exits. }
+procedure HoldInstallerMutex;
+begin
+  if CreateMutex(0, False, 'Global\YiIMEInstaller') = 0 then
+    Log('建安装互斥体失败');
+end;
+
+function InitializeSetup: Boolean;
+begin
+  HoldInstallerMutex;
+  Result := True;
+end;
+
+function InitializeUninstall: Boolean;
+begin
+  HoldInstallerMutex;
+  Result := True;
+end;
 
 function CurrentDll: String;
 begin
