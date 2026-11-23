@@ -6,6 +6,19 @@
 
 ## [Unreleased]
 
+## [0.2.0-rc.3] - 2026-11-22
+
+候选版本（预发布），修复 0.2.0-rc.2 的问题。升级后请重启电脑。
+
+### 修复
+
+- 翻译进行中换到另一个输入框（或另一个应用）时，中文原文提交回原来的位置，译文不再上屏到新的位置；没按 Enter 的草稿也不再跟着新输入框走。
+- 打开自学习后，用户词仍然排在该编码的最前面。
+
+### 变更
+
+- 输入法 DLL 与输入框的协议改为 3（窗口类名和服务窗口标题带上该版本）。旧版 DLL 不会连到新的输入框。
+
 ## [0.2.0-rc.2] - 2026-11-22
 
 候选版本（预发布），修复 0.2.0-rc.1 的问题。升级后请重启电脑（安装程序检测到旧版 DLL 仍在使用时会提示）。
@@ -169,7 +182,8 @@ Linux：
 
 - 命令行工具 `yiime`（`query` 查候选、`translate` 测试翻译），提供 tar.gz 与 .deb。
 
-[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.2...HEAD
+[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.3...HEAD
+[0.2.0-rc.3]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.2...v0.2.0-rc.3
 [0.2.0-rc.2]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.1...v0.2.0-rc.2
 [0.2.0-rc.1]: https://github.com/leelieber2025/YiIME/compare/v0.1.5...v0.2.0-rc.1
 [0.1.5]: https://github.com/leelieber2025/YiIME/compare/v0.1.4...v0.1.5
