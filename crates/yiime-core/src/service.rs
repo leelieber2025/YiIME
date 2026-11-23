@@ -360,6 +360,65 @@ pub fn key_route(session_open: bool, same_context: bool) -> KeyRoute {
     }
 }
 
+/// What a change of the application's focused TSF document means for an open input session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusChange {
+    /// Not a move to another text field: keep the session.
+    Keep,
+    /// The user is now in another editable text field: end the session there.
+    OtherField,
+}
+
+/// Decides on ITfThreadMgrEventSink::OnSetFocus. `session_document`: the document the session's
+/// text field belongs to; `focused`: the newly focused document and whether its top context
+/// accepts input.
+///
+/// Only a different, editable document is another field. The input box itself takes the
+/// foreground while the user types, so the host sees its focus go away and come back: to no
+/// document, or (Chromium/Electron) to a disabled "empty" document while the page is blurred,
+/// then back to the same document — with `previous` being null or that empty document. None of
+/// that is a field switch; treating it as one ended the session just before the box committed,
+/// and the commit was refused (0.2.0-rc.3).
+pub fn focus_change<D: PartialEq>(
+    session_open: bool,
+    session_document: Option<&D>,
+    focused: Option<&D>,
+    focused_editable: bool,
+) -> FocusChange {
+    match (session_open, session_document, focused) {
+        (true, Some(session), Some(focused)) if session != focused && focused_editable => {
+            FocusChange::OtherField
+        }
+        _ => FocusChange::Keep,
+    }
+}
+
+/// Where the box's commit (COPYDATA 0, text for its current session) goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitTarget {
+    /// The text field of the open session.
+    Session,
+    /// The field parked when the session ended for another field (the box had not been told
+    /// yet, e.g. a translation that finished in between).
+    Held,
+    /// No field is known any more: the text field that has the focus now, rather than refusing
+    /// the commit and leaving the user unable to type.
+    Focused,
+}
+
+/// Commit targets in the order to try them. An open session always wins, so text never lands in
+/// a field that was left; the focused field is the last resort.
+pub fn commit_targets(session: bool, held: bool, focused: bool) -> Vec<CommitTarget> {
+    [
+        (session, CommitTarget::Session),
+        (held, CommitTarget::Held),
+        (focused, CommitTarget::Focused),
+    ]
+    .into_iter()
+    .filter_map(|(available, target)| available.then_some(target))
+    .collect()
+}
+
 /// What a Shift tap in the input box does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShiftTapAction {
@@ -448,6 +507,56 @@ pub fn context_after_pop<C: PartialEq>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Replays OnSetFocus sequences seen in Chromium/Electron hosts (documents as numbers:
+    /// 1 = the text field, 9 = Chromium's disabled empty document, 2 = another field).
+    fn replay(events: &[(Option<u32>, bool)]) -> Vec<FocusChange> {
+        events
+            .iter()
+            .map(|(focused, editable)| focus_change(true, Some(&1), focused.as_ref(), *editable))
+            .collect()
+    }
+
+    #[test]
+    fn chromium_refocus_of_the_same_field_keeps_the_session() {
+        use FocusChange::*;
+        // The box takes the foreground: the page blurs to the empty document; the box commits
+        // and brings the host back: field 1 again (previous = empty document).
+        assert_eq!(replay(&[(Some(9), false), (Some(1), true)]), [Keep, Keep]);
+        // Classic hosts: focus goes to no document and back (previous = null).
+        assert_eq!(replay(&[(None, true), (Some(1), true)]), [Keep, Keep]);
+        // Several blur/refocus pairs during one composition.
+        assert_eq!(
+            replay(&[
+                (Some(9), false),
+                (Some(1), true),
+                (None, false),
+                (Some(1), true)
+            ]),
+            [Keep, Keep, Keep, Keep]
+        );
+        // A real click into another field ends it, even after a blur.
+        assert_eq!(
+            replay(&[(Some(9), false), (Some(2), true)]),
+            [Keep, OtherField]
+        );
+        // A read-only or disabled document is not a field to type into.
+        assert_eq!(replay(&[(Some(2), false)]), [Keep]);
+        // No session, or its document unknown: nothing to end.
+        assert_eq!(focus_change(false, Some(&1), Some(&2), true), Keep);
+        assert_eq!(focus_change::<u32>(true, None, Some(&2), true), Keep);
+    }
+
+    #[test]
+    fn a_commit_is_never_refused_while_a_field_is_known() {
+        use CommitTarget::*;
+        assert_eq!(commit_targets(true, true, true), [Session, Held, Focused]);
+        // Session ended by a focus event before the box committed: the parked field, then the
+        // focused one; never nothing while the user is in a text field.
+        assert_eq!(commit_targets(false, true, true), [Held, Focused]);
+        assert_eq!(commit_targets(false, false, true), [Focused]);
+        assert!(commit_targets(false, false, false).is_empty());
+    }
 
     #[test]
     fn the_field_under_a_popped_context_is_queried_again() {

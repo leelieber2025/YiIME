@@ -625,6 +625,7 @@ impl TextService {
         let id = self.next_held.get().wrapping_add(1).max(1);
         self.next_held.set(id);
         *self.held_context.borrow_mut() = self.context.borrow_mut().take();
+        self.session_document.borrow_mut().take();
         self.held_id.set(id);
         id
     }
@@ -761,6 +762,8 @@ struct TextService {
     context: RefCell<Option<ITfContext>>,
     /// Text field a dropped session was typing into, and the id the box echoes to commit there.
     held_context: RefCell<Option<ITfContext>>,
+    /// Document (text field) of the open session; focus events compare against it.
+    session_document: RefCell<Option<ITfDocumentMgr>>,
     held_id: Cell<u64>,
     next_held: Cell<u64>,
     client_id: Cell<u32>,
@@ -807,6 +810,7 @@ impl TextService {
             thread_manager: RefCell::new(None),
             context: RefCell::new(None),
             held_context: RefCell::new(None),
+            session_document: RefCell::new(None),
             held_id: Cell::new(0),
             next_held: Cell::new(0),
             client_id: Cell::new(0),
@@ -931,6 +935,7 @@ impl TextService {
         self.first_key.set(None);
         self.flush_attempts.set(0);
         self.context.borrow_mut().take();
+        self.session_document.borrow_mut().take();
         self.clear_held();
     }
     fn kill_timers(&self) {
@@ -1023,11 +1028,20 @@ impl TextService {
         if !self.keyboard_open() {
             return false;
         }
+        // Same field: the session's context, or another context of its document (hosts may
+        // re-create the context of a field).
         let same_context = self
             .context
             .borrow()
             .as_ref()
-            .is_some_and(|active| active == context);
+            .is_some_and(|active| active == context)
+            || self
+                .session_document
+                .borrow()
+                .as_ref()
+                .is_some_and(|document| {
+                    unsafe { context.GetDocumentMgr() }.is_ok_and(|other| &other == document)
+                });
         match yiime_core::key_route(self.buffering(), same_context) {
             yiime_core::KeyRoute::Buffer => return true,
             // The box still belongs to another text field: drop that session so this letter
@@ -1317,6 +1331,7 @@ impl TextService {
             let pid = window_pid(window);
             self.allow_editor_foreground();
             *self.context.borrow_mut() = Some(context.clone());
+            *self.session_document.borrow_mut() = unsafe { context.GetDocumentMgr() }.ok();
             self.first_key.set(
                 first_key
                     .is_ascii_alphabetic()
@@ -1408,6 +1423,7 @@ impl TextService {
             ]);
         }
         if let Ok(child) = command.spawn() {
+            *self.session_document.borrow_mut() = unsafe { context.GetDocumentMgr() }.ok();
             *self.context.borrow_mut() = Some(context);
             self.first_key.set(
                 first_key
@@ -1438,24 +1454,55 @@ impl TextService {
         }
     }
     fn commit(&self, text: String) -> bool {
-        // A session was already dropped for another text field. This text (a translation that
-        // finished in between) belongs there, not in the session that may have started since.
-        if self.held_id.get() != 0 {
-            return self.commit_held(self.held_id.get(), text);
-        }
         if text.is_empty() {
-            self.finish_editor();
+            // Empty: the box closed its session. With no session open, release a parked field
+            // (the box was not told about it yet).
+            if self.editor_open.get() {
+                self.finish_editor();
+            } else if self.held_id.get() != 0 {
+                self.commit_held(self.held_id.get(), String::new());
+            }
             return true;
         }
-        let context = self.context.borrow().clone();
-        let Some(context) = context else {
-            return false;
-        };
-        if !self.insert_text(&context, text) {
-            return false;
+        let session = self
+            .editor_open
+            .get()
+            .then(|| self.context.borrow().clone())
+            .flatten();
+        let held = self.held_context.borrow().clone();
+        let focused = self.focused_context();
+        let targets =
+            yiime_core::commit_targets(session.is_some(), held.is_some(), focused.is_some());
+        for target in targets {
+            let (context, which) = match target {
+                yiime_core::CommitTarget::Session => (session.clone(), "session"),
+                yiime_core::CommitTarget::Held => (held.clone(), "held"),
+                yiime_core::CommitTarget::Focused => (focused.clone(), "focused"),
+            };
+            let Some(context) = context else { continue };
+            if self.insert_text(&context, text.clone()) {
+                match target {
+                    yiime_core::CommitTarget::Session => self.finish_editor(),
+                    yiime_core::CommitTarget::Held => self.clear_held(),
+                    yiime_core::CommitTarget::Focused => {
+                        log("上屏到当前焦点输入框（原会话已结束）");
+                        self.clear_held();
+                        self.finish_editor();
+                    }
+                }
+                return true;
+            }
+            log(&format!("上屏失败：{which}"));
         }
-        self.finish_editor();
-        true
+        log("没有可上屏的输入框");
+        false
+    }
+    /// Top context of the document that has the focus in this thread, if it takes input.
+    fn focused_context(&self) -> Option<ITfContext> {
+        let manager = self.thread_manager.borrow().clone()?;
+        let document = unsafe { manager.GetFocus() }.ok()?;
+        let context = unsafe { document.GetTop() }.ok()?;
+        (!Self::disabled(&context)).then_some(context)
     }
     /// Inserts `text` into the parked text field `id` and releases it. Does not touch a session
     /// that started afterwards. Empty text only releases the field.
@@ -1485,6 +1532,7 @@ impl TextService {
     }
     fn finish_editor(&self) {
         self.editor_open.set(false);
+        self.session_document.borrow_mut().take();
         self.starting_window.set(null_mut());
         self.ready_deadline.set(None);
         self.context.borrow_mut().take();
@@ -1767,12 +1815,22 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
     fn OnSetFocus(
         &self,
         document: Ref<ITfDocumentMgr>,
-        previous: Ref<ITfDocumentMgr>,
+        _previous: Ref<ITfDocumentMgr>,
     ) -> Result<()> {
         com_guard("OnSetFocus", || {
-            // Focus moved to another text field of this application (not to the input box, which
-            // leaves no focused document here): the old session ends now.
-            if document.is_some() && document.as_ref() != previous.as_ref() {
+            // Only a move to another editable field ends the session; see
+            // yiime_core::focus_change for the refocus sequences that must not.
+            let editable = document
+                .as_ref()
+                .and_then(|document| unsafe { document.GetTop() }.ok())
+                .is_some_and(|context| !TextService::disabled(&context));
+            let change = yiime_core::focus_change(
+                self.buffering(),
+                self.session_document.borrow().as_ref(),
+                document.as_ref(),
+                editable,
+            );
+            if change == yiime_core::FocusChange::OtherField {
                 self.drop_stale_session("焦点移到另一个输入框");
             }
             self.notify_focus_moved();
