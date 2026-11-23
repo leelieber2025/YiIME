@@ -6,6 +6,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             self.tested_key.borrow_mut().take();
             self.shift_down.set(None);
             if !foreground.as_bool() {
+                self.inline.cancel(self.client_id.get());
                 // This application's thread lost the keyboard (also when the input box itself
                 // takes it; the box then ignores the notice because it has the foreground).
                 self.notify_focus_moved();
@@ -37,7 +38,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             *self.tested_key.borrow_mut() = context
                 .as_ref()
                 .map(|context| (context.clone(), key.0, consume));
-            Ok(consume.into())
+            Ok((consume || is_shift(key.0)).into())
         })
     }
     fn OnKeyDown(
@@ -48,6 +49,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
     ) -> Result<BOOL> {
         com_guard("OnKeyDown", || {
             self.track_key_down(key.0);
+            if is_shift(key.0) {
+                return Ok(false.into());
+            }
             let Some(context) = context.as_ref() else {
                 return Ok(false.into());
             };
@@ -76,9 +80,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
             self.after_digit
                 .set((!shift && (0x30..=0x39).contains(&key.0)) || (0x60..=0x69).contains(&key.0));
-            // Only letters go to the box; keys whose conditions changed since OnTestKeyDown (e.g. eaten
-            // by punctuation) are released.
-            if !consume || !(0x41..=0x5a).contains(&key.0) {
+            // Let the host receive a key if it no longer belongs to this input session.
+            if !consume {
                 return Ok(false.into());
             }
             if self.buffering() {
@@ -93,12 +96,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 }
                 return Ok(true.into());
             }
-            self.probe_new_field(context);
-            let opened = self.open_editor(context.clone(), key.0 as u8);
-            if !opened {
-                self.note_pass(Some(yiime_core::PassReason::BoxUnavailable));
-            }
-            Ok(opened.into())
+            Ok(self.inline.key(context, self.client_id.get(), key.0).into())
         })
     }
     fn OnTestKeyUp(
@@ -108,10 +106,8 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
         _data: windows::Win32::Foundation::LPARAM,
     ) -> Result<BOOL> {
         com_guard("OnTestKeyUp", || {
-            // A Shift released without being eaten reaches the host as usual; the toggle happens once
-            // (track_key_up clears the record).
-            self.track_key_up(key.0);
-            Ok(false.into())
+            // Ask TSF to deliver the corresponding OnKeyUp; that callback changes the mode.
+            Ok(is_shift(key.0).into())
         })
     }
     fn OnKeyUp(
@@ -133,6 +129,17 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 return Ok(false.into());
             }
             let guid = unsafe { *guid };
+            if guid == EDITOR_KEY {
+                self.inline.cancel(self.client_id.get());
+                if let Some(context) = context.as_ref() {
+                    self.probe_new_field(context);
+                    return Ok(self.open_editor(context.clone(), 0).into());
+                }
+                return Ok(false.into());
+            }
+            if guid == TOGGLE_KEY {
+                self.inline.cancel(self.client_id.get());
+            }
             if guid == HISTORY_KEY {
                 // Passed through to the application when history is off, a session is active, in
                 // English mode or in a password field.

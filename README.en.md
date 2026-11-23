@@ -8,9 +8,10 @@
 [![Downloads](https://img.shields.io/github/downloads/leelieber2025/YiIME/total)](https://github.com/leelieber2025/YiIME/releases)
 
 YiIME 译 is a free, open-source (GPL-3.0) Windows 10/11 input method (TSF). Type Chinese in any
-application with Wubi 86 and Pinyin mixed (no switching); press **Enter** to commit the English
-translation, or **Shift+Enter** to commit the Chinese text. A plain Wubi mode without translation is
-one shortcut away (Ctrl+Shift+Space).
+application with Wubi 86 and Pinyin mixed (no switching). The current development build composes
+in the target field and picks a candidate there; **Ctrl+Alt+T** opens the draft editor for
+translation. Released packages describe their own input flow. A plain Wubi mode without translation
+is one shortcut away (Ctrl+Shift+Space).
 
 ## Download
 

@@ -177,7 +177,7 @@ unsafe fn receiver_proc_impl(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> 
                         let _ = child.kill();
                     }
                 }
-                (*pointer).restore_pending_keys(true);
+                (*pointer).restore_pending_keys();
                 (*pointer).reset_editor();
             }
         } else {

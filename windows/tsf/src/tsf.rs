@@ -1,5 +1,4 @@
-//! Windows TSF text service. Typing happens in the companion input box; the result is inserted
-//! through a TSF edit session.
+//! Windows TSF text service. Normal typing composes in the target document.
 #![allow(non_snake_case)]
 
 use std::cell::{Cell, RefCell};
@@ -7,6 +6,7 @@ use std::ffi::c_void;
 use std::mem::ManuallyDrop;
 use std::ptr::null_mut;
 use std::rc::Rc;
+use std::sync::OnceLock as DictionaryLock;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI32, AtomicPtr, Ordering};
 use windows::Win32::Foundation::{
@@ -26,18 +26,24 @@ use windows::Win32::UI::TextServices::{
     GUID_COMPARTMENT_KEYBOARD_OPENCLOSE, GUID_LBI_INPUTMODE, GUID_PROP_INPUTSCOPE,
     GUID_TFCAT_TIP_KEYBOARD, GUID_TFCAT_TIPCAP_COMLESS, GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
     GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT, GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
-    GUID_TFCAT_TIPCAP_UIELEMENTENABLED, INSERT_TEXT_AT_SELECTION_FLAGS, ITfCategoryMgr,
-    ITfCompartmentEventSink, ITfCompartmentEventSink_Impl, ITfCompartmentMgr, ITfContext,
-    ITfDocumentMgr, ITfEditRecord, ITfEditSession, ITfEditSession_Impl, ITfInputProcessorProfiles,
-    ITfInputScope, ITfInsertAtSelection, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
+    GUID_TFCAT_TIPCAP_UIELEMENTENABLED, INSERT_TEXT_AT_SELECTION_FLAGS, ITfCandidateListUIElement,
+    ITfCandidateListUIElement_Impl, ITfCategoryMgr, ITfCompartmentEventSink,
+    ITfCompartmentEventSink_Impl, ITfCompartmentMgr, ITfComposition, ITfCompositionSink,
+    ITfContext, ITfContextComposition, ITfContextView, ITfDocumentMgr, ITfEditRecord,
+    ITfEditSession, ITfEditSession_Impl, ITfInputProcessorProfiles, ITfInputScope,
+    ITfInsertAtSelection, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
     ITfLangBarItem_Impl, ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItemMgr,
     ITfLangBarItemSink, ITfMenu, ITfSource, ITfSource_Impl, ITfTextEditSink, ITfTextEditSink_Impl,
-    ITfTextInputProcessor, ITfTextInputProcessor_Impl, ITfThreadFocusSink, ITfThreadFocusSink_Impl,
-    ITfThreadMgr, ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl, TF_AE_END, TF_ANCHOR_END,
-    TF_ANCHOR_START, TF_CONVERSIONMODE_NATIVE, TF_DEFAULT_SELECTION, TF_E_NOOBJECT,
-    TF_ES_ASYNCDONTCARE, TF_ES_READ, TF_ES_READWRITE, TF_LANGBARITEMINFO, TF_LBI_CLK_RIGHT,
-    TF_LBI_ICON, TF_LBI_STYLE_BTN_BUTTON, TF_LBI_TEXT, TF_LBI_TOOLTIP, TF_MOD_ALT, TF_MOD_CONTROL,
-    TF_MOD_SHIFT, TF_PRESERVEDKEY, TF_SD_READONLY, TF_SELECTION, TF_SELECTIONSTYLE, TfLBIClick,
+    ITfTextInputProcessor, ITfTextInputProcessor_Impl, ITfTextInputProcessorEx,
+    ITfTextInputProcessorEx_Impl, ITfTextLayoutSink, ITfTextLayoutSink_Impl, ITfThreadFocusSink,
+    ITfThreadFocusSink_Impl, ITfThreadMgr, ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl,
+    ITfUIElement_Impl, ITfUIElementMgr, TF_AE_END, TF_ANCHOR_END, TF_ANCHOR_START, TF_CLUIE_COUNT,
+    TF_CLUIE_CURRENTPAGE, TF_CLUIE_DOCUMENTMGR, TF_CLUIE_PAGEINDEX, TF_CLUIE_SELECTION,
+    TF_CLUIE_STRING, TF_CONVERSIONMODE_NATIVE, TF_DEFAULT_SELECTION, TF_E_NOOBJECT, TF_ES_ASYNC,
+    TF_ES_ASYNCDONTCARE, TF_ES_READ, TF_ES_READWRITE, TF_ES_SYNC, TF_LANGBARITEMINFO,
+    TF_LBI_CLK_RIGHT, TF_LBI_ICON, TF_LBI_STYLE_BTN_BUTTON, TF_LBI_TEXT, TF_LBI_TOOLTIP,
+    TF_MOD_ALT, TF_MOD_CONTROL, TF_MOD_SHIFT, TF_PRESERVEDKEY, TF_SD_READONLY, TF_SELECTION,
+    TF_SELECTIONSTYLE, TfLBIClick,
 };
 use windows::core::{
     BOOL, BSTR, GUID, HRESULT, IUnknown, IUnknownImpl, Interface, Ref, Result, implement,
@@ -48,7 +54,9 @@ use windows_sys::Win32::Foundation::POINT;
 use windows_sys::Win32::Foundation::{
     ERROR_CLASS_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, WPARAM,
 };
-use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONULL, MonitorFromPoint};
+use windows_sys::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromPoint,
+};
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::Diagnostics::Debug::OutputDebugStringW;
 use windows_sys::Win32::System::Threading::{
@@ -62,9 +70,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow,
     ES_PASSWORD, GA_ROOT, GWL_STYLE, GWLP_USERDATA, GetAncestor, GetClassNameW,
     GetForegroundWindow, GetSystemMetrics, GetWindowLongPtrW, GetWindowLongW,
-    GetWindowThreadProcessId, HWND_MESSAGE, IMAGE_ICON, IsChild, IsWindow, KillTimer, LoadImageW,
-    PostMessageW, RegisterClassW, SM_CXSMICON, SMTO_ABORTIFHUNG, SendMessageTimeoutW, SetTimer,
-    SetWindowLongPtrW, WM_APP, WM_COPYDATA, WM_CREATE, WM_TIMER, WNDCLASSW,
+    GetWindowThreadProcessId, HWND_MESSAGE, HWND_TOPMOST, IMAGE_ICON, IsChild, IsWindow, KillTimer,
+    LoadImageW, PostMessageW, RegisterClassW, SM_CXSMICON, SMTO_ABORTIFHUNG, SW_HIDE,
+    SWP_NOACTIVATE, SWP_SHOWWINDOW, SendMessageTimeoutW, SetTimer, SetWindowLongPtrW, SetWindowPos,
+    SetWindowTextW, ShowWindow, WM_APP, WM_COPYDATA, WM_CREATE, WM_TIMER, WNDCLASSW, WS_BORDER,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, FindWindowExW, FindWindowW, MF_CHECKED,
@@ -73,10 +83,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 use yiime_core::{Flag, OptionStore, Options, Quotes, full_width, us_key_char};
 
+mod inline;
 mod key_sink;
 mod lang_bar;
 mod receiver;
 mod registration;
+use inline::InlineInput;
 use lang_bar::{
     InputModeButton, LangBarSink, chinese_punctuation, history_key_text, option, parse_hotkey,
     plain_mode, plain_toggle_text, refresh_sink, set_plain_mode, toggle_option,
@@ -90,6 +102,11 @@ const TOGGLE_KEY: GUID = GUID::from_u128(0x39c04f7e_c659_4d9e_ad8e_55929249bb77)
 const TOGGLE_CHORD: TF_PRESERVEDKEY = TF_PRESERVEDKEY {
     uVKey: 0x20,
     uModifiers: TF_MOD_CONTROL,
+};
+const EDITOR_KEY: GUID = GUID::from_u128(0x198710a7_bafd_46e2_9573_43f8c0f1d44a);
+const EDITOR_CHORD: TF_PRESERVEDKEY = TF_PRESERVEDKEY {
+    uVKey: 0x54,
+    uModifiers: TF_MOD_CONTROL | TF_MOD_ALT,
 };
 /// Preserved key for toggling plain Wubi mode (no translation); the chord comes from
 /// HKCU\\Software\\YiIME\\PlainToggleKey.
@@ -226,20 +243,14 @@ fn absent_is_ok(result: Result<()>) -> Result<()> {
     }
 }
 
-/// Registered TIP categories, compared with qingjian's list (com/registry/mod.rs CATEGORIES).
-/// SYSTRAYSUPPORT is required for the Win8+ taskbar input indicator to show this IME's mode icon
-/// (GUID_LBI_INPUTMODE) and forward clicks to it. UIELEMENTENABLED lets TSF activate the IME in
-/// applications that ask for UI-less mode (games); the input box is a window of its own, so it
-/// does not depend on the application drawing anything. Not registered, unlike qingjian:
-/// IMMERSIVESUPPORT (UWP/AppContainer hosts cannot launch the input-box EXE or message it across
-/// integrity levels), SECUREMODE (the logon and UAC desktops must not start the box), and
-/// DISPLAYATTRIBUTEPROVIDER (no in-document composition yet).
-const CATEGORIES: [GUID; 5] = [
+/// Categories for the taskbar mode button, TSF candidate UI and immersive text hosts.
+const CATEGORIES: [GUID; 6] = [
     GUID_TFCAT_TIP_KEYBOARD,
     GUID_TFCAT_TIPCAP_COMLESS,
     GUID_TFCAT_TIPCAP_INPUTMODECOMPARTMENT,
     GUID_TFCAT_TIPCAP_SYSTRAYSUPPORT,
     GUID_TFCAT_TIPCAP_UIELEMENTENABLED,
+    GUID_TFCAT_TIPCAP_IMMERSIVESUPPORT,
 ];
 /// Small diagnostic log: %TEMP%\YiIME-tsf.log (rotated to .old over 512 KB); ignored where it
 /// cannot be written (AppContainer etc.).
@@ -644,7 +655,6 @@ impl TextService {
         self.kill_timers();
         self.editor_open.set(false);
         self.pending_keys.borrow_mut().clear();
-        self.first_key.set(None);
         self.flush_attempts.set(0);
         let id = self.hold_context();
         let editor_window = self.editor_window.get();
@@ -814,6 +824,7 @@ type ModeButton = Option<(ITfLangBarItemButton, Vec<(ITfSource, u32)>, LangBarSi
 
 #[implement(
     ITfTextInputProcessor,
+    ITfTextInputProcessorEx,
     ITfKeyEventSink,
     ITfThreadMgrEventSink,
     ITfThreadFocusSink,
@@ -851,7 +862,6 @@ struct TextService {
     /// When a starting session gives up waiting for its editor to report ready.
     ready_deadline: Cell<Option<std::time::Instant>>,
     pending_keys: RefCell<String>,
-    first_key: Cell<Option<char>>,
     flush_attempts: Cell<u8>,
     /// Timeouts of the shared service and restart backoff (see yiime_core::ServiceHealth).
     health: RefCell<yiime_core::ServiceHealth>,
@@ -877,6 +887,7 @@ struct TextService {
     /// Plain-mode state last shown by the button; refreshed when the tray or another app changes
     /// it.
     shown_plain: Cell<bool>,
+    inline: InlineInput,
 }
 impl TextService {
     fn new() -> Self {
@@ -901,7 +912,6 @@ impl TextService {
             starting_window: Cell::new(null_mut()),
             ready_deadline: Cell::new(None),
             pending_keys: RefCell::new(String::new()),
-            first_key: Cell::new(None),
             flush_attempts: Cell::new(0),
             health: RefCell::new(yiime_core::ServiceHealth::default()),
             private: Cell::new(None),
@@ -917,6 +927,7 @@ impl TextService {
             after_digit: Cell::new(false),
             quotes: Cell::new(Quotes::default()),
             shown_plain: Cell::new(false),
+            inline: InlineInput::new(),
         }
     }
     fn refresh_editor(&self) {
@@ -938,7 +949,7 @@ impl TextService {
                 // The box died during a session: letters it never received go back to the
                 // application instead of vanishing.
                 log("输入框进程已退出，未发送的按键已归还");
-                self.restore_pending_keys(false);
+                self.restore_pending_keys();
             }
             self.reset_editor();
         }
@@ -986,8 +997,7 @@ impl TextService {
             if let Some(child) = self.editor.borrow_mut().as_mut() {
                 let _ = child.kill();
             }
-            // Back off before starting another editor, so one that cannot start does not
-            // swallow the first letter of every word.
+            // Back off before starting another explicit editor session.
             self.health
                 .borrow_mut()
                 .start_failed(std::time::Instant::now());
@@ -1000,7 +1010,7 @@ impl TextService {
         } else {
             "输入框启动失败（进程已退出），已归还缓存按键"
         });
-        self.restore_pending_keys(true);
+        self.restore_pending_keys();
         self.reset_editor();
     }
     fn reset_editor(&self) {
@@ -1012,7 +1022,6 @@ impl TextService {
         self.starting_window.set(null_mut());
         self.ready_deadline.set(None);
         self.pending_keys.borrow_mut().clear();
-        self.first_key.set(None);
         self.flush_attempts.set(0);
         self.context.borrow_mut().take();
         self.session_document.borrow_mut().take();
@@ -1184,6 +1193,18 @@ impl TextService {
         }
         self.refresh_editor();
         let modifier = |vk| unsafe { GetKeyState(vk as i32) } < 0;
+        if !self.buffering() {
+            let active = self.inline.active();
+            return !Self::disabled(context)
+                && self.keyboard_open()
+                && !self.es_password()
+                && (active || !caps_lock())
+                && ![VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN]
+                    .into_iter()
+                    .any(modifier)
+                && (active || !modifier(VK_SHIFT))
+                && self.inline.wants(context, key);
+        }
         if !(0x41..=0x5a).contains(&key) || Self::disabled(context) {
             return false;
         }
@@ -1242,6 +1263,7 @@ impl TextService {
         let modifier = |vk| unsafe { GetKeyState(vk as i32) } < 0;
         if running_in_editor()
             || self.buffering()
+            || self.inline.active()
             || modifier(VK_CONTROL)
             || modifier(VK_MENU)
             || modifier(VK_LWIN)
@@ -1274,7 +1296,7 @@ impl TextService {
             .is_ok()
     }
     fn should_consume(&self, context: &ITfContext, key: usize) -> bool {
-        let consume = self.wants_key(context, key) && (self.buffering() || !self.es_password());
+        let consume = self.wants_key(context, key);
         if consume {
             self.note_pass(None);
         } else if (0x41..=0x5a).contains(&key) && !running_in_editor() {
@@ -1354,7 +1376,11 @@ impl TextService {
         if let Some(start) = self.shift_down.take()
             && start.elapsed() <= SHIFT_TAP_MAX
             && !running_in_editor()
+            && ![VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN]
+                .into_iter()
+                .any(|vk| unsafe { GetKeyState(vk as i32) } < 0)
         {
+            self.inline.cancel(self.client_id.get());
             let ok = self.toggle_keyboard_mode();
             log(&format!(
                 "Shift 单击切换中/英：{ok}，现在中文={}",
@@ -1530,11 +1556,6 @@ impl TextService {
             *self.context.borrow_mut() = Some(context.clone());
             *self.session_document.borrow_mut() = unsafe { context.GetDocumentMgr() }.ok();
             self.session_window.set(context_window(&context));
-            self.first_key.set(
-                first_key
-                    .is_ascii_alphabetic()
-                    .then(|| (first_key as char).to_ascii_lowercase()),
-            );
             self.editor_open.set(true);
             self.editor_window.set(null_mut());
             self.starting_window.set(window);
@@ -1596,7 +1617,9 @@ impl TextService {
                 "--target-hwnd",
                 &format!("{target}"),
                 "--initial",
-                &if first_key == RECALL {
+                &if first_key == 0 {
+                    String::new()
+                } else if first_key == RECALL {
                     "-".to_owned()
                 } else {
                     format!("{}", first_key as char)
@@ -1624,11 +1647,6 @@ impl TextService {
             *self.session_document.borrow_mut() = unsafe { context.GetDocumentMgr() }.ok();
             self.session_window.set(context_window(&context));
             *self.context.borrow_mut() = Some(context);
-            self.first_key.set(
-                first_key
-                    .is_ascii_alphabetic()
-                    .then(|| (first_key as char).to_ascii_lowercase()),
-            );
             self.editor_pid.set(child.id());
             *self.editor.borrow_mut() = Some(child);
             self.allow_editor_foreground();
@@ -1831,7 +1849,6 @@ impl TextService {
         self.ready_deadline.set(None);
         self.context.borrow_mut().take();
         self.pending_keys.borrow_mut().clear();
-        self.first_key.set(None);
         self.flush_attempts.set(0);
         self.kill_timers();
     }
@@ -1902,13 +1919,10 @@ impl TextService {
         }
         sent
     }
-    /// Types the letters of a session that ends without its box into the application.
-    /// `include_first`: the box never received the first letter (see yiime_core::keys_to_give_back).
-    fn restore_pending_keys(&self, include_first: bool) {
+    /// Types letters buffered while the explicit editor was starting into the application.
+    fn restore_pending_keys(&self) {
         let pending = std::mem::take(&mut *self.pending_keys.borrow_mut());
-        let first = self.first_key.take();
-        let keys = yiime_core::keys_to_give_back(first, &pending, !include_first);
-        if keys.is_empty() {
+        if pending.is_empty() {
             return;
         }
         // Clone before starting the edit session: it may run synchronously and re-enter
@@ -1917,7 +1931,7 @@ impl TextService {
         if let Some(context) = context {
             let session: ITfEditSession = CommitEdit {
                 context: context.clone(),
-                text: keys,
+                text: pending,
             }
             .into();
             let _ = unsafe {
@@ -2029,6 +2043,10 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
                     );
                 }
             }
+            let description: Vec<u16> = "打开翻译草稿 Ctrl+Alt+T".encode_utf16().collect();
+            let _ = unsafe {
+                keystroke.PreserveKey(client_id, &EDITOR_KEY, &EDITOR_CHORD, &description)
+            };
             for (guid, chord, text) in [
                 (&PUNCT_KEY, &PUNCT_CHORD, "中/英文标点 Ctrl+."),
                 (&TRAD_KEY, &TRAD_CHORD, "简/繁输出 Ctrl+Shift+F"),
@@ -2057,6 +2075,9 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
                 .ok()
                 .and_then(|document| unsafe { document.GetTop() }.ok());
             *self.thread_manager.borrow_mut() = Some(manager);
+            if let Some(manager) = self.thread_manager.borrow().as_ref() {
+                self.inline.activate(manager);
+            }
             if let Some(context) = initial_context {
                 self.probe_scope(context);
             }
@@ -2094,6 +2115,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
                 }
                 if let Ok(keystroke) = manager.cast::<ITfKeystrokeMgr>() {
                     let _ = unsafe { keystroke.UnpreserveKey(&TOGGLE_KEY, &TOGGLE_CHORD) };
+                    let _ = unsafe { keystroke.UnpreserveKey(&EDITOR_KEY, &EDITOR_CHORD) };
                     let _ = unsafe { keystroke.UnpreserveKey(&PUNCT_KEY, &PUNCT_CHORD) };
                     let _ = unsafe { keystroke.UnpreserveKey(&TRAD_KEY, &TRAD_CHORD) };
                     if let Some(chord) = self.history_chord.take() {
@@ -2107,6 +2129,7 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             }
             self.scope_cache.borrow_mut().take();
             self.tested_key.borrow_mut().take();
+            self.inline.deactivate(self.client_id.get());
             self.clear_held();
             let receiver = self.receiver.replace(null_mut());
             if !receiver.is_null() {
@@ -2118,6 +2141,11 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             self.reset_editor();
             Ok(())
         })
+    }
+}
+impl ITfTextInputProcessorEx_Impl for TextService_Impl {
+    fn ActivateEx(&self, manager: Ref<ITfThreadMgr>, client_id: u32, _flags: u32) -> Result<()> {
+        ITfTextInputProcessor_Impl::Activate(self, manager, client_id)
     }
 }
 impl ITfThreadMgrEventSink_Impl for TextService_Impl {
@@ -2133,6 +2161,7 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
         _previous: Ref<ITfDocumentMgr>,
     ) -> Result<()> {
         com_guard("OnSetFocus", || {
+            self.inline.cancel(self.client_id.get());
             // A change of the focused document never ends the session (as in qingjian, which
             // has no document-manager switch at all): Chromium, Electron, Word and Explorer's
             // search box move it while the box has the keyboard. A letter typed into another
@@ -2168,6 +2197,7 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
     }
     fn OnPopContext(&self, _context: Ref<ITfContext>) -> Result<()> {
         com_guard("OnPopContext", || {
+            self.inline.cancel(self.client_id.get());
             self.tested_key.borrow_mut().take();
             Ok(())
         })
@@ -2189,6 +2219,7 @@ impl ITfThreadFocusSink_Impl for TextService_Impl {
     }
     fn OnKillThreadFocus(&self) -> Result<()> {
         com_guard("OnKillThreadFocus", || {
+            self.inline.cancel(self.client_id.get());
             self.shift_down.set(None);
             self.notify_focus_moved();
             Ok(())
