@@ -150,7 +150,7 @@ const READY_TIMEOUT_MS: u64 = 5000;
 /// While waiting for the editor, check this often whether it exited or hung.
 const READY_POLL_MS: u32 = 250;
 /// The InputScope privacy of a context (see yiime_core::private_scope), None until read.
-type ScopeCache = Option<(ITfContext, Rc<Cell<Option<bool>>>)>;
+type ScopeCache = Option<(ITfContext, Rc<Cell<Option<yiime_core::FieldScope>>>)>;
 /// Receiver messages: an asynchronous InputScope read finished (12), a caret rectangle arrived (13),
 /// the language-bar or hotkey switched 译/普通五笔 (14, wParam 0 = 译, 1 = 普通五笔).
 const WM_SCOPE_READ: u32 = WM_APP + 12;
@@ -364,7 +364,7 @@ impl ITfEditSession_Impl for CommitEdit_Impl {
 #[implement(ITfEditSession)]
 struct ScopeCheck {
     context: ITfContext,
-    result: Rc<Cell<Option<bool>>>,
+    result: Rc<Cell<Option<yiime_core::FieldScope>>>,
     receiver: usize,
 }
 impl ITfEditSession_Impl for ScopeCheck_Impl {
@@ -382,10 +382,13 @@ impl ITfEditSession_Impl for ScopeCheck_Impl {
             };
             if selected.is_err() || fetched == 0 {
                 drop(ManuallyDrop::into_inner(selection.range));
-                self.result.set(Some(false));
+                self.result.set(Some(yiime_core::FieldScope::Normal));
+                unsafe {
+                    PostMessageW(self.receiver as HWND, WM_SCOPE_READ, 0, 0);
+                }
                 return Ok(());
             }
-            let mut private = false;
+            let mut kind = yiime_core::FieldScope::Normal;
             let range = ManuallyDrop::into_inner(selection.range);
             if let Some(range) = range
                 && let Ok(property) = unsafe { self.context.GetAppProperty(&GUID_PROP_INPUTSCOPE) }
@@ -403,7 +406,7 @@ impl ITfEditSession_Impl for ScopeCheck_Impl {
                         if read && !ptr.is_null() {
                             let scopes = unsafe { std::slice::from_raw_parts(ptr, count as usize) };
                             let values: Vec<i32> = scopes.iter().map(|scope| scope.0).collect();
-                            private = yiime_core::private_scope(&values);
+                            kind = yiime_core::field_scope(&values);
                         }
                         if !ptr.is_null() {
                             unsafe {
@@ -414,7 +417,7 @@ impl ITfEditSession_Impl for ScopeCheck_Impl {
                 }
                 let _ = unsafe { VariantClear(&mut value) };
             }
-            self.result.set(Some(private));
+            self.result.set(Some(kind));
             unsafe {
                 PostMessageW(self.receiver as HWND, WM_SCOPE_READ, 0, 0);
             }
@@ -1345,14 +1348,71 @@ impl TextService {
         (class == "edit" || class.starts_with("richedit"))
             && unsafe { GetWindowLongW(focus, GWL_STYLE) } & ES_PASSWORD != 0
     }
-    /// The field declared a private InputScope (as far as read so far). Only privacy follows
-    /// from it, never whether letters are taken.
-    fn private_field(&self, context: &ITfContext) -> bool {
+    /// The InputScope of `context` as read so far (None: not read yet).
+    fn field_scope(&self, context: &ITfContext) -> Option<yiime_core::FieldScope> {
         self.scope_cache
             .borrow()
             .as_ref()
             .filter(|(cached, _)| cached == context)
-            .is_some_and(|(_, result)| result.get() == Some(true))
+            .and_then(|(_, result)| result.get())
+    }
+    /// Privacy for learning, history and translation: a field whose InputScope is not read yet
+    /// counts as private (yiime_core::treat_as_private).
+    fn private_field(&self, context: &ITfContext) -> bool {
+        yiime_core::treat_as_private(self.field_scope(context))
+    }
+    /// The field is known to be private (read, and password, PIN or IS_PRIVATE).
+    fn known_private(&self, context: &ITfContext) -> bool {
+        self.field_scope(context)
+            .is_some_and(|scope| scope != yiime_core::FieldScope::Normal)
+    }
+    /// The field is known to be a password or PIN field: its letters go to the application. Not
+    /// read yet counts as an ordinary field, so a host that answers late (Word just opened) is
+    /// still typed in.
+    fn password_field(&self, context: &ITfContext) -> bool {
+        self.field_scope(context) == Some(yiime_core::FieldScope::Password)
+    }
+    /// An InputScope read finished: a composition already running in a field that turned out to
+    /// be a password field is committed as typed (the letters, not a candidate) and ended; then
+    /// the box is told the field's privacy.
+    fn scope_arrived(&self) {
+        let password = self
+            .scope_cache
+            .borrow()
+            .as_ref()
+            .filter(|(_, result)| result.get() == Some(yiime_core::FieldScope::Password))
+            .map(|(context, _)| context.clone());
+        if let Some(context) = password.as_ref()
+            && self.inline.active()
+            && self.inline.same_context(context)
+        {
+            log("输入框是密码框：按原样提交已输入的字母并结束组字");
+            self.inline.commit_raw(context, self.client_id.get());
+        }
+        // A draft-box session opened before the read: close the box without committing, so the
+        // password is neither shown nor typed on in the box.
+        let draft_in_password = password.as_ref().is_some_and(|context| {
+            self.buffering() && self.context.borrow().as_ref() == Some(context)
+        });
+        if draft_in_password {
+            self.drop_stale_session("输入框是密码框");
+            return;
+        }
+        self.notify_privacy();
+    }
+    /// The field turned out to be a password field while a composition is running there: commit
+    /// the letters as typed before the key that found it goes to the application.
+    fn finish_in_password(&self, context: &ITfContext) -> bool {
+        if self.buffering()
+            || !self.inline.active()
+            || !self.inline.same_context(context)
+            || !self.password_field(context)
+        {
+            return false;
+        }
+        log("输入框是密码框：按原样提交已输入的字母并结束组字");
+        self.inline.commit_raw(context, self.client_id.get());
+        true
     }
     /// Tells the box whether the session's field is private (WM_APP + 11, wParam = receiver,
     /// lParam 1 = private): no learning, history or translation service there.
@@ -1361,11 +1421,20 @@ impl TextService {
         if !self.buffering() || window.is_null() {
             return;
         }
-        let private = self
-            .context
+        let Some(context) = self.context.borrow().clone() else {
+            return;
+        };
+        // Only the session's own field: a read of another context (a focus change inside the same
+        // window) says nothing about it, and the box keeps what it was told.
+        if !self
+            .scope_cache
             .borrow()
             .as_ref()
-            .is_some_and(|context| self.private_field(context));
+            .is_some_and(|(cached, _)| cached == &context)
+        {
+            return;
+        }
+        let private = self.private_field(&context);
         unsafe {
             PostMessageW(
                 window,
@@ -1398,6 +1467,8 @@ impl TextService {
             return !Self::disabled(context)
                 && self.keyboard_open()
                 && !self.es_password()
+                // While composing, keep the key so OnKeyDown can commit the letters first.
+                && (active || !self.password_field(context))
                 && (active || !caps_lock())
                 && ![VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN]
                     .into_iter()
@@ -1405,7 +1476,8 @@ impl TextService {
                 && (active || !modifier(VK_SHIFT))
                 && self.inline.wants(context, key);
         }
-        if !(0x41..=0x5a).contains(&key) || Self::disabled(context) {
+        if !(0x41..=0x5a).contains(&key) || Self::disabled(context) || self.password_field(context)
+        {
             return false;
         }
         if !self.keyboard_open() {
@@ -1472,6 +1544,7 @@ impl TextService {
             || option(Flag::PunctEnglish)
             || Self::disabled(context)
             || self.es_password()
+            || self.password_field(context)
         {
             return None;
         }
@@ -1508,7 +1581,8 @@ impl TextService {
                 || [VK_CONTROL, VK_MENU, VK_LWIN, VK_RWIN, VK_SHIFT]
                     .into_iter()
                     .any(modifier);
-            let password = !read_only && !english && self.es_password();
+            let password =
+                !read_only && !english && (self.es_password() || self.password_field(context));
             self.note_pass(yiime_core::pass_reason(
                 read_only,
                 english,
@@ -2291,6 +2365,10 @@ impl TextService_Impl {
             return;
         };
         self.probe_new_field(&context);
+        if TextService::disabled(&context) || self.es_password() || self.password_field(&context) {
+            log("翻译模式：当前是密码框或禁用输入的框，不打开草稿框");
+            return;
+        }
         if !self.open_editor(context, 0) {
             log("翻译模式：草稿框未能打开，下一键再试");
         }
@@ -2318,17 +2396,26 @@ impl TextService_Impl {
         *self.scope_cache.borrow_mut() = Some((context.clone(), result.clone()));
         let session: ITfEditSession = ScopeCheck {
             context: context.clone(),
-            result,
+            result: result.clone(),
             receiver: self.receiver.get() as usize,
         }
         .into();
-        let _ = unsafe {
+        let requested = unsafe {
             context.RequestEditSession(
                 self.client_id.get(),
                 &session,
                 TF_ES_ASYNCDONTCARE | TF_ES_READ,
             )
         };
+        if requested.is_err() && result.get().is_none() {
+            // The host refuses read sessions: the scope can never be read, so do not keep the field
+            // "private until read" forever (no translation there at all).
+            log("读取 InputScope 失败，按普通输入框处理");
+            result.set(Some(yiime_core::FieldScope::Normal));
+            unsafe {
+                PostMessageW(self.receiver.get(), WM_SCOPE_READ, 0, 0);
+            }
+        }
         let mut attached = self.edit_sink.borrow_mut();
         if attached.as_ref().is_some_and(|(old, _)| old == &context) {
             return;

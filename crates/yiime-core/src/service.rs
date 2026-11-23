@@ -414,10 +414,46 @@ impl FieldSwitches {
 /// InputScope.h.
 pub const PRIVATE_SCOPES: [i32; 6] = [31, 61, 63, 64, 65, 66];
 
-/// Whether a field's InputScope list marks it private. Such a field is still typed in through
-/// the box, but nothing is learned, kept in the history or sent to a translation service.
+/// InputScope values of password and PIN fields (IS_PASSWORD, IS_NUMERIC_PASSWORD,
+/// IS_NUMERIC_PIN, IS_ALPHANUMERIC_PIN, IS_ALPHANUMERIC_PIN_SET). Letters typed there go straight
+/// to the application, as with the system IMEs: composing would show the password in clear text
+/// in the candidate bar or the draft box.
+pub const PASSWORD_SCOPES: [i32; 5] = [31, 63, 64, 65, 66];
+
+/// What a field's InputScope list says about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldScope {
+    /// An ordinary field.
+    Normal,
+    /// IS_PRIVATE only (e.g. every field of a Chromium private window): typed in as usual, but
+    /// nothing is learned, kept in the history or sent to a translation service.
+    Private,
+    /// A password or PIN field: the IME does not take the letters at all.
+    Password,
+}
+
+/// Classifies a field's InputScope list.
+pub fn field_scope(scopes: &[i32]) -> FieldScope {
+    if scopes.iter().any(|scope| PASSWORD_SCOPES.contains(scope)) {
+        FieldScope::Password
+    } else if scopes.iter().any(|scope| PRIVATE_SCOPES.contains(scope)) {
+        FieldScope::Private
+    } else {
+        FieldScope::Normal
+    }
+}
+
+/// Whether a field's InputScope list marks it private (password, PIN or IS_PRIVATE). Nothing is
+/// learned, kept in the history or sent to a translation service there.
 pub fn private_scope(scopes: &[i32]) -> bool {
-    scopes.iter().any(|scope| PRIVATE_SCOPES.contains(scope))
+    field_scope(scopes) != FieldScope::Normal
+}
+
+/// Privacy of a field whose InputScope may not have been read yet: unknown counts as private, so
+/// the first keys of a session are never learned, recorded or translated before the read
+/// arrives.
+pub fn treat_as_private(scope: Option<FieldScope>) -> bool {
+    scope != Some(FieldScope::Normal)
 }
 
 /// Line heights (physical pixels) trusted as one text line: smaller is a caret sliver, larger
@@ -861,6 +897,27 @@ mod tests {
         assert!(private_scope(&[66])); // IS_ALPHANUMERIC_PIN_SET
         assert!(!private_scope(&[]));
         assert!(!private_scope(&[0, 1, 5])); // default, URL, e-mail
+    }
+
+    #[test]
+    fn password_scopes_are_not_composed_but_private_windows_are() {
+        assert_eq!(field_scope(&[31]), FieldScope::Password); // IS_PASSWORD
+        assert_eq!(field_scope(&[61, 31]), FieldScope::Password); // private window, password
+        assert_eq!(field_scope(&[63]), FieldScope::Password);
+        assert_eq!(field_scope(&[64]), FieldScope::Password);
+        assert_eq!(field_scope(&[65]), FieldScope::Password);
+        assert_eq!(field_scope(&[66]), FieldScope::Password);
+        assert_eq!(field_scope(&[1, 61]), FieldScope::Private); // IS_PRIVATE only
+        assert_eq!(field_scope(&[]), FieldScope::Normal);
+        assert_eq!(field_scope(&[0, 1, 5]), FieldScope::Normal);
+    }
+
+    #[test]
+    fn unknown_scope_is_private_until_read() {
+        assert!(treat_as_private(None));
+        assert!(treat_as_private(Some(FieldScope::Private)));
+        assert!(treat_as_private(Some(FieldScope::Password)));
+        assert!(!treat_as_private(Some(FieldScope::Normal)));
     }
 
     #[test]

@@ -70,15 +70,15 @@ pub use reload::{FileStamp, UserWordsReloader};
 pub use request::RequestGate;
 pub use service::{
     APP_WINDOW_CLASS, Activation, BACKOFF_RESET, BoxView, CommitTarget, DUPLICATE_COMMIT_MS,
-    EMPTY_BOX_GRACE_MS, FIRST_BACKOFF, FieldSwitches, HIGH_INTEGRITY, HostOwner, KeyRoute,
-    LeftField, MAX_BACKOFF, MEDIUM_INTEGRITY, PRIVATE_SCOPES, PassReason, ProcessSecurity,
-    REQUEST_TIMEOUT_MS, SegmentAnchor, ServiceHealth, ShiftTapAction, Startup, TRAY_WINDOW_TITLE,
-    TSF_PROTOCOL, TSF_RECEIVER_CLASS, UnconfirmedCommit, WATCHDOG_GRACE, WATCHDOG_LIMIT, Watchdog,
-    WatchedHosts, caret_anchor, commit_digest, commit_targets, duplicate_commit,
-    english_ends_session, focused_first, handle_from_wire, hide_empty_box, key_route,
-    keys_to_give_back, late_commit_landed, left_field, may_share_service, needs_private_editor,
-    next_held_id, pass_reason, private_scope, redirect_to_focused, service_window_title,
-    shift_tap_action, startup_state,
+    EMPTY_BOX_GRACE_MS, FIRST_BACKOFF, FieldScope, FieldSwitches, HIGH_INTEGRITY, HostOwner,
+    KeyRoute, LeftField, MAX_BACKOFF, MEDIUM_INTEGRITY, PRIVATE_SCOPES, PassReason,
+    ProcessSecurity, REQUEST_TIMEOUT_MS, SegmentAnchor, ServiceHealth, ShiftTapAction, Startup,
+    TRAY_WINDOW_TITLE, TSF_PROTOCOL, TSF_RECEIVER_CLASS, UnconfirmedCommit, WATCHDOG_GRACE,
+    WATCHDOG_LIMIT, Watchdog, WatchedHosts, caret_anchor, commit_digest, commit_targets,
+    duplicate_commit, english_ends_session, field_scope, focused_first, handle_from_wire,
+    hide_empty_box, key_route, keys_to_give_back, late_commit_landed, left_field,
+    may_share_service, needs_private_editor, next_held_id, pass_reason, private_scope,
+    redirect_to_focused, service_window_title, shift_tap_action, startup_state, treat_as_private,
 };
 pub use settings::{
     AZURE_KEY_FILE, ApiSettings, DEFAULT_HISTORY_KEY, DEFAULT_URL, Engine, Flag, GOOGLE_KEY_FILE,

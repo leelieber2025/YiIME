@@ -68,6 +68,11 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 })
                 .map(|(_, _, consume)| *consume)
                 .unwrap_or_else(|| self.should_consume(context, key.0));
+            // Composing in a field just found to be a password field: commit the letters as
+            // typed, then this key goes to the application.
+            if self.finish_in_password(context) {
+                return Ok(false.into());
+            }
             if !self.buffering()
                 && !self.should_consume(context, key.0)
                 && let Some(text) = self.punctuation(context, key.0)
@@ -111,6 +116,11 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     self.inline.cancel(self.client_id.get());
                 }
                 self.probe_new_field(context);
+                // The read may have finished just now (synchronously): never open the box on a
+                // password field.
+                if self.password_field(context) {
+                    return Ok(false.into());
+                }
                 let opened = self.open_editor(context.clone(), key.0 as u8);
                 if !opened {
                     self.note_pass(Some(yiime_core::PassReason::BoxUnavailable));
@@ -134,6 +144,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             if !self.inline.active() && (0x41..=0x5a).contains(&key.0) && launch::draft_box_usable()
             {
                 self.probe_new_field(context);
+                if self.password_field(context) {
+                    return Ok(false.into());
+                }
                 let opened = self.open_editor(context.clone(), key.0 as u8);
                 if !opened {
                     self.note_pass(Some(yiime_core::PassReason::BoxUnavailable));
@@ -206,7 +219,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                     || !self.keyboard_open()
                     || TextService::disabled(context)
                     || self.es_password()
-                    || self.private_field(context)
+                    || self.known_private(context)
                 {
                     return Ok(false.into());
                 }

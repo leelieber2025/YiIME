@@ -1082,7 +1082,9 @@ unsafe fn activate(hwnd: HWND, state: &State, target: HWND, anchor: Option<RECT>
     state.finished.set(false);
     state.pending.set(false);
     state.recall_session.set(false);
-    state.private_field.set(false);
+    // A TSF session counts as private (no learning, history or translation) until the DLL reports
+    // the field's InputScope (WM_TSF_PRIVATE, sent for every session once the box is ready).
+    state.private_field.set(state.tsf_service);
     state.history_pos.set(None);
     state.english.set(false);
     state.generation.set(state.generation.get() + 1);

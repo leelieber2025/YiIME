@@ -122,7 +122,7 @@ unsafe fn receiver_proc_impl(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> 
         let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TextService_Impl };
         if !pointer.is_null() {
             if message == WM_SCOPE_READ {
-                unsafe { (*pointer).notify_privacy() };
+                unsafe { (*pointer).scope_arrived() };
             } else {
                 unsafe { (*pointer).caret_arrived() };
             }

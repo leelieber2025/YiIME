@@ -1413,6 +1413,21 @@ impl InlineInput {
             accepted
         }
     }
+    /// Commits the letters typed so far as they are (not a candidate) and ends the composition:
+    /// used when the field turns out to be a password field after the first key.
+    pub(super) fn commit_raw(&self, context: &ITfContext, client_id: u32) -> bool {
+        let code = self
+            .ui
+            .state
+            .borrow()
+            .as_ref()
+            .filter(|state| state.context == *context)
+            .map(|state| state.code.clone());
+        match code {
+            Some(code) => self.edit(context, client_id, Action::Finish(code)),
+            None => false,
+        }
+    }
     pub(super) fn cancel(&self, client_id: u32) {
         let Some(state) = self.ui.state.borrow_mut().take() else {
             self.ui.end_ui();
