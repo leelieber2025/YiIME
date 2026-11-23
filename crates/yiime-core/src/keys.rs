@@ -84,7 +84,6 @@ pub fn classify_char(ch: char, context: &KeyContext) -> KeyAction {
     if ch == '\n' {
         return KeyAction::SubmitChinese;
     }
-    // Numpad digits never pick candidates.
     if context.numpad && ch.is_ascii_digit() {
         return KeyAction::FlushThenPass;
     }

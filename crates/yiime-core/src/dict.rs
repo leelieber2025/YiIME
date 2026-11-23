@@ -822,7 +822,7 @@ impl MixedInput {
     }
 }
 
-/// Separator positions in the code with separators removed: `xi'an` → [2].
+/// Separator positions in the code with separators removed: `xi'an` → `[2]`.
 fn boundaries(code: &str, separator: char) -> Vec<usize> {
     let mut letters = 0;
     let mut result = Vec::new();

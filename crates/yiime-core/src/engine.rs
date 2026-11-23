@@ -292,7 +292,6 @@ impl Composer {
             code.push(letter);
             self.set_code(input, code.clone(), options, learned);
         }
-        // A unique four-letter Wubi code commits itself.
         let auto = wubi_rules && rules.auto_commit4 && auto_commits_four(input, &code);
         if let Some(pick) = self.candidate_at(0).filter(|_| auto) {
             picks.push(pick);

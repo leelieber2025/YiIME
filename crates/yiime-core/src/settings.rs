@@ -237,7 +237,7 @@ pub struct ApiSettings {
     /// Azure Translator key (stored encrypted in [`AZURE_KEY_FILE`]) and resource region.
     pub azure_key: String,
     pub azure_region: String,
-    /// DeepL API key (stored encrypted in [`DEEPL_KEY_FILE`]). A key ending in `:fx` uses the free
+    /// DeepL API key (stored encrypted in `DEEPL_KEY_FILE`). A key ending in `:fx` uses the free
     /// endpoint.
     pub deepl_key: String,
 }
