@@ -6,9 +6,21 @@
 
 ## [Unreleased]
 
+## [0.2.1-rc.3] - 2026-11-22
+
+候选版本。包含 0.2.1-rc.2 的全部内容，另外：
+
+### 修复
+
+- **资源管理器搜索框仍然只能打进一个字**（rc.2）：资源管理器在第一次上屏后，把后面的按键从同一窗口的另一个子窗口（另一个文档）交过来；rc.2 会把这当成换了输入框而重开会话，或者把字写进一个接受但不显示的旧上下文。现在像 qingjian 一样以最后一次按键所在的输入框为准：同一窗口另一个子窗口来的按键继续当前会话；上屏时优先投给持有键盘焦点的那个输入框。日志记录判断依据（窗口类名，不含内容）。
+
+### 已知问题
+
+- Windows 开始菜单搜索、设置等 UWP/沙箱应用里暂时不能使用 YiIME，计划在 0.3 支持。
+
 ## [0.2.1-rc.2] - 2026-11-22
 
-候选版本。包含 0.2.1-rc.1 的全部内容（rc.1 未打 tag，见下一节），另外：
+未打 tag（测试构建，提交 c7abe11），内容并入 0.2.1-rc.3。候选版本。包含 0.2.1-rc.1 的全部内容（rc.1 未打 tag，见下一节），另外：
 
 ### 修复
 
@@ -40,7 +52,7 @@
 
 ## [0.2.0] - 2026-11-22 [已撤回]
 
-已撤回（Office 刚打开时无法输入），请使用 0.2.1-rc.2 或更新版本。以下汇总 0.1.5 以来的变化，0.2.1-rc.2 同样包含（各候选版本的详细记录见下方 0.2.0-rc.4、rc.2、rc.1；rc.3 已撤回，内容并入 rc.4）。**升级后请重启电脑**；从 0.1.x 升级时设置、用户词库和输入记忆自动迁移。
+已撤回（Office 刚打开时无法输入），请使用 0.2.1-rc.3 或更新版本。以下汇总 0.1.5 以来的变化，0.2.1-rc.3 同样包含（各候选版本的详细记录见下方 0.2.0-rc.4、rc.2、rc.1；rc.3 已撤回，内容并入 rc.4）。**升级后请重启电脑**；从 0.1.x 升级时设置、用户词库和输入记忆自动迁移。
 
 ### 新增
 
@@ -262,8 +274,9 @@ Linux：
 
 - 命令行工具 `yiime`（`query` 查候选、`translate` 测试翻译），提供 tar.gz 与 .deb。
 
-[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.1-rc.2...HEAD
-[0.2.1-rc.2]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.2...v0.2.1-rc.2
+[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.1-rc.3...HEAD
+[0.2.1-rc.3]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.2...v0.2.1-rc.3
+[0.2.1-rc.2]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.2...c7abe11
 [0.2.1-rc.1]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.2...a4a5b1f
 [0.2.0]: https://github.com/leelieber2025/YiIME/compare/v0.1.5...6246776275301d7881677fec385fe35df71003a5
 [0.2.0-rc.4]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.2...161f51922f35bbe926f0b92e9c7f90a415eef690
