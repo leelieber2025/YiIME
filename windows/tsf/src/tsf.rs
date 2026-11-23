@@ -32,12 +32,12 @@ use windows::Win32::UI::TextServices::{
     ITfInsertAtSelection, ITfKeyEventSink, ITfKeyEventSink_Impl, ITfKeystrokeMgr,
     ITfLangBarItem_Impl, ITfLangBarItemButton, ITfLangBarItemButton_Impl, ITfLangBarItemMgr,
     ITfLangBarItemSink, ITfMenu, ITfSource, ITfSource_Impl, ITfTextEditSink, ITfTextEditSink_Impl,
-    ITfTextInputProcessor, ITfTextInputProcessor_Impl, ITfThreadMgr, ITfThreadMgrEventSink,
-    ITfThreadMgrEventSink_Impl, TF_AE_END, TF_ANCHOR_END, TF_ANCHOR_START,
-    TF_CONVERSIONMODE_NATIVE, TF_DEFAULT_SELECTION, TF_E_NOOBJECT, TF_ES_ASYNCDONTCARE, TF_ES_READ,
-    TF_ES_READWRITE, TF_LANGBARITEMINFO, TF_LBI_CLK_RIGHT, TF_LBI_ICON, TF_LBI_STYLE_BTN_BUTTON,
-    TF_LBI_TEXT, TF_LBI_TOOLTIP, TF_MOD_ALT, TF_MOD_CONTROL, TF_MOD_SHIFT, TF_PRESERVEDKEY,
-    TF_SD_READONLY, TF_SELECTION, TF_SELECTIONSTYLE, TfLBIClick,
+    ITfTextInputProcessor, ITfTextInputProcessor_Impl, ITfThreadFocusSink, ITfThreadFocusSink_Impl,
+    ITfThreadMgr, ITfThreadMgrEventSink, ITfThreadMgrEventSink_Impl, TF_AE_END, TF_ANCHOR_END,
+    TF_ANCHOR_START, TF_CONVERSIONMODE_NATIVE, TF_DEFAULT_SELECTION, TF_E_NOOBJECT,
+    TF_ES_ASYNCDONTCARE, TF_ES_READ, TF_ES_READWRITE, TF_LANGBARITEMINFO, TF_LBI_CLK_RIGHT,
+    TF_LBI_ICON, TF_LBI_STYLE_BTN_BUTTON, TF_LBI_TEXT, TF_LBI_TOOLTIP, TF_MOD_ALT, TF_MOD_CONTROL,
+    TF_MOD_SHIFT, TF_PRESERVEDKEY, TF_SD_READONLY, TF_SELECTION, TF_SELECTIONSTYLE, TfLBIClick,
 };
 use windows::core::{
     BOOL, BSTR, GUID, HRESULT, IUnknown, IUnknownImpl, Interface, Ref, Result, implement,
@@ -790,6 +790,7 @@ type ModeButton = Option<(ITfLangBarItemButton, Vec<(ITfSource, u32)>, LangBarSi
     ITfTextInputProcessor,
     ITfKeyEventSink,
     ITfThreadMgrEventSink,
+    ITfThreadFocusSink,
     ITfTextEditSink
 )]
 struct TextService {
@@ -833,6 +834,8 @@ struct TextService {
     private: Cell<Option<bool>>,
     scope_cache: RefCell<ScopeCache>,
     manager_sink_cookie: Cell<Option<u32>>,
+    /// ITfThreadFocusSink advise cookie.
+    focus_sink_cookie: Cell<Option<u32>>,
     edit_sink: RefCell<Option<(ITfContext, u32)>>,
     tested_key: RefCell<Option<(ITfContext, usize, bool)>>,
     mode_button: RefCell<ModeButton>,
@@ -878,6 +881,7 @@ impl TextService {
             private: Cell::new(None),
             scope_cache: RefCell::new(None),
             manager_sink_cookie: Cell::new(None),
+            focus_sink_cookie: Cell::new(None),
             edit_sink: RefCell::new(None),
             tested_key: RefCell::new(None),
             mode_button: RefCell::new(None),
@@ -1909,6 +1913,12 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
                 {
                     self.manager_sink_cookie.set(Some(cookie));
                 }
+                let focus_sink: ITfThreadFocusSink = self.to_interface();
+                if let Ok(cookie) =
+                    unsafe { source.AdviseSink(&ITfThreadFocusSink::IID, &focus_sink) }
+                {
+                    self.focus_sink_cookie.set(Some(cookie));
+                }
             }
             log("Activate");
             TextService::ensure_keyboard_mode(&manager, client_id);
@@ -1975,10 +1985,16 @@ impl ITfTextInputProcessor_Impl for TextService_Impl {
             }
             if let Some(manager) = self.thread_manager.borrow_mut().take() {
                 self.remove_mode_button(&manager);
-                if let Some(cookie) = self.manager_sink_cookie.take()
-                    && let Ok(source) = manager.cast::<ITfSource>()
-                {
-                    let _ = unsafe { source.UnadviseSink(cookie) };
+                if let Ok(source) = manager.cast::<ITfSource>() {
+                    for cookie in [
+                        self.manager_sink_cookie.take(),
+                        self.focus_sink_cookie.take(),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    {
+                        let _ = unsafe { source.UnadviseSink(cookie) };
+                    }
                 }
                 if let Ok(keystroke) = manager.cast::<ITfKeystrokeMgr>() {
                     let _ = unsafe { keystroke.UnpreserveKey(&TOGGLE_KEY, &TOGGLE_CHORD) };
@@ -2057,6 +2073,28 @@ impl ITfThreadMgrEventSink_Impl for TextService_Impl {
     fn OnPopContext(&self, _context: Ref<ITfContext>) -> Result<()> {
         com_guard("OnPopContext", || {
             self.tested_key.borrow_mut().take();
+            Ok(())
+        })
+    }
+}
+/// Window switches reach here, not ITfKeyEventSink::OnSetFocus (qingjian com/focus.rs). Gaining
+/// the focus picks up a mode changed in another application (qingjian service/mode.rs
+/// set_thread_focus); losing it hides an empty box. Unlike qingjian it does not commit: the
+/// input box itself takes the focus from the application for every session.
+impl ITfThreadFocusSink_Impl for TextService_Impl {
+    fn OnSetThreadFocus(&self) -> Result<()> {
+        com_guard("OnSetThreadFocus", || {
+            self.tested_key.borrow_mut().take();
+            self.shift_down.set(None);
+            self.sync_plain_mode();
+            self.refresh_mode_button();
+            Ok(())
+        })
+    }
+    fn OnKillThreadFocus(&self) -> Result<()> {
+        com_guard("OnKillThreadFocus", || {
+            self.shift_down.set(None);
+            self.notify_focus_moved();
             Ok(())
         })
     }
