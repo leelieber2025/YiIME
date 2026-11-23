@@ -152,7 +152,10 @@ const WM_TSF_FOCUS_MOVED: u32 = WM_APP + 8;
 const WM_TSF_ENGLISH: u32 = WM_APP + 9;
 /// Tray (portable) and TSF editor instances use different titles so each can find its single
 /// instance.
-const TRAY_TITLE: &str = "YiIME 译 · 托盘";
+const TRAY_TITLE: &str = yiime_core::TRAY_WINDOW_TITLE;
+/// Window classes of the input-history and settings windows (this EXE only).
+const HISTORY_CLASS: &str = "YiIMEHistory";
+const SETTINGS_CLASS: &str = "YiIMESettings";
 const APP_NAME: &str = "YiIME 译";
 const NIN_KEYSELECT: u32 = NIN_SELECT | 1;
 static TRAY_V4: AtomicBool = AtomicBool::new(false);
@@ -1659,6 +1662,17 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             if let Some(state) = state
                 && state.tsf_service
                 && w != 0
+                && l != 0
+                && w as HWND != state.tsf_receiver.get()
+                && is_tsf_receiver(w as HWND)
+            {
+                // A parked field of an application this box no longer serves: nothing to commit,
+                // but release the id, or that application's next commit would go to the old field.
+                service_log("session end: parked field of another application released");
+                unsafe { send_tsf_held(w as HWND, hwnd, l as u64, "") };
+            } else if let Some(state) = state
+                && state.tsf_service
+                && w != 0
                 && w as HWND == state.tsf_receiver.get()
             {
                 if l != 0 {
@@ -1990,7 +2004,7 @@ pub fn run() {
     let wants_history = args.iter().any(|arg| arg == "--history");
     unsafe {
         let instance = GetModuleHandleW(null());
-        let class = wide("InputTranslationWindow");
+        let class = wide(yiime_core::APP_WINDOW_CLASS);
         let smoke_test = SELF_TEST.load(Ordering::Relaxed);
         if !tsf_mode && !smoke_test {
             ensure_tip_in_language_list();
@@ -2020,7 +2034,7 @@ pub fn run() {
             ..std::mem::zeroed()
         };
         RegisterClassW(&wc);
-        let history_class = wide("InputTranslationHistory");
+        let history_class = wide(HISTORY_CLASS);
         let wc = WNDCLASSW {
             lpfnWndProc: Some(history_proc),
             hIcon: app_icon(GetSystemMetrics(SM_CXICON)),
@@ -2031,7 +2045,7 @@ pub fn run() {
             ..std::mem::zeroed()
         };
         RegisterClassW(&wc);
-        let settings_class = wide("InputTranslationSettings");
+        let settings_class = wide(SETTINGS_CLASS);
         let wc = WNDCLASSW {
             lpfnWndProc: Some(settings_proc),
             hIcon: app_icon(GetSystemMetrics(SM_CXICON)),

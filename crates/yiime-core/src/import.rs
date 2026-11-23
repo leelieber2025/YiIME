@@ -145,6 +145,11 @@ pub fn parse_scel(bytes: &[u8]) -> Result<Vec<ImportedWord>, &'static str> {
             at += 2 + word_len;
             let extra = u16_at(at)?;
             at += 2 + extra;
+            // Same rule as text exports: only Chinese words, so a word with spaces or line breaks
+            // cannot break the `word code` lines of the user words file.
+            if word.is_empty() || !word.chars().all(is_han) {
+                continue;
+            }
             if let Some(code) = pinyin_code(&code) {
                 words.push((word, code));
             }
@@ -243,9 +248,9 @@ mod tests {
             bytes.extend(text);
         }
         bytes.resize(SCEL_WORDS, 0);
-        // Two homophones under ni'hao, one word under lv.
-        bytes.extend([2, 0, 4, 0, 0, 0, 1, 0]);
-        for word in ["你好", "拟好"] {
+        // Three words under ni'hao (one not Chinese, skipped), one word under lv.
+        bytes.extend([3, 0, 4, 0, 0, 0, 1, 0]);
+        for word in ["你好", "坏 词\n", "拟好"] {
             let text = utf16(word);
             bytes.extend((text.len() as u16).to_le_bytes());
             bytes.extend(text);

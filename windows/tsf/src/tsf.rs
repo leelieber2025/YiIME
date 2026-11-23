@@ -587,12 +587,17 @@ impl TextService {
         let id = self.hold_context();
         let editor_window = self.editor_window.get();
         let receiver = self.receiver.get();
-        if editor_window.is_null() || receiver.is_null() {
+        if editor_window.is_null() || receiver.is_null() || unsafe { IsWindow(editor_window) } == 0
+        {
+            // No box to send the field back: release it now, or the next session's first commit
+            // would go there.
+            self.clear_held();
             return;
         }
         // Synchronous, so a translation result already queued on the box is applied only after
         // this session's Chinese has been committed and the draft cleared. If the box does not
-        // answer, post it; a second delivery only releases an id that was already used.
+        // answer in time, post it (a second delivery only releases an id that was already used);
+        // if even that fails nobody will release the field, so release it here.
         let answered = unsafe {
             let mut result = 0usize;
             SendMessageTimeoutW(
@@ -601,14 +606,15 @@ impl TextService {
                 receiver as usize,
                 id as isize,
                 SMTO_ABORTIFHUNG,
-                1000,
+                yiime_core::REQUEST_TIMEOUT_MS,
                 &mut result,
             ) != 0
         };
-        if !answered {
-            unsafe {
-                let _ = PostMessageW(editor_window, WM_APP + 8, receiver as usize, id as isize);
-            }
+        if !answered
+            && unsafe { PostMessageW(editor_window, WM_APP + 8, receiver as usize, id as isize) }
+                == 0
+        {
+            self.clear_held();
         }
     }
     /// Moves the current text field aside so a new session can replace it. Returns the id the box
@@ -645,7 +651,7 @@ fn find_editor_service(
     exe: &std::path::Path,
     host: &yiime_core::ProcessSecurity,
 ) -> Option<(HWND, u32)> {
-    let class = wide("InputTranslationWindow");
+    let class = wide(yiime_core::APP_WINDOW_CLASS);
     let title = wide(&yiime_core::service_window_title(host.integrity, false));
     let expected = exe.to_string_lossy().to_lowercase();
     let mut window: HWND = null_mut();
@@ -696,8 +702,8 @@ fn open_tray_window(history: bool) {
     }
     let tray = unsafe {
         FindWindowW(
-            wide("InputTranslationWindow").as_ptr(),
-            wide("YiIME 译 · 托盘").as_ptr(),
+            wide(yiime_core::APP_WINDOW_CLASS).as_ptr(),
+            wide(yiime_core::TRAY_WINDOW_TITLE).as_ptr(),
         )
     };
     if !tray.is_null() {

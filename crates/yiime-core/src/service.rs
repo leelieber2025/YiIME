@@ -138,6 +138,10 @@ pub fn may_share_service(host: &ProcessSecurity, service: Option<&ProcessSecurit
 pub const TSF_PROTOCOL: u32 = 3;
 /// Window class of the TSF DLL's receiver window (the input box accepts sessions only from it).
 pub const TSF_RECEIVER_CLASS: &str = concat!("YiIMETsfReceiver.", 3);
+/// Window class of YiIME.exe's tray and input-box windows, which the TSF DLL looks up.
+pub const APP_WINDOW_CLASS: &str = "YiIMEWindow";
+/// Title of the tray instance's window: the TSF DLL asks it to open settings or history.
+pub const TRAY_WINDOW_TITLE: &str = "YiIME 译 · 托盘";
 
 /// Window title of the input box: the shared service has one per integrity level (FindWindow only
 /// sees the caller's session and desktop, and the DLL checks the process as well); a private box

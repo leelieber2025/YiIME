@@ -65,7 +65,7 @@ pub(super) unsafe fn open_history() {
     let window = unsafe {
         CreateWindowExW(
             ex_style,
-            wide("InputTranslationHistory").as_ptr(),
+            wide(HISTORY_CLASS).as_ptr(),
             wide("YiIME 译 · 输入记忆").as_ptr(),
             style,
             (GetSystemMetrics(SM_CXSCREEN) - width) / 2,

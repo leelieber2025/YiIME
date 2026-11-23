@@ -34,7 +34,7 @@ pub(super) unsafe fn open_settings(owner: HWND) {
     let window = unsafe {
         CreateWindowExW(
             ex_style,
-            wide("InputTranslationSettings").as_ptr(),
+            wide(SETTINGS_CLASS).as_ptr(),
             wide(concat!("YiIME 译 · 设置 · v", env!("CARGO_PKG_VERSION"))).as_ptr(),
             style,
             x,

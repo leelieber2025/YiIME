@@ -1,5 +1,5 @@
 //! Settings model. Switches, shortcuts and page size go through [`OptionStore`]
-//! (`HKCU\Software\InputTranslation` on Windows, shared by the TSF DLL and the EXE); API settings
+//! (`HKCU\Software\YiIME` on Windows, shared by the TSF DLL and the EXE); API settings
 //! live in settings.json, and keys are encrypted with [`Sealer`] and stored separately (DPAPI on
 //! Windows).
 
