@@ -652,6 +652,18 @@ fn window_class(window: HWND) -> String {
     let len = unsafe { GetClassNameW(window, class.as_mut_ptr(), class.len() as i32) } as usize;
     String::from_utf16_lossy(&class[..len])
 }
+/// The host process is explorer.exe (File Explorer, also the desktop and taskbar).
+fn host_is_explorer() -> bool {
+    static EXPLORER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EXPLORER.get_or_init(|| {
+        let mut module = [0u16; 260];
+        let len = unsafe { GetModuleFileNameW(None, &mut module) } as usize;
+        let host = String::from_utf16_lossy(&module[..len.min(module.len())]);
+        host.rsplit('\\')
+            .next()
+            .is_some_and(|name| name.eq_ignore_ascii_case("explorer.exe"))
+    })
+}
 fn context_window(context: &ITfContext) -> HWND {
     unsafe { context.GetActiveView() }
         .and_then(|view| unsafe { view.GetWnd() })
@@ -1448,6 +1460,13 @@ impl TextService {
         {
             log(&format!("按键交给应用：{}", reason.describe()));
         }
+    }
+    /// Whether 译 mode may open the draft box here. Hosts that cannot use it (AppContainer,
+    /// elevated) and explorer.exe compose Wubi in the document instead, as the Start menu search
+    /// does: Explorer's search box (a WinUI island) and rename field lose the text when the draft
+    /// box takes the focus, so a translation cannot be committed there.
+    fn draft_box_usable(&self, _context: &ITfContext) -> bool {
+        launch::draft_box_usable() && !host_is_explorer()
     }
     fn wants_key(&self, context: &ITfContext, key: usize) -> bool {
         if running_in_editor() {
@@ -2361,6 +2380,10 @@ impl TextService_Impl {
             log("翻译模式：没有焦点输入框，下一键打开草稿框");
             return;
         };
+        if !self.draft_box_usable(&context) {
+            log("翻译模式：此输入框不能使用草稿框，在文档内组字");
+            return;
+        }
         self.probe_new_field(&context);
         if TextService::disabled(&context) || self.es_password() || self.password_field(&context) {
             log("翻译模式：当前是密码框或禁用输入的框，不打开草稿框");

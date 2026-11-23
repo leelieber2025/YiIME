@@ -110,8 +110,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             // in-document composition. AppContainer hosts (SearchHost / Start menu) cannot
             // open the box and often cannot read PlainMode from HKCU, so they would otherwise
             // stay in 译 and hand Latin letters back to the search box. Keep SampleIME-style
-            // in-document composition there, as e255d84 did.
-            if !plain_mode() && (0x41..=0x5a).contains(&key.0) && launch::draft_box_usable() {
+            // in-document composition there, as e255d84 did. File Explorer (search box, rename,
+            // explorer.exe in general) is treated the same way.
+            if !plain_mode() && (0x41..=0x5a).contains(&key.0) && self.draft_box_usable(context) {
                 if self.inline.active() {
                     self.inline.cancel(self.client_id.get());
                 }
@@ -130,7 +131,7 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             }
             if !plain_mode()
                 && (0x41..=0x5a).contains(&key.0)
-                && !launch::draft_box_usable()
+                && !self.draft_box_usable(context)
                 && !NOTED_INLINE_FALLBACK.swap(true, Ordering::Relaxed)
             {
                 log("翻译模式：此宿主不能打开草稿框，改在文档内组字");
@@ -141,7 +142,9 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             // The host did not accept the composition session. Fall back to the draft box
             // rather than swallowing a key OnTestKeyDown already claimed. Skip the box in
             // hosts that cannot use it, and give the key back.
-            if !self.inline.active() && (0x41..=0x5a).contains(&key.0) && launch::draft_box_usable()
+            if !self.inline.active()
+                && (0x41..=0x5a).contains(&key.0)
+                && self.draft_box_usable(context)
             {
                 self.probe_new_field(context);
                 if self.password_field(context) {
