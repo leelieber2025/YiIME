@@ -22,6 +22,30 @@ impl FileStamp {
     }
 }
 
+/// Stamps of the API settings: settings.json and the encrypted key files. The settings window
+/// runs in the tray process while the resident input box (another process) translates, so the
+/// box compares this stamp before each translation and reloads the settings when it changed;
+/// otherwise a new engine (DeepL, LLM…) only took effect after the box restarted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SettingsStamp([FileStamp; 5]);
+
+impl SettingsStamp {
+    pub fn of(dir: &Path) -> Self {
+        use crate::settings::SETTINGS_FILE;
+        use crate::settings::{AZURE_KEY_FILE, DEEPL_KEY_FILE, GOOGLE_KEY_FILE, KEY_FILE};
+        Self(
+            [
+                SETTINGS_FILE,
+                KEY_FILE,
+                GOOGLE_KEY_FILE,
+                AZURE_KEY_FILE,
+                DEEPL_KEY_FILE,
+            ]
+            .map(|name| FileStamp::of(&dir.join(name))),
+        )
+    }
+}
+
 /// Watches the user words file of one process.
 #[derive(Debug)]
 pub struct UserWordsReloader {
@@ -101,5 +125,26 @@ mod tests {
         assert_eq!(reloader.check(), None);
         let _ = std::fs::remove_dir(&dir);
         assert_eq!(UserWordsReloader::load(None).0.check(), None);
+    }
+
+    #[test]
+    fn settings_stamp_changes_when_another_process_saves() {
+        use crate::settings::{ApiSettings, Engine, PlainSealer};
+        let dir = std::env::temp_dir().join(format!("yiime-stamp-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let empty = SettingsStamp::of(&dir);
+        let mut settings = ApiSettings::default();
+        settings.save(&dir, &PlainSealer).unwrap();
+        let saved = SettingsStamp::of(&dir);
+        assert_ne!(empty, saved);
+        assert_eq!(saved, SettingsStamp::of(&dir));
+        // "azure" and "deepl" have the same length: a key file appearing still changes it.
+        settings.engine = Engine::DeepL;
+        settings.deepl_key = "k:fx".to_owned();
+        settings.save(&dir, &PlainSealer).unwrap();
+        let deepl = SettingsStamp::of(&dir);
+        assert_ne!(saved, deepl);
+        assert_eq!(ApiSettings::load(&dir, &PlainSealer).engine, Engine::DeepL);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

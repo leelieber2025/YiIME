@@ -318,6 +318,8 @@ struct State {
     /// Status line: (text, is error).
     status: RefCell<Option<(String, bool)>>,
     settings: RefCell<ApiSettings>,
+    /// Stamp of the settings files behind `settings` (see [`current_settings`]).
+    settings_stamp: Cell<Option<yiime_core::SettingsStamp>>,
     settings_window: Cell<HWND>,
     /// Dialog font for the settings window (message font, scaled to the window DPI).
     settings_font: Cell<HFONT>,
@@ -852,6 +854,25 @@ unsafe fn protect(data: &[u8], encrypt: bool) -> Option<Vec<u8>> {
 fn load_settings() -> ApiSettings {
     settings_dir().map_or_else(ApiSettings::default, |dir| ApiSettings::load(&dir, &Dpapi))
 }
+/// The API settings as saved now. The settings window usually runs in the tray process while
+/// this resident input box translates, so a saved change (another engine, a new key) is picked up
+/// here by the file stamps instead of waiting for the box to restart.
+fn current_settings(state: &State) -> ApiSettings {
+    if let Some(dir) = settings_dir() {
+        let stamp = yiime_core::SettingsStamp::of(&dir);
+        if state.settings_stamp.get() != Some(stamp) {
+            let settings = ApiSettings::load(&dir, &Dpapi);
+            service_log(&format!(
+                "settings reloaded: engine={} fallback={}",
+                settings.engine.id(),
+                settings.allow_fallback
+            ));
+            *state.settings.borrow_mut() = settings;
+            state.settings_stamp.set(Some(stamp));
+        }
+    }
+    state.settings.borrow().clone()
+}
 fn save_settings(settings: &ApiSettings) -> std::io::Result<()> {
     let dir = settings_dir().ok_or_else(|| std::io::Error::other("找不到 APPDATA"))?;
     settings.save(&dir, &Dpapi)
@@ -1104,7 +1125,7 @@ unsafe fn activate(hwnd: HWND, state: &State, target: HWND, anchor: Option<RECT>
     // Warm up the connection to the translation server while typing (no key or text; at most
     // once per 30 s).
     if !plain_mode() {
-        let settings = state.settings.borrow().clone();
+        let settings = current_settings(state);
         std::thread::spawn(move || yiime_core::prewarm(&settings));
     }
     unsafe {
@@ -1320,7 +1341,7 @@ unsafe fn submit(hwnd: HWND, state: &State, chinese: bool) {
         }
         return;
     }
-    let settings = state.settings.borrow().clone();
+    let settings = current_settings(state);
     if let Err(error) = settings.validate() {
         unsafe {
             set_status(hwnd, state, Some((error.into(), true)));
@@ -2046,6 +2067,9 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
             draft_h: Cell::new(EDIT_H),
             composition: RefCell::new(Composition::default()),
             status: RefCell::new(None),
+            settings_stamp: Cell::new(
+                settings_dir().map(|dir| yiime_core::SettingsStamp::of(&dir)),
+            ),
             settings: RefCell::new(load_settings()),
             settings_window: Cell::new(null_mut()),
             settings_font: Cell::new(null_mut()),
@@ -2314,7 +2338,7 @@ pub fn run() {
             notify_tsf_ready(receiver, hwnd);
         } else if wants_history {
             open_history();
-        } else if wants_settings || state.settings.borrow().validate().is_err() {
+        } else if wants_settings || current_settings(state).validate().is_err() {
             open_settings(hwnd);
         }
         if state.tsf_service && !SELF_TEST.load(Ordering::Relaxed) {

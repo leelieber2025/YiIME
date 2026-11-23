@@ -565,7 +565,7 @@ pub(super) unsafe extern "system" fn settings_proc(
             let Some(state) = state_of(owner) else {
                 return -1;
             };
-            let settings = state.settings.borrow().clone();
+            let settings = current_settings(state);
             let dpi = window_dpi(hwnd);
             let font = settings_dialog_font(dpi);
             let previous = state.settings_font.replace(font);
@@ -1052,6 +1052,9 @@ pub(super) unsafe extern "system" fn settings_proc(
                         message(hwnd, &format!("保存设置失败：{error}"));
                     } else {
                         *state.settings.borrow_mut() = settings;
+                        state
+                            .settings_stamp
+                            .set(settings_dir().map(|dir| yiime_core::SettingsStamp::of(&dir)));
                         if state
                             .status
                             .borrow()

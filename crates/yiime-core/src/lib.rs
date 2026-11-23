@@ -66,7 +66,7 @@ pub use learn::{
     HALF_LIFE_DAYS, LEARNED_FILE, LEGACY_LEARNED_FILE, Learned, MAX_ENTRIES, PROMOTE_SCORE,
     write_atomically,
 };
-pub use reload::{FileStamp, UserWordsReloader};
+pub use reload::{FileStamp, SettingsStamp, UserWordsReloader};
 pub use request::RequestGate;
 pub use service::{
     APP_WINDOW_CLASS, Activation, BACKOFF_RESET, BoxView, CommitTarget, DUPLICATE_COMMIT_MS,
