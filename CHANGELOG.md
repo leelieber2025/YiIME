@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-23
+
+**升级后请重启电脑。**
+
 ### 修复
 
 - 浏览器网页密码框不再明文显示密码：密码、PIN 框不启用输入法，字母直接交给应用。
@@ -298,7 +302,8 @@ Linux：
 
 - 命令行工具 `yiime`（`query` 查候选、`translate` 测试翻译），提供 tar.gz 与 .deb。
 
-[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.2...HEAD
+[0.2.2]: https://github.com/leelieber2025/YiIME/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/leelieber2025/YiIME/compare/v0.1.5...v0.2.1
 [0.2.1-rc.3]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.2...v0.2.1-rc.3
 [0.2.1-rc.2]: https://github.com/leelieber2025/YiIME/compare/v0.2.0-rc.2...c7abe11
