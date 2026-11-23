@@ -75,9 +75,9 @@ pub use service::{
     REQUEST_TIMEOUT_MS, ServiceHealth, ShiftTapAction, Startup, TRAY_WINDOW_TITLE, TSF_PROTOCOL,
     TSF_RECEIVER_CLASS, UnconfirmedCommit, WATCHDOG_GRACE, WATCHDOG_LIMIT, Watchdog, WatchedHosts,
     caret_anchor, commit_digest, commit_targets, duplicate_commit, english_ends_session,
-    hide_empty_box, key_route, keys_to_give_back, late_commit_landed, left_field,
-    may_share_service, needs_private_editor, pass_reason, private_scope, service_window_title,
-    shift_tap_action, startup_state,
+    handle_from_wire, hide_empty_box, key_route, keys_to_give_back, late_commit_landed, left_field,
+    may_share_service, needs_private_editor, next_held_id, pass_reason, private_scope,
+    service_window_title, shift_tap_action, startup_state,
 };
 pub use settings::{
     AZURE_KEY_FILE, ApiSettings, DEFAULT_HISTORY_KEY, DEFAULT_URL, Engine, Flag, GOOGLE_KEY_FILE,

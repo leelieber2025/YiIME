@@ -1456,6 +1456,22 @@ unsafe fn on_translated(hwnd: HWND, state: &State, response: TranslationResult) 
     }
 }
 unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    // wParam of the TSF messages (and WM_COPYDATA's sender) is a window of the DLL's process,
+    // which may be a 32-bit application: compare it in canonical form.
+    let w = if matches!(
+        msg,
+        WM_COPYDATA
+            | WM_TSF_ACTIVATE
+            | WM_TSF_EXIT
+            | WM_TSF_FOCUS_MOVED
+            | WM_TSF_ENGLISH
+            | WM_TSF_COMMITTED
+            | WM_TSF_PRIVATE
+    ) {
+        yiime_core::handle_from_wire(w as u64) as WPARAM
+    } else {
+        w
+    };
     let state = unsafe { state_of(hwnd) };
     if let Some(state) = state
         && msg == state.taskbar_created
@@ -1905,8 +1921,10 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
     };
     let handle = |name: &str| {
         argument(name)
-            .and_then(|value| value.parse::<usize>().ok())
-            .map_or(null_mut(), |value| value as HWND)
+            .and_then(|value| value.parse::<u64>().ok())
+            .map_or(null_mut(), |value| {
+                yiime_core::handle_from_wire(value) as HWND
+            })
     };
     let tsf_receiver = handle("--tsf-hwnd");
     let target = handle("--target-hwnd");

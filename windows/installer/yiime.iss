@@ -35,6 +35,9 @@
 #define Repo "..\.."
 #define Exe "YiIME.exe"
 #define Dll "yiime_tsf.dll"
+; 32-bit DLL for 32-bit applications, registered with the 32-bit regsvr32 (qingjian.iss does the
+; same with qingjian_tsf-<version>-x86.dll).
+#define Dll32 "yiime_tsf_x86.dll"
 ; File names of 0.1.x, still present in old version directories.
 #define LegacyExe "InputTranslation-Portable.exe"
 #define LegacyDll "input_translation_tsf.dll"
@@ -95,6 +98,7 @@ Name: "{app}\{#VersionDir}"
 ; Files in an existing version directory are identical (the name is their hash) and may be loaded,
 ; so never overwrite them.
 Source: "{#Repo}\dist\{#Dll}"; DestDir: "{app}\{#VersionDir}"; Flags: onlyifdoesntexist uninsrestartdelete
+Source: "{#Repo}\dist\{#Dll32}"; DestDir: "{app}\{#VersionDir}"; Flags: onlyifdoesntexist uninsrestartdelete
 Source: "{#Repo}\dist\{#Exe}"; DestDir: "{app}\{#VersionDir}"; Flags: onlyifdoesntexist
 ; Large lexicon (derived from rime-frost, GPL-3.0), read from the EXE directory at runtime.
 Source: "{#Repo}\data\frost\YiIME-words.txt"; DestDir: "{app}\{#VersionDir}"; Flags: ignoreversion
@@ -159,15 +163,28 @@ const
 
 var
   PreviousDll: String;
+  PreviousDll32: String;
 
 function CurrentDll: String;
 begin
   Result := ExpandConstant('{app}\{#VersionDir}\{#Dll}');
 end;
 
+function CurrentDll32: String;
+begin
+  Result := ExpandConstant('{app}\{#VersionDir}\{#Dll32}');
+end;
+
 function RunRegsvr32(const Params: String): Integer;
 begin
   if not Exec(ExpandConstant('{sys}\regsvr32.exe'), Params, '', SW_HIDE, ewWaitUntilTerminated, Result) then
+    Result := -1;
+end;
+
+{ 32 位 regsvr32（SysWOW64）：InprocServer32 写进 WOW6432Node，供 32 位应用加载；TIP 配置两边共用。 }
+function RunRegsvr32x86(const Params: String): Integer;
+begin
+  if not Exec(ExpandConstant('{syswow64}\regsvr32.exe'), Params, '', SW_HIDE, ewWaitUntilTerminated, Result) then
     Result := -1;
 end;
 
@@ -189,6 +206,8 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   PreviousDll := '';
   RegQueryStringValue(HKCR, ClsidKey, '', PreviousDll);
+  PreviousDll32 := '';
+  RegQueryStringValue(HKCR32, ClsidKey, '', PreviousDll32);
   StopOldTray;
   Result := '';
 end;
@@ -208,6 +227,16 @@ var
   Code: Integer;
 begin
   Code := RunRegsvr32('/s "' + CurrentDll + '"');
+  if Code = 0 then
+  begin
+    Code := RunRegsvr32x86('/s "' + CurrentDll32 + '"');
+    if Code <> 0 then
+    begin
+      Log('32 位 regsvr32 注册失败，退出码 ' + IntToStr(Code) + '：' + CurrentDll32);
+      if (PreviousDll32 <> '') and (CompareText(PreviousDll32, CurrentDll32) <> 0) and FileExists(PreviousDll32) then
+        RunRegsvr32x86('/s "' + PreviousDll32 + '"');
+    end;
+  end;
   if Code <> 0 then
   begin
     Log('regsvr32 注册失败，退出码 ' + IntToStr(Code) + '：' + CurrentDll);
@@ -222,7 +251,7 @@ begin
       '安装已取消，本次复制的文件会被回滚；原来安装的版本（如有）保持不变。' + #13#10 +
       '安装日志：' + LogHint);
   end;
-  Log('已注册 ' + CurrentDll);
+  Log('已注册 ' + CurrentDll + ' 和 ' + CurrentDll32);
 end;
 
 var
@@ -249,6 +278,16 @@ begin
           Busy := False;
           { 0.1.x 目录里的 DLL 叫 {#LegacyDll}：同样先删 DLL，删不掉说明仍被加载。 }
           Dll := Dir + '\{#Dll}';
+          if FileExists(Dll) and not DeleteFile(Dll) then
+          begin
+            Busy := True;
+            try
+              RestartReplace(Dll, '');
+            except
+              Log('无法安排重启后删除 ' + Dll);
+            end;
+          end;
+          Dll := Dir + '\{#Dll32}';
           if FileExists(Dll) and not DeleteFile(Dll) then
           begin
             Busy := True;
@@ -322,9 +361,19 @@ end;
   DLL 已经不在时没有可注销的东西，直接继续。 }
 procedure UnregisterTip;
 var
-  Dll: String;
+  Dll, Dll32: String;
   Code: Integer;
 begin
+  { 32 位注册只删 WOW6432Node 下的 CLSID（TIP 配置由 64 位那次删）；失败只记日志。 }
+  Dll32 := ExpandConstant('{app}\{#VersionDir}\{#Dll32}');
+  if FileExists(Dll32) then
+  begin
+    Code := RunRegsvr32x86('/u /s "' + Dll32 + '"');
+    if Code = 0 then
+      Log('已注销 ' + Dll32)
+    else
+      Log('32 位 regsvr32 /u 失败，退出码 ' + IntToStr(Code) + '：' + Dll32);
+  end;
   Dll := ExpandConstant('{app}\{#VersionDir}\{#Dll}');
   if not FileExists(Dll) then
   begin

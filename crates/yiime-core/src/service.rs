@@ -540,6 +540,24 @@ pub fn late_commit_landed(
     })
 }
 
+/// A window handle received from the other side of the DLL/box protocol (a 32-bit DLL in a WOW64
+/// application, the 64-bit box), from a message parameter or a command-line number. Window handles
+/// are 32-bit significant and sign-extended in 64-bit code; a 32-bit sender's value may arrive
+/// zero-extended, so both sides are compared in that canonical form.
+pub fn handle_from_wire(value: u64) -> isize {
+    value as u32 as i32 as isize
+}
+
+/// The next id for a parked text field. Sent to the box in an LPARAM, which is 32 bits in a
+/// 32-bit DLL and sign-extended on the way back, so it stays in 1..=i32::MAX.
+pub fn next_held_id(previous: u64) -> u64 {
+    if previous >= i32::MAX as u64 {
+        1
+    } else {
+        previous + 1
+    }
+}
+
 /// What a Shift tap in the input box does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShiftTapAction {
@@ -612,6 +630,30 @@ pub fn keys_to_give_back(first: Option<char>, pending: &str, box_ready: bool) ->
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn protocol_values_survive_a_32_bit_dll() {
+        // Handles: the same window whether it came zero-extended from a 32-bit sender or
+        // sign-extended from 64-bit code.
+        assert_eq!(handle_from_wire(0x0001_0234), 0x0001_0234);
+        assert_eq!(
+            handle_from_wire(0x8000_1234),
+            handle_from_wire(0xFFFF_FFFF_8000_1234)
+        );
+        assert_eq!(handle_from_wire(0xFFFF_FFFF_8000_1234), -0x7FFF_EDCC);
+        // Parked-field ids fit a 32-bit LPARAM and come back unchanged after sign extension.
+        assert_eq!(next_held_id(0), 1);
+        assert_eq!(next_held_id(41), 42);
+        assert_eq!(next_held_id(i32::MAX as u64), 1);
+        let id = next_held_id(i32::MAX as u64 - 1);
+        assert_eq!(id as i32 as i64 as u64, id);
+        // Packets are fixed-size integers, never pointer-sized: caret = 4 × i32, parked commit =
+        // u64 id + UTF-16, digest = u32.
+        assert_eq!(std::mem::size_of::<[i32; 4]>(), 16);
+        assert_eq!(std::mem::size_of::<u64>(), 8);
+        let digest = commit_digest("测试");
+        assert_eq!(digest as i32 as isize as u32, digest);
+    }
+
     #[test]
     fn commit_digest_tells_texts_apart() {
         assert_eq!(commit_digest("我想试一试"), commit_digest("我想试一试"));

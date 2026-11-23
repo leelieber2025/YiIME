@@ -45,7 +45,7 @@ unsafe fn receiver_proc_impl(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> 
     if message == WM_CREATE {
         let create = unsafe { &*(l as *const CREATESTRUCTW) };
         unsafe {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as isize);
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, create.lpCreateParams as _);
         }
         return 0;
     }

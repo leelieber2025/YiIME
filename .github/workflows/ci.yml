@@ -44,26 +44,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.96.1
-          targets: x86_64-pc-windows-gnu
+          targets: x86_64-pc-windows-gnu,i686-pc-windows-gnu
           components: clippy
       - name: Install MinGW
-        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64-posix binutils-mingw-w64-x86-64
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64-posix binutils-mingw-w64-x86-64 gcc-mingw-w64-i686-posix binutils-mingw-w64-i686
       # Windows-only code (YiIME.exe, the TSF DLL) only compiles for a Windows target.
       - name: Clippy (Windows target)
         run: cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-gnu -- -D warnings
+      # The 32-bit TSF DLL (for 32-bit applications).
+      - name: Clippy (32-bit TSF DLL)
+        env:
+          CARGO_TARGET_I686_PC_WINDOWS_GNU_LINKER: i686-w64-mingw32-gcc-posix
+        run: cargo clippy -p yiime-tsf --all-targets --locked --target i686-pc-windows-gnu -- -D warnings
       # Source hash must match; EXE/DLL are not yet byte-reproducible, so only warn.
       - name: Build actual release target twice
         run: |
           bash windows/build.sh
           cp dist/BUILDINFO.txt /tmp/first-buildinfo.txt
           cargo clean --target x86_64-pc-windows-gnu
+          cargo clean --target i686-pc-windows-gnu
           bash windows/build.sh
           python3 - <<'PY'
           from pathlib import Path
           first = dict(line.split(': ', 1) for line in Path('/tmp/first-buildinfo.txt').read_text().splitlines() if ': ' in line)
           second = dict(line.split(': ', 1) for line in Path('dist/BUILDINFO.txt').read_text().splitlines() if ': ' in line)
           assert first['Source SHA-256'] == second['Source SHA-256'], 'Source SHA-256 changed across clean builds'
-          for key in ('EXE SHA-256', 'DLL SHA-256'):
+          for key in ('EXE SHA-256', 'DLL SHA-256', 'x86 DLL SHA-256'):
               if first[key] != second[key]:
                   print(f'::warning::{key} differs across clean builds (not yet reproducible)')
           PY
@@ -71,7 +77,7 @@ jobs:
         run: |
           # VERSIONINFO is numeric: a release candidate (0.2.0-rc.1) carries 0.2.0.
           version="$(tools/version.sh)"; version="${version%%-*}"
-          for file in dist/YiIME.exe dist/yiime_tsf.dll; do
+          for file in dist/YiIME.exe dist/yiime_tsf.dll dist/yiime_tsf_x86.dll; do
               strings -el "$file" | grep -qx "$version" || { echo "$file 缺少版本 $version" >&2; exit 1; }
           done
       - uses: actions/upload-artifact@v4
@@ -120,6 +126,32 @@ jobs:
             if ($result.ExitCode -ne 0) { throw "unregister failed: $($result.ExitCode)" }
             $result = Start-Process $regsvr32 -ArgumentList @('/u', '/s', "`"$dll`"") -Wait -PassThru
             if ($result.ExitCode -ne 0) { Write-Output "::warning::second unregister returned $($result.ExitCode)" }
+          }
+      # 32-bit DLL next to the 64-bit one, as the installer registers them (SysWOW64 regsvr32 writes
+      # WOW6432Node; the TIP profile is shared), and both unregistered again.
+      - name: Register and unregister the 32-bit TSF DLL
+        shell: pwsh
+        run: |
+          rustup target add i686-pc-windows-msvc
+          cargo build --release -p yiime-tsf --target i686-pc-windows-msvc
+          $dll = (Resolve-Path 'target\release\yiime_tsf.dll').Path
+          $dll32 = (Resolve-Path 'target\i686-pc-windows-msvc\release\yiime_tsf.dll').Path
+          $regsvr32 = Join-Path $env:WINDIR 'System32\regsvr32.exe'
+          $regsvr32x86 = Join-Path $env:WINDIR 'SysWOW64\regsvr32.exe'
+          foreach ($pair in @(@($regsvr32, $dll), @($regsvr32x86, $dll32))) {
+            $result = Start-Process $pair[0] -ArgumentList @('/s', "`"$($pair[1])`"") -Wait -PassThru
+            if ($result.ExitCode -ne 0) { throw "register failed: $($pair[1]) $($result.ExitCode)" }
+          }
+          try {
+            $key = 'Registry::HKEY_CLASSES_ROOT\CLSID\{A72091C2-7459-4C47-85F4-4626AE42A6C8}\InprocServer32'
+            $key32 = 'Registry::HKEY_CLASSES_ROOT\WOW6432Node\CLSID\{A72091C2-7459-4C47-85F4-4626AE42A6C8}\InprocServer32'
+            if ((Get-Item $key).GetValue('') -ne $dll) { throw 'wrong 64-bit TSF DLL path' }
+            if ((Get-Item $key32).GetValue('') -ne $dll32) { throw 'wrong 32-bit TSF DLL path' }
+          } finally {
+            foreach ($pair in @(@($regsvr32x86, $dll32), @($regsvr32, $dll))) {
+              $result = Start-Process $pair[0] -ArgumentList @('/u', '/s', "`"$($pair[1])`"") -Wait -PassThru
+              if ($result.ExitCode -ne 0) { throw "unregister failed: $($pair[1]) $($result.ExitCode)" }
+            }
           }
 
   linux-cli:

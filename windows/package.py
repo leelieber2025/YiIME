@@ -48,13 +48,16 @@ if dist.exists():
 dist.mkdir(exist_ok=True)
 exe = dist / "YiIME.exe"
 dll = dist / "yiime_tsf.dll"
+dll32 = dist / "yiime_tsf_x86.dll"
 exe.write_bytes((root / "target/x86_64-pc-windows-gnu/release/windows_gui.exe").read_bytes())
 dll.write_bytes((root / "target/x86_64-pc-windows-gnu/release/yiime_tsf.dll").read_bytes())
+dll32.write_bytes((root / "target/i686-pc-windows-gnu/release/yiime_tsf.dll").read_bytes())
 info = (
     f"Source SHA-256: {source_hash.hexdigest()}\n"
     f"EXE SHA-256: {sha256(exe.read_bytes()).hexdigest()}\n"
     f"DLL SHA-256: {sha256(dll.read_bytes()).hexdigest()}\n"
-    "Target: x86_64-pc-windows-gnu\n"
+    f"x86 DLL SHA-256: {sha256(dll32.read_bytes()).hexdigest()}\n"
+    "Target: x86_64-pc-windows-gnu (x86 DLL: i686-pc-windows-gnu)\n"
     f"rustc: {subprocess.check_output(['rustc', '-Vv'], text=True).strip()}\n"
     f"cargo: {subprocess.check_output(['cargo', '-V'], text=True).strip()}\n"
     f"Linker: {Path(os.environ.get('CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER', 'x86_64-w64-mingw32-gcc')).name}\n"
@@ -70,7 +73,7 @@ version = subprocess.check_output(["bash", str(root / "tools/version.sh")], text
 licenses = [data_files[index] for index in (0, 2, 3, 5, 6, 8, 9, 10, 11, 12)]
 for name, files in {
     f"YiIME-{version}-portable.zip": [exe, root / "windows/使用说明.txt", root / "SECURITY.md", dist / "BUILDINFO.txt", *licenses],
-    f"YiIME-{version}-tsf-test.zip": [exe, dll, root / "windows/Install-YiIME.ps1",
+    f"YiIME-{version}-tsf-test.zip": [exe, dll, dll32, root / "windows/Install-YiIME.ps1",
                                       root / "windows/Uninstall-YiIME.ps1",
                                       root / "windows/TSF-使用说明.txt", root / "SECURITY.md", dist / "BUILDINFO.txt", *licenses],
 }.items():

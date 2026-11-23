@@ -659,7 +659,7 @@ impl TextService {
     /// Moves the current text field aside so a new session can replace it. Returns the id the box
     /// sends back with the Chinese source (never 0).
     fn hold_context(&self) -> u64 {
-        let id = self.next_held.get().wrapping_add(1).max(1);
+        let id = yiime_core::next_held_id(self.next_held.get());
         self.next_held.set(id);
         *self.held_context.borrow_mut() = self.context.borrow_mut().take();
         self.session_document.borrow_mut().take();

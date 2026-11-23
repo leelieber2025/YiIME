@@ -10,6 +10,12 @@ $base = Join-Path $env:ProgramFiles 'YiIME'
 $legacyBase = Join-Path $env:ProgramFiles 'InputTranslation'
 $registryPath = 'Registry::HKEY_CLASSES_ROOT\CLSID\{A72091C2-7459-4C47-85F4-4626AE42A6C8}\InprocServer32'
 $dll = if (Test-Path $registryPath) { (Get-Item $registryPath).GetValue('') } else { $null }
+# The 32-bit registration (WOW6432Node), for 32-bit applications.
+$registryPath32 = 'Registry::HKEY_CLASSES_ROOT\WOW6432Node\CLSID\{A72091C2-7459-4C47-85F4-4626AE42A6C8}\InprocServer32'
+$dll32 = if (Test-Path $registryPath32) { (Get-Item $registryPath32).GetValue('') } else { $null }
+if ($dll32 -and (Test-Path $dll32)) {
+    [void](Start-Process -FilePath (Join-Path $env:WINDIR 'SysWOW64\regsvr32.exe') -ArgumentList @('/u', '/s', "`"$dll32`"") -Wait -PassThru -WindowStyle Hidden)
+}
 if ($dll -and (Test-Path $dll)) {
     $proc = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\regsvr32.exe') -ArgumentList @('/u', '/s', "`"$dll`"") -Wait -PassThru -WindowStyle Hidden
     if ($proc.ExitCode -ne 0) { throw "输入法注销失败：$($proc.ExitCode)" }
@@ -50,7 +56,7 @@ foreach ($root in @($base, $legacyBase)) {
     $rootLocked = @()
     foreach ($dir in Get-ChildItem $root -Directory) {
         try {
-            foreach ($name in @('yiime_tsf.dll', 'input_translation_tsf.dll')) {
+            foreach ($name in @('yiime_tsf.dll', 'yiime_tsf_x86.dll', 'input_translation_tsf.dll')) {
                 $dirDll = Join-Path $dir.FullName $name
                 if (Test-Path $dirDll) { Remove-Item $dirDll -Force -ErrorAction Stop }
             }

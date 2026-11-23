@@ -7,25 +7,32 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 $source = Split-Path -Parent $MyInvocation.MyCommand.Path
 $base = Join-Path $env:ProgramFiles 'YiIME'
 $regsvr32 = Join-Path $env:WINDIR 'System32\regsvr32.exe'
-function Invoke-Regsvr32([string[]]$RegArgs) {
-    $proc = Start-Process -FilePath $regsvr32 -ArgumentList $RegArgs -Wait -PassThru -WindowStyle Hidden
+# 32-bit regsvr32: registers the x86 DLL under WOW6432Node for 32-bit applications.
+$regsvr32x86 = Join-Path $env:WINDIR 'SysWOW64\regsvr32.exe'
+function Invoke-Regsvr32([string[]]$RegArgs, [string]$Tool = $regsvr32) {
+    $proc = Start-Process -FilePath $Tool -ArgumentList $RegArgs -Wait -PassThru -WindowStyle Hidden
     return $proc.ExitCode
 }
 $clsid = '{A72091C2-7459-4C47-85F4-4626AE42A6C8}'
 $registryPath = "Registry::HKEY_CLASSES_ROOT\CLSID\$clsid\InprocServer32"
 $oldDll = if (Test-Path $registryPath) { (Get-Item $registryPath).GetValue('') } else { $null }
 $sourceDll = Join-Path $source 'yiime_tsf.dll'
+$sourceDll32 = Join-Path $source 'yiime_tsf_x86.dll'
 $sourceExe = Join-Path $source 'YiIME.exe'
-if (-not (Test-Path $sourceDll) -or -not (Test-Path $sourceExe)) {
+if (-not (Test-Path $sourceDll) -or -not (Test-Path $sourceDll32) -or -not (Test-Path $sourceExe)) {
     throw '安装包缺少 DLL 或 EXE。'
 }
-$version = (Get-FileHash $sourceDll -Algorithm SHA256).Hash.Substring(0, 12) + '-' +
+$dllBytes = [IO.File]::ReadAllBytes($sourceDll) + [IO.File]::ReadAllBytes($sourceDll32)
+$dllHash = [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash($dllBytes)).Replace('-', '')
+$version = $dllHash.Substring(0, 12) + '-' +
     (Get-FileHash $sourceExe -Algorithm SHA256).Hash.Substring(0, 12)
 $destination = Join-Path $base $version
 New-Item -ItemType Directory -Force -Path $destination | Out-Null
 $dll = Join-Path $destination 'yiime_tsf.dll'
+$dll32 = Join-Path $destination 'yiime_tsf_x86.dll'
 $exe = Join-Path $destination 'YiIME.exe'
 if (-not (Test-Path $dll)) { Copy-Item $sourceDll $dll }
+if (-not (Test-Path $dll32)) { Copy-Item $sourceDll32 $dll32 }
 if (-not (Test-Path $exe)) { Copy-Item $sourceExe $exe }
 # The large lexicon (derived from rime-frost, GPL-3.0) is a separate file read by the EXE at
 # runtime; every install overwrites it.
@@ -41,6 +48,8 @@ if ($registrationError -ne 0) {
     if ($oldDll -and (Test-Path $oldDll) -and $oldDll -ne $dll) { [void](Invoke-Regsvr32 @('/s', "`"$oldDll`"")) }
     throw "新版输入法注册失败：$registrationError"
 }
+$registrationError = Invoke-Regsvr32 @('/s', "`"$dll32`"") $regsvr32x86
+if ($registrationError -ne 0) { throw "32 位输入法注册失败：$registrationError" }
 # Record the current version directory, for an older DLL (still loaded by a running application)
 # that cannot find the EXE next to it.
 $stateKey = 'HKLM:\Software\YiIME'
