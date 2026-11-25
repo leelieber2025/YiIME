@@ -39,6 +39,18 @@ fn paging_keys() {
     assert_eq!(paging_direction(',', false), None);
     assert_eq!(paging_direction('.', true), Some(true));
     assert_eq!(paging_direction(',', true), Some(false));
+    // TSF key sink uses virtual keys (US layout). PageUp/PageDown always page; `,` `.` follow the switch.
+    assert_eq!(paging_direction_vk(0xBB, false, false), Some(true));
+    assert_eq!(paging_direction_vk(0xBD, false, false), Some(false));
+    assert_eq!(paging_direction_vk(0x22, false, false), Some(true));
+    assert_eq!(paging_direction_vk(0x21, false, false), Some(false));
+    assert_eq!(paging_direction_vk(0xBE, false, false), None);
+    assert_eq!(paging_direction_vk(0xBC, false, false), None);
+    assert_eq!(paging_direction_vk(0xBE, false, true), Some(true));
+    assert_eq!(paging_direction_vk(0xBC, false, true), Some(false));
+    assert_eq!(paging_direction_vk(0xBB, true, true), None);
+    assert_eq!(paging_direction_vk(0xBE, true, true), None);
+    assert_eq!(paging_direction_vk(0x21, true, true), None);
 }
 
 #[test]

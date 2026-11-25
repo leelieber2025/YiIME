@@ -1354,12 +1354,17 @@ impl InlineInput {
     }
     pub(super) fn wants(&self, context: &ITfContext, key: usize) -> bool {
         if let Some(state) = self.ui.state.borrow().as_ref() {
-            // 0xBD/0xBB are `-`/`=` paging keys (yiime_core::paging_direction).
+            let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
+            let paging = u16::try_from(key).ok().is_some_and(|vk| {
+                yiime_core::paging_direction_vk(vk, shift, option(Flag::CommaPeriodPaging))
+                    .is_some()
+            });
             state.context == *context
-                && matches!(
-                    key,
-                    0x41..=0x5a | 0x08 | 0x1b | 0x0d | 0x20 | 0x31..=0x39 | 0xBD | 0xBB
-                )
+                && (paging
+                    || matches!(
+                        key,
+                        0x41..=0x5a | 0x08 | 0x1b | 0x0d | 0x20 | 0x31..=0x39
+                    ))
         } else {
             (0x41..=0x5a).contains(&key)
         }
@@ -1400,9 +1405,15 @@ impl InlineInput {
                 .ui
                 .page_choice(key - 0x31)
                 .is_some_and(|word| self.edit(context, client_id, Action::Finish(word))),
-            0xBD => self.ui.turn_page(false),
-            0xBB => self.ui.turn_page(true),
-            _ => false,
+            _ => {
+                let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
+                u16::try_from(key)
+                    .ok()
+                    .and_then(|vk| {
+                        yiime_core::paging_direction_vk(vk, shift, option(Flag::CommaPeriodPaging))
+                    })
+                    .is_some_and(|forward| self.ui.turn_page(forward))
+            }
         }
     }
     fn edit(&self, context: &ITfContext, client_id: u32, action: Action) -> bool {

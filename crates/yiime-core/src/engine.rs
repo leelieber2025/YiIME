@@ -332,6 +332,22 @@ pub fn paging_direction(ch: char, comma_period: bool) -> Option<bool> {
     }
 }
 
+/// Virtual-key paging on a US layout (the keys the README lists): `-` `=` and PageUp/PageDown
+/// always, `,` `.` when `comma_period` is on. Shifted keys are not paging (`+` `_` `<` `>`).
+/// Some(true) = next page, Some(false) = previous.
+pub fn paging_direction_vk(vk: u16, shift: bool, comma_period: bool) -> Option<bool> {
+    if shift {
+        return None;
+    }
+    match vk {
+        0xBB | 0x22 => Some(true),           // `=` / PageDown (VK_NEXT)
+        0xBD | 0x21 => Some(false),          // `-` / PageUp (VK_PRIOR)
+        0xBE if comma_period => Some(true),  // `.`
+        0xBC if comma_period => Some(false), // `,`
+        _ => None,
+    }
+}
+
 /// Selection keys: `;` picks the 2nd candidate, `'` the 3rd (unless the code may be pinyin or
 /// already has a separator, where `'` separates syllables).
 pub fn selection_index(input: &MixedInput, code: &str, ch: char) -> Option<usize> {

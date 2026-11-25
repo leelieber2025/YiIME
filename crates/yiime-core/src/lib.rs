@@ -50,8 +50,8 @@ pub use draft::Draft;
 #[cfg(feature = "engine")]
 pub use engine::{
     CANDIDATE_PAGES, ComposeOptions, Composer, Flushed, LetterAction, LetterRules, Pick,
-    auto_commits_four, char_of_word, classify_letter, paging_direction, pushes_fifth,
-    selection_index,
+    auto_commits_four, char_of_word, classify_letter, paging_direction, paging_direction_vk,
+    pushes_fifth, selection_index,
 };
 pub use history::{HISTORY_CAP, HISTORY_FILE, History, HistoryEntry, history_label};
 pub use hotkey::{DEFAULT_PLAIN_TOGGLE, Hotkey, parse_hotkey};
