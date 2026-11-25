@@ -59,9 +59,12 @@ class YiIMEInputController: IMKInputController {
         }
         guard event.type == .keyDown else { return false }
         shiftDown = nil
-        if translating { return true }
         let flags = event.modifierFlags.intersection([.command, .control, .option])
         if !flags.isEmpty { return false }
+        if translating {
+            abandonTranslation(client: client)
+            if event.keyCode == 53 { return true }
+        }
         let active = yiime_active(ime)
         switch event.keyCode {
         case 36, 76: // Return / Enter

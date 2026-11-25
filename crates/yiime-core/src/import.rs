@@ -23,8 +23,10 @@ fn pinyin_code(spelling: &str) -> Option<String> {
             ch => ch.to_ascii_lowercase(),
         })
         .collect();
-    (!code.is_empty() && code.len() <= 64 && code.bytes().all(|b| b.is_ascii_lowercase()))
-        .then_some(code)
+    (!code.is_empty()
+        && code.len() <= crate::MAX_CODE_LEN
+        && code.bytes().all(|b| b.is_ascii_lowercase()))
+    .then_some(code)
 }
 
 /// Words from a text export: per line, one Chinese word and its pinyin (in either order,
@@ -55,10 +57,13 @@ pub fn parse_text_export(text: &str) -> Vec<ImportedWord> {
             .iter()
             .find(|field| field.chars().all(is_han))
             .map(|word| word.to_string());
-        let code = fields
+        let spelling = fields
             .iter()
             .filter(|field| field.chars().any(|ch| ch.is_ascii_alphabetic()))
-            .find_map(|field| pinyin_code(field));
+            .copied()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let code = pinyin_code(&spelling);
         if let (Some(word), Some(code)) = (word, code) {
             words.push((word, code));
         }
@@ -144,6 +149,7 @@ pub fn parse_scel(bytes: &[u8]) -> Result<Vec<ImportedWord>, &'static str> {
             let word = text_at(at + 2, word_len)?;
             at += 2 + word_len;
             let extra = u16_at(at)?;
+            bytes.get(at + 2..at + 2 + extra).ok_or("词库文件不完整")?;
             at += 2 + extra;
             // Same rule as text exports: only Chinese words, so a word with spaces or line breaks
             // cannot break the `word code` lines of the user words file.
@@ -154,6 +160,9 @@ pub fn parse_scel(bytes: &[u8]) -> Result<Vec<ImportedWord>, &'static str> {
                 words.push((word, code));
             }
         }
+    }
+    if at != bytes.len() {
+        return Err("词库文件不完整");
     }
     Ok(words)
 }
@@ -198,6 +207,21 @@ pub fn merge_user_words(existing: &str, words: &[ImportedWord]) -> (String, usiz
     (contents, added)
 }
 
+/// Serialize the full read/merge/replace transaction across CLI and GUI processes.
+pub fn import_into(path: &std::path::Path, words: &[ImportedWord]) -> std::io::Result<usize> {
+    let _lock = crate::storage::lock(path)?;
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e),
+    };
+    let (contents, added) = merge_user_words(&existing, words);
+    if !crate::write_atomically(path, contents.as_bytes()) {
+        return Err(std::io::Error::other("词库替换失败"));
+    }
+    Ok(added)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +235,11 @@ mod tests {
 
     #[test]
     fn sogou_qq_and_rime_text_exports() {
+        assert_eq!(
+            parse_text_export("ni hao 你好"),
+            pairs(&[("你好", "nihao")])
+        );
+        assert!(pinyin_code(&"a".repeat(crate::MAX_CODE_LEN + 1)).is_none());
         let sogou = "'ni'hao 你好\r\n'lü'xing 旅行\r\n";
         assert_eq!(
             parse_text_export(sogou),
@@ -267,7 +296,47 @@ mod tests {
             import_words(&bytes).unwrap(),
             pairs(&[("你好", "nihao"), ("拟好", "nihao"), ("绿", "lv")])
         );
+        assert!(parse_scel(&bytes[..bytes.len() - 1]).is_err());
         assert!(parse_scel(&bytes[..SCEL_WORDS + 6]).is_err());
+    }
+
+    #[test]
+    fn import_preserves_unreadable_encoding() {
+        let dir = std::env::temp_dir().join(format!("yiime-import-invalid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("user_words.txt");
+        let old = [0xff, 0xfe, 0x41, 0x00];
+        std::fs::write(&path, old).unwrap();
+        assert!(import_into(&path, &pairs(&[("你好", "nihao")])).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), old);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn simultaneous_imports_preserve_every_word() {
+        let dir =
+            std::env::temp_dir().join(format!("yiime-import-concurrent-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("user_words.txt");
+        let words = [
+            "词一", "词二", "词三", "词四", "词五", "词六", "词七", "词八",
+        ];
+        let handles: Vec<_> = words
+            .iter()
+            .map(|word| {
+                let path = path.clone();
+                let word = word.to_string();
+                std::thread::spawn(move || import_into(&path, &[(word, "ci".into())]).unwrap())
+            })
+            .collect();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), 1);
+        }
+        let contents = std::fs::read_to_string(&path).unwrap();
+        for word in words {
+            assert!(contents.contains(&format!("{word} ci\r\n")));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

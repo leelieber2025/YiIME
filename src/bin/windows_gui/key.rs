@@ -2,6 +2,11 @@ use super::*;
 use yiime_core::KeyAction;
 
 pub(super) unsafe fn set_code(hwnd: HWND, state: &State, code: String) {
+    if state.pending.get() && state.composition.borrow().code != code {
+        state.pending.set(false);
+        state.generation.set(state.generation.get().wrapping_add(1));
+        *state.status.borrow_mut() = None;
+    }
     state.composition.borrow_mut().set_code(
         &state.input.borrow(),
         code,
@@ -151,7 +156,19 @@ unsafe fn insert_punctuation(state: &State, ch: char) -> bool {
     if option(Flag::AutoPair) {
         // Auto-close: insert the opening and closing marks with the caret between them; a
         // closing mark right after the caret is skipped over.
-        if yiime_core::is_closing(text)
+        if {
+            let mut start = 0u32;
+            let mut end = 0u32;
+            unsafe {
+                SendMessageW(
+                    state.edit,
+                    EM_GETSEL,
+                    &mut start as *mut u32 as usize,
+                    &mut end as *mut u32 as isize,
+                );
+            }
+            start == end
+        } && yiime_core::is_closing(text)
             && unsafe { char_after_caret(state.edit) } == text.encode_utf16().next()
         {
             unsafe {
@@ -459,13 +476,12 @@ pub(super) unsafe extern "system" fn edit_proc(
                 && option(Flag::HistoryEnabled) =>
         {
             let draft = unsafe { get_text(state.edit) };
-            let current = state.history_pos.get();
-            let untouched = draft.is_empty()
-                || current.is_some_and(|index| {
-                    load_history()
-                        .get(index)
-                        .is_some_and(|entry| entry.chinese == draft)
-                });
+            let current = state.history_pos.get().and_then(|_| {
+                load_history()
+                    .iter()
+                    .position(|entry| entry.chinese == draft)
+            });
+            let untouched = draft.is_empty() || current.is_some();
             if untouched {
                 let older = [VK_UP, VK_PRIOR].contains(&(w as u16));
                 let next = match (current, older) {

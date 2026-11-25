@@ -405,6 +405,19 @@ impl ApiSettings {
             if let Some(on) = value["allow_fallback"].as_bool() {
                 settings.allow_fallback = on;
             }
+            if let Some(blob) = value.get("sealed_keys") {
+                if let Ok(bytes) = serde_json::from_value::<Vec<u8>>(blob.clone())
+                    && let Some(clear) = sealer.open(&bytes)
+                    && let Ok([key, google, azure, deepl]) =
+                        serde_json::from_slice::<[String; 4]>(&clear)
+                {
+                    settings.key = key;
+                    settings.google_key = google;
+                    settings.azure_key = azure;
+                    settings.deepl_key = deepl;
+                }
+                return settings;
+            }
         }
         let key = std::fs::read(dir.join(KEY_FILE))
             .ok()
@@ -438,55 +451,32 @@ impl ApiSettings {
     }
     pub fn save(&self, dir: &Path, sealer: &dyn Sealer) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
+        let keys = serde_json::to_vec(&[
+            self.key.as_str(),
+            self.google_key.trim(),
+            self.azure_key.trim(),
+            self.deepl_key.trim(),
+        ])?;
         let encrypted = sealer
-            .seal(self.key.as_bytes())
+            .seal(&keys)
             .ok_or_else(|| std::io::Error::other("密钥加密失败"))?;
-        std::fs::write(dir.join(KEY_FILE), encrypted)?;
-        let google = dir.join(GOOGLE_KEY_FILE);
-        if self.google_key.trim().is_empty() {
-            if google.exists() {
-                std::fs::remove_file(&google)?;
-            }
-        } else {
-            let sealed = sealer
-                .seal(self.google_key.trim().as_bytes())
-                .ok_or_else(|| std::io::Error::other("密钥加密失败"))?;
-            std::fs::write(google, sealed)?;
+        let snapshot = serde_json::to_vec(&serde_json::json!({
+            "sealed_keys": encrypted,
+            "url": self.url,
+            "model": self.model,
+            "style": self.style.id(),
+            "custom": self.custom,
+            "engine": self.engine.id(),
+            "allow_fallback": self.allow_fallback,
+            "azure_region": self.azure_region.trim(),
+        }))?;
+        if !crate::write_atomically(&dir.join(SETTINGS_FILE), &snapshot) {
+            return Err(std::io::Error::other("设置替换失败"));
         }
-        let azure = dir.join(AZURE_KEY_FILE);
-        if self.azure_key.trim().is_empty() {
-            if azure.exists() {
-                std::fs::remove_file(&azure)?;
-            }
-        } else {
-            let sealed = sealer
-                .seal(self.azure_key.trim().as_bytes())
-                .ok_or_else(|| std::io::Error::other("密钥加密失败"))?;
-            std::fs::write(azure, sealed)?;
+        for legacy in [KEY_FILE, GOOGLE_KEY_FILE, AZURE_KEY_FILE, DEEPL_KEY_FILE] {
+            let _ = std::fs::remove_file(dir.join(legacy));
         }
-        let deepl = dir.join(DEEPL_KEY_FILE);
-        if self.deepl_key.trim().is_empty() {
-            if deepl.exists() {
-                std::fs::remove_file(&deepl)?;
-            }
-        } else {
-            let sealed = sealer
-                .seal(self.deepl_key.trim().as_bytes())
-                .ok_or_else(|| std::io::Error::other("密钥加密失败"))?;
-            std::fs::write(deepl, sealed)?;
-        }
-        std::fs::write(
-            dir.join(SETTINGS_FILE),
-            serde_json::to_vec(&serde_json::json!({
-                "url": self.url,
-                "model": self.model,
-                "style": self.style.id(),
-                "custom": self.custom,
-                "engine": self.engine.id(),
-                "allow_fallback": self.allow_fallback,
-                "azure_region": self.azure_region.trim(),
-            }))?,
-        )
+        Ok(())
     }
     /// Checks before sending a request. Free Google needs nothing; Google Cloud needs a key; see
     /// [`Self::validate_llm`] for the LLM.
@@ -668,10 +658,6 @@ mod tests {
             deepl_key: "dkey:fx".into(),
         };
         settings.save(&dir, &Xor).unwrap();
-        assert_ne!(std::fs::read(dir.join(AZURE_KEY_FILE)).unwrap(), b"akey");
-        assert_ne!(std::fs::read(dir.join(DEEPL_KEY_FILE)).unwrap(), b"dkey:fx");
-        let raw = std::fs::read(dir.join(KEY_FILE)).unwrap();
-        assert_ne!(raw, b"secret");
         let json = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
         assert!(!json.contains("secret") && json.contains("academic"));
         assert_eq!(ApiSettings::load(&dir, &Xor), settings);
@@ -690,8 +676,6 @@ mod tests {
             ..ApiSettings::default()
         };
         assert!(cloud.validate().is_err());
-        let raw = std::fs::read(dir.join(GOOGLE_KEY_FILE)).unwrap();
-        assert_ne!(raw, b"gkey");
         assert!(json.contains("\"engine\":\"llm\""));
         let mut cleared = settings.clone();
         cleared.google_key.clear();

@@ -129,6 +129,13 @@ unsafe fn receiver_proc_impl(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> 
         }
         return 0;
     }
+    if message == WM_APP + 15 {
+        let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TextService_Impl };
+        if !pointer.is_null() {
+            unsafe { (*pointer).finish_pending_commit() };
+        }
+        return 0;
+    }
     if message == WM_TRANSLATE_MODE {
         let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TextService_Impl };
         if !pointer.is_null() {

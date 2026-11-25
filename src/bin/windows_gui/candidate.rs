@@ -212,7 +212,7 @@ pub(super) unsafe fn relayout(hwnd: HWND, state: &State) {
                     SelectObject(hdc, state.font.get() as _);
                 }
             }
-            composition.hits.push((x, x + w));
+            composition.hits.push((x, x + w, 0));
             x += w + gap;
         }
         width = width.max(x + pad + 4);
@@ -233,12 +233,23 @@ pub(super) unsafe fn relayout(hwnd: HWND, state: &State) {
     // and 9th candidates are not cut off.
     let max_w = unsafe {
         let work = work_area(state.anchor.get());
-        (work.right - work.left - 16).max(MAX_W)
+        (work.right - work.left - 16).max(1)
     };
-    let width = width.clamp(min_w, max_w) + 2;
+    let width = width.clamp(min_w.min(max_w), max_w) + 2;
     // Multi-line draft: wrap at the edit-box width to compute its height (excluding the edit
     // control's padding).
-    let edit_w = width - 2 - 2 * pad;
+    let edit_w = (width - 2 - 2 * pad).max(1);
+    let mut x = pad;
+    let mut candidate_line = 0;
+    for hit in &mut composition.hits {
+        let item_width = (hit.1 - hit.0).min(edit_w);
+        if x != pad && x + item_width > width - pad {
+            candidate_line += 1;
+            x = pad;
+        }
+        *hit = (x, x + item_width, candidate_line);
+        x += item_width + gap;
+    }
     let draft_h = unsafe {
         SelectObject(hdc, state.font.get() as _);
         let mut metrics: TEXTMETRICW = std::mem::zeroed();
@@ -269,7 +280,7 @@ pub(super) unsafe fn relayout(hwnd: HWND, state: &State) {
         ReleaseDC(hwnd, hdc);
     }
     state.draft_h.set(draft_h);
-    let lines = if composing { 2 } else { 1 };
+    let lines = if composing { 2 + candidate_line } else { 1 };
     let height = pad + draft_h + 3 + lines * line_h + pad + 2;
     composition.row_top = pad + draft_h + 3 + line_h;
     drop(composition);
@@ -313,13 +324,13 @@ pub(super) unsafe fn paint(hwnd: HWND, state: &State) {
         unsafe {
             draw_text(hdc, pad, top + 2, BLUE, &composition.code);
         }
-        let row = composition.row_top;
-        for (index, (candidate, (left, right))) in composition
+        for (index, (candidate, (left, right, line))) in composition
             .page_items()
             .iter()
             .zip(composition.hits.iter().copied())
             .enumerate()
         {
+            let row = composition.row_top + line * line_h;
             if index == 0 {
                 let rect = RECT {
                     left: left - 4,

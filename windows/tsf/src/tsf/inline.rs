@@ -67,7 +67,25 @@ fn user_words_path() -> Option<PathBuf> {
 }
 
 fn dictionary() -> &'static yiime_core::MixedInput {
-    let input = DICTIONARY.get_or_init(yiime_core::MixedInput::bundled);
+    let input = DICTIONARY.get_or_init(|| {
+        let bundled = yiime_core::MixedInput::bundled();
+        let Some(dir) = module_path()
+            .ok()
+            .and_then(|path| PathBuf::from(path).parent().map(PathBuf::from))
+        else {
+            return bundled;
+        };
+        let words = [
+            dir.join("YiIME-words.txt"),
+            dir.join("data").join("frost").join("YiIME-words.txt"),
+        ]
+        .into_iter()
+        .find_map(|path| std::fs::read_to_string(path).ok());
+        match words {
+            Some(words) => bundled.with_frequency_words(words),
+            None => bundled,
+        }
+    });
     refresh_user_words(input);
     input
 }

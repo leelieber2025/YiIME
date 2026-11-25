@@ -59,13 +59,13 @@ impl UserWordsReloader {
     /// with the read is picked up by the next [`Self::check`].
     pub fn load(path: Option<PathBuf>) -> (Self, Option<String>) {
         let stamp = path.as_deref().map(FileStamp::of);
-        let contents = path
-            .as_deref()
-            .and_then(|path| std::fs::read_to_string(path).ok());
+        let read = path.as_deref().map(std::fs::read_to_string);
+        let retry = matches!(&read, Some(Err(e)) if e.kind() != std::io::ErrorKind::NotFound);
+        let contents = read.and_then(Result::ok);
         (
             Self {
                 path,
-                loaded: stamp,
+                loaded: if retry { None } else { stamp },
             },
             contents,
         )

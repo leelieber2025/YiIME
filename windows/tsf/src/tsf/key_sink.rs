@@ -6,6 +6,7 @@ static NOTED_INLINE_FALLBACK: AtomicBool = AtomicBool::new(false);
 impl ITfKeyEventSink_Impl for TextService_Impl {
     fn OnSetFocus(&self, foreground: BOOL) -> Result<()> {
         com_guard("OnSetFocus", || {
+            self.after_digit.set(false);
             self.tested_key.borrow_mut().take();
             self.shift_down.set(None);
             if !foreground.as_bool() {
@@ -40,6 +41,12 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             let consume = context.as_ref().is_some_and(|context| {
                 self.should_consume(context, key.0) || self.punctuation(context, key.0).is_some()
             });
+            if !consume && !is_shift(key.0) {
+                let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
+                self.after_digit.set(
+                    (!shift && (0x30..=0x39).contains(&key.0)) || (0x60..=0x69).contains(&key.0),
+                );
+            }
             *self.tested_key.borrow_mut() = context
                 .as_ref()
                 .map(|context| (context.clone(), key.0, consume));
@@ -77,14 +84,15 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 && !self.should_consume(context, key.0)
                 && let Some(text) = self.punctuation(context, key.0)
             {
-                if key.0 == 0xDE {
+                let inserted = self.insert_direct(context, text);
+                if inserted && key.0 == 0xDE {
                     let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
                     let mut quotes = self.quotes.get();
                     quotes.next(if shift { '"' } else { '\'' });
                     self.quotes.set(quotes);
                 }
                 self.after_digit.set(false);
-                return Ok(self.insert_direct(context, text).into());
+                return Ok(inserted.into());
             }
             // Remember digits so a following `.` `:` stays half-width (3.5, 10:30).
             let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;

@@ -314,11 +314,42 @@ impl IClassFactory_Impl for ClassFactory_Impl {
     }
 }
 
+fn preceding_digit(context: &ITfContext, cookie: u32) -> Option<bool> {
+    let mut selection: TF_SELECTION = unsafe { std::mem::zeroed() };
+    let mut fetched = 0;
+    let read = unsafe {
+        context.GetSelection(
+            cookie,
+            TF_DEFAULT_SELECTION,
+            std::slice::from_mut(&mut selection),
+            &mut fetched,
+        )
+    };
+    let range = ManuallyDrop::into_inner(selection.range)?;
+    read.ok()?;
+    if fetched == 0 {
+        return None;
+    }
+    unsafe {
+        range.Collapse(cookie, TF_ANCHOR_START).ok()?;
+        let mut moved = 0;
+        range
+            .ShiftStart(cookie, -1, &mut moved, std::ptr::null())
+            .ok()?;
+        let mut unit = [0u16];
+        let mut count = 0;
+        range.GetText(cookie, 0, &mut unit, &mut count).ok()?;
+        Some(count == 1 && (48..=57).contains(&unit[0]))
+    }
+}
+
 #[implement(ITfEditSession)]
 struct CommitEdit {
     context: ITfContext,
     text: String,
     /// None until DoEditSession finishes, then Some(success).
+    wake: usize,
+    numeric_mark: bool,
     outcome: Rc<Cell<Option<bool>>>,
 }
 impl ITfEditSession_Impl for CommitEdit_Impl {
@@ -329,13 +360,28 @@ impl ITfEditSession_Impl for CommitEdit_Impl {
                     .context
                     .cast()
                     .inspect_err(|error| log_hresult("上屏：ITfInsertAtSelection 接口", error))?;
-                let utf16: Vec<u16> = self.text.encode_utf16().collect();
+                let mut text = self.text.as_str();
+                if self.numeric_mark
+                    && matches!(text, "." | ":" | "。" | "：")
+                    && let Some(digit) = preceding_digit(&self.context, cookie)
+                {
+                    text = match (text, digit) {
+                        ("。" | ".", true) => ".",
+                        ("：" | ":", true) => ":",
+                        ("。" | ".", false) => "。",
+                        ("：" | ":", false) => "：",
+                        _ => text,
+                    };
+                }
+                let utf16: Vec<u16> = text.encode_utf16().collect();
                 // SampleIME Composition.cpp `_AddCharAndFinalize`: insert the committed
                 // text at the selection (flags 0), then collapse the caret to the end.
                 let range = unsafe {
                     insert.InsertTextAtSelection(cookie, INSERT_TEXT_AT_SELECTION_FLAGS(0), &utf16)
                 }
                 .inspect_err(|error| log_hresult("上屏：InsertTextAtSelection", error))?;
+                // The host owns the text from here on. Caret errors must not retry insertion.
+                self.outcome.set(Some(true));
                 let caret = unsafe { range.Clone()? };
                 unsafe {
                     caret.Collapse(cookie, TF_ANCHOR_END)?;
@@ -355,8 +401,14 @@ impl ITfEditSession_Impl for CommitEdit_Impl {
                 drop(ManuallyDrop::into_inner(selection.range));
                 result
             })();
-            self.outcome.set(Some(result.is_ok()));
-            result
+            let inserted = self.outcome.get() == Some(true);
+            self.outcome.set(Some(inserted));
+            if self.wake != 0 {
+                unsafe {
+                    PostMessageW(self.wake as HWND, WM_APP + 15, 0, 0);
+                }
+            }
+            if inserted { Ok(()) } else { result }
         })
     }
 }
@@ -953,6 +1005,14 @@ struct TextService {
     /// Last reason logged for letters passed to the application (logged again only on change).
     pass_logged: Cell<Option<yiime_core::PassReason>>,
     /// Digest and time of the last text inserted for the box (see yiime_core::duplicate_commit).
+    pending_commit: RefCell<
+        Option<(
+            u32,
+            Rc<Cell<Option<bool>>>,
+            ITfContext,
+            yiime_core::CommitTarget,
+        )>,
+    >,
     last_commit: Cell<Option<(u32, std::time::Instant)>>,
     /// Last good caret rectangle (shared with the asynchronous CaretQuery).
     caret: Rc<Cell<yiime_core::SegmentAnchor>>,
@@ -1011,6 +1071,7 @@ impl TextService {
             session_document: RefCell::new(None),
             session_window: Cell::new(null_mut()),
             pass_logged: Cell::new(None),
+            pending_commit: RefCell::new(None),
             last_commit: Cell::new(None),
             caret: Rc::new(Cell::new(yiime_core::SegmentAnchor::default())),
             last_caret: Rc::new(Cell::new(None)),
@@ -1572,18 +1633,16 @@ impl TextService {
                 .peek(if shift { '"' } else { '\'' })
                 .map(str::to_owned);
         }
-        chinese_punctuation(key, shift, self.after_digit.get()).map(str::to_owned)
+        chinese_punctuation(key, shift, false).map(|text| match (text, self.after_digit.get()) {
+            ("。", true) => ".".to_owned(),
+            ("：", true) => ":".to_owned(),
+            _ => text.to_owned(),
+        })
     }
     /// Inserts text straight into the document (without the box).
     fn insert_direct(&self, context: &ITfContext, text: String) -> bool {
-        let session: ITfEditSession = CommitEdit {
-            context: context.clone(),
-            text,
-            outcome: Rc::new(Cell::new(None)),
-        }
-        .into();
-        unsafe { context.RequestEditSession(self.client_id.get(), &session, TF_ES_READWRITE) }
-            .is_ok()
+        let outcome = Rc::new(Cell::new(None));
+        self.request_insert(context, text, outcome.clone(), 0, true) && outcome.get() != Some(false)
     }
     fn should_consume(&self, context: &ITfContext, key: usize) -> bool {
         let consume = self.wants_key(context, key);
@@ -2014,6 +2073,9 @@ impl TextService {
             }
             return true;
         }
+        if self.pending_commit.borrow().is_some() {
+            return false;
+        }
         let session = self
             .editor_open
             .get()
@@ -2076,7 +2138,21 @@ impl TextService {
                 yiime_core::CommitTarget::Focused => (focused.clone(), "focused"),
             };
             let Some(context) = context else { continue };
-            if self.insert_text(&context, text.clone()) {
+            let outcome = Rc::new(Cell::new(None));
+            if self.request_insert(
+                &context,
+                text.clone(),
+                outcome.clone(),
+                self.receiver.get() as usize,
+                false,
+            ) {
+                if outcome.get().is_none() {
+                    *self.pending_commit.borrow_mut() = Some((digest, outcome, context, target));
+                    return false; // The GUI retains its draft until the existing late confirmation arrives.
+                }
+                if outcome.get() == Some(false) {
+                    continue;
+                }
                 log(&format!("上屏成功：{which}"));
                 self.last_commit
                     .set(Some((digest, std::time::Instant::now())));
@@ -2101,6 +2177,32 @@ impl TextService {
     /// Tells the box the text landed (WM_APP + 10, wParam = receiver, lParam = digest), posted
     /// besides the COPYDATA reply: that reply can be lost to a timeout while the focus moves, and
     /// the box would keep a draft that was already inserted.
+    fn finish_pending_commit(&self) {
+        let ready = self
+            .pending_commit
+            .borrow()
+            .as_ref()
+            .is_some_and(|(_, result, _, _)| result.get().is_some());
+        if !ready {
+            return;
+        }
+        let pending = self.pending_commit.borrow_mut().take();
+        if let Some((digest, result, context, target)) = pending
+            && result.get() == Some(true)
+        {
+            self.last_commit
+                .set(Some((digest, std::time::Instant::now())));
+            self.confirm_commit(digest);
+            if self.context.borrow().as_ref() == Some(&context) {
+                self.finish_editor();
+            }
+            if target == yiime_core::CommitTarget::Held
+                && self.held_context.borrow().as_ref() == Some(&context)
+            {
+                self.clear_held();
+            }
+        }
+    }
     fn confirm_commit(&self, digest: u32) {
         let editor_window = self.editor_window.get();
         let receiver = self.receiver.get();
@@ -2169,9 +2271,22 @@ impl TextService {
         // Win11 Notepad and other immersive hosts can crash on a synchronous lock.
         // SampleIME KeyHandler.cpp uses TF_ES_ASYNCDONTCARE | TF_ES_READWRITE for the same reason.
         let outcome = Rc::new(Cell::new(None));
+        self.request_insert(context, text, outcome.clone(), 0, false)
+            && outcome.get() != Some(false)
+    }
+    fn request_insert(
+        &self,
+        context: &ITfContext,
+        text: String,
+        outcome: Rc<Cell<Option<bool>>>,
+        wake: usize,
+        numeric_mark: bool,
+    ) -> bool {
         let session: ITfEditSession = CommitEdit {
             context: context.clone(),
             text,
+            wake,
+            numeric_mark,
             outcome: outcome.clone(),
         }
         .into();
@@ -2193,20 +2308,7 @@ impl TextService {
                 false
             }
         };
-        if !accepted {
-            return false;
-        }
-        match outcome.get() {
-            Some(true) => true,
-            Some(false) => {
-                log("上屏编辑会话已失败");
-                false
-            }
-            None => {
-                log("上屏编辑会话已受理，等待回调写入");
-                true
-            }
-        }
+        accepted
     }
     /// Accept COPYDATA only from the bound YiIME.exe, or bind it on the first packet of a
     /// session started with ShellExecuteW (which does not return a process id).
@@ -2337,6 +2439,8 @@ impl TextService {
             let session: ITfEditSession = CommitEdit {
                 context: context.clone(),
                 text: pending,
+                wake: 0,
+                numeric_mark: false,
                 outcome: Rc::new(Cell::new(None)),
             }
             .into();

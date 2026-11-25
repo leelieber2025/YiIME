@@ -12,7 +12,7 @@ use std::collections::HashMap;
 /// Each query fetches `page_size × CANDIDATE_PAGES` candidates.
 pub const CANDIDATE_PAGES: usize = 10;
 /// Longest code; extra letters are ignored.
-pub const MAX_CODE_LEN: usize = 32;
+use crate::MAX_CODE_LEN;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ComposeOptions {
@@ -142,6 +142,10 @@ impl Composer {
             if !hint.is_empty() {
                 self.hints.insert(candidate.text.clone(), hint);
             }
+        }
+        if options.traditional {
+            let mut seen = std::collections::HashSet::new();
+            candidates.retain(|item| seen.insert((item.text.clone(), item.rest.clone())));
         }
         if options.learn {
             if options.pinyin_first {

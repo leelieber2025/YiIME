@@ -17,9 +17,13 @@ mod dict;
 mod draft;
 #[cfg(feature = "engine")]
 mod engine;
+mod storage;
+pub use storage::write_atomically;
+pub const MAX_CODE_LEN: usize = 32;
 mod history;
 mod hotkey;
 mod import;
+pub use import::import_into;
 mod inline;
 #[cfg(feature = "engine")]
 mod keys;
@@ -45,8 +49,8 @@ pub use dict::{
 pub use draft::Draft;
 #[cfg(feature = "engine")]
 pub use engine::{
-    CANDIDATE_PAGES, ComposeOptions, Composer, Flushed, LetterAction, LetterRules, MAX_CODE_LEN,
-    Pick, auto_commits_four, char_of_word, classify_letter, paging_direction, pushes_fifth,
+    CANDIDATE_PAGES, ComposeOptions, Composer, Flushed, LetterAction, LetterRules, Pick,
+    auto_commits_four, char_of_word, classify_letter, paging_direction, pushes_fifth,
     selection_index,
 };
 pub use history::{HISTORY_CAP, HISTORY_FILE, History, HistoryEntry, history_label};
@@ -64,7 +68,6 @@ pub use keys::{
 #[cfg(feature = "engine")]
 pub use learn::{
     HALF_LIFE_DAYS, LEARNED_FILE, LEGACY_LEARNED_FILE, Learned, MAX_ENTRIES, PROMOTE_SCORE,
-    write_atomically,
 };
 pub use reload::{FileStamp, SettingsStamp, UserWordsReloader};
 pub use request::RequestGate;

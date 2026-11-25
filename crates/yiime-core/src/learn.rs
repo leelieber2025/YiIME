@@ -13,6 +13,7 @@
 
 use crate::dict::Candidate;
 use crate::settings::{PlainSealer, Sealer};
+use crate::write_atomically;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -61,6 +62,7 @@ pub struct Learned {
     sealer: Box<dyn Sealer>,
     /// Number of `(code, word)` pairs in `stats`.
     count: usize,
+    migrated_legacy: bool,
     dirty: bool,
     last_save: Option<Instant>,
 }
@@ -73,6 +75,7 @@ impl Default for Learned {
             sealer: Box::new(PlainSealer),
             count: 0,
             dirty: false,
+            migrated_legacy: false,
             last_save: None,
         }
     }
@@ -97,6 +100,7 @@ impl Learned {
             sealer,
             count: 0,
             dirty: false,
+            migrated_legacy: false,
             last_save: None,
         };
         let Some(path) = learned.path.clone() else {
@@ -109,7 +113,9 @@ impl Learned {
             learned.parse(&String::from_utf8_lossy(&plain));
         }
         let legacy = path.with_file_name(LEGACY_LEARNED_FILE);
-        if let Ok(text) = std::fs::read_to_string(&legacy) {
+        if !learned.migrated_legacy
+            && let Ok(text) = std::fs::read_to_string(&legacy)
+        {
             // Old picks have no time; count them as made when the log was last written.
             let when = std::fs::metadata(&legacy)
                 .and_then(|meta| meta.modified())
@@ -121,6 +127,7 @@ impl Learned {
                     learned.bump(code, word, when);
                 }
             }
+            learned.migrated_legacy = true;
             learned.dirty = true;
             if learned.save() {
                 let _ = std::fs::remove_file(&legacy);
@@ -135,6 +142,10 @@ impl Learned {
             return;
         }
         for line in lines {
+            if line == "# migrated legacy" {
+                self.migrated_legacy = true;
+                continue;
+            }
             let mut fields = line.split('\t');
             let (Some(code), Some(word), Some(score), Some(last)) =
                 (fields.next(), fields.next(), fields.next(), fields.next())
@@ -286,6 +297,9 @@ impl Learned {
         self.compact(now_secs());
         let mut text = String::from(HEADER);
         text.push('\n');
+        if self.migrated_legacy {
+            text.push_str("# migrated legacy\n");
+        }
         let mut codes: Vec<_> = self.stats.iter().collect();
         codes.sort_by(|a, b| a.0.cmp(b.0));
         for (code, words) in codes {
@@ -362,30 +376,6 @@ impl Drop for Learned {
     fn drop(&mut self) {
         let _ = self.flush();
     }
-}
-
-/// Writes `bytes` to a temporary file next to `path`, then renames it over `path`, so a crash or
-/// full disk never leaves a truncated file.
-pub fn write_atomically(path: &std::path::Path, bytes: &[u8]) -> bool {
-    use std::io::Write;
-    let Some(dir) = path.parent() else {
-        return false;
-    };
-    let _ = std::fs::create_dir_all(dir);
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let temp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
-    let written = std::fs::File::create(&temp).and_then(|mut file| {
-        file.write_all(bytes)?;
-        file.sync_all()
-    });
-    if written.is_err() || std::fs::rename(&temp, path).is_err() {
-        let _ = std::fs::remove_file(&temp);
-        return false;
-    }
-    true
 }
 
 #[cfg(test)]

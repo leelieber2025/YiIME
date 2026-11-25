@@ -113,6 +113,9 @@ impl Ime {
             }
             if !self.draft.text().is_empty() {
                 self.draft.backspace();
+                if self.draft.text().is_empty() {
+                    self.english = false;
+                }
                 return true;
             }
             return false;
@@ -122,6 +125,15 @@ impl Ime {
             return true;
         }
         if self.composer.is_composing() {
+            if ch == '\'' && yiime_core::selection_index(input(), &self.composer.code, ch).is_none()
+            {
+                let mut code = self.composer.code.clone();
+                if code.len() < yiime_core::MAX_CODE_LEN {
+                    code.push(ch);
+                    self.set_code(code);
+                }
+                return true;
+            }
             match ch {
                 ' ' => {
                     self.flush_first();
@@ -147,7 +159,7 @@ impl Ime {
                     self.composer
                         .type_letter(input(), letter, RULES, &OPTIONS, &self.learned);
                 for pick in picks {
-                    self.take_pick(pick);
+                    self.draft.insert(&pick.text);
                 }
                 true
             }
@@ -158,9 +170,12 @@ impl Ime {
             }
             _ if self.active() && !ch.is_control() => {
                 self.flush_all();
-                let text = yiime_core::full_width(ch, false)
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| ch.to_string());
+                let text = yiime_core::full_width(
+                    ch,
+                    self.draft.text().ends_with(|c: char| c.is_ascii_digit()),
+                )
+                .map(str::to_owned)
+                .unwrap_or_else(|| ch.to_string());
                 self.draft.insert(&text);
                 true
             }
@@ -547,6 +562,23 @@ mod tests {
         assert_eq!(ime.take_text(), "nihao");
     }
 
+    #[test]
+    fn ffi_input_regressions() {
+        let mut ime = Ime::default();
+        typed(&mut ime, "gnguw");
+        assert_eq!(ime.code(), "w");
+        let mut ime = Ime::default();
+        typed(&mut ime, "xi'");
+        assert_eq!(ime.code(), "xi'");
+        let mut ime = Ime::default();
+        typed(&mut ime, "a");
+        ime.shift_tap();
+        ime.key('\u{8}');
+        assert!(!ime.english());
+        ime.draft.insert("版本3");
+        typed(&mut ime, ".5");
+        assert_eq!(ime.draft(), "版本3.5");
+    }
     #[test]
     fn ffi_round_trip() {
         unsafe {

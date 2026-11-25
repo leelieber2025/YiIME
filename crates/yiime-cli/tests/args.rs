@@ -35,6 +35,36 @@ fn no_words_query_still_works() {
 }
 
 #[test]
+fn frost_words_are_reachable_by_pinyin_and_wubi() {
+    let words = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../data/frost/YiIME-words.txt"
+    );
+    let run = |words_args: &[&str]| {
+        let output = Command::new(env!("CARGO_BIN_EXE_yiime"))
+            .args(["query", "tongguan", "iuud", "--pages", "2", "--tsv"])
+            .args(words_args)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let with_words = run(&["--words", words]);
+    assert!(
+        with_words
+            .lines()
+            .any(|line| line.contains("tongguan") && line.contains("潼关"))
+    );
+    assert!(
+        with_words
+            .lines()
+            .any(|line| line.contains("iuud") && line.contains("潼关"))
+    );
+    let without_words = run(&["--no-words"]);
+    assert!(!without_words.contains("潼关"));
+}
+
+#[test]
 fn common_characters_by_default_and_all_chars_option() {
     let run = |extra: &[&str]| {
         let output = Command::new(env!("CARGO_BIN_EXE_yiime"))

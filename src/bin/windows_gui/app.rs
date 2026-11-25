@@ -262,7 +262,7 @@ const LINE_H: i32 = 22;
 const GAP: i32 = 16;
 const MIN_W: i32 = 280;
 /// Widest candidate bar (fits 9 candidates with Wubi hints).
-const MAX_W: i32 = 1000;
+
 /// Drafts wrap beyond this width and then grow only in height.
 const DRAFT_MAX_W: i32 = 480;
 /// Draft lines shown before it scrolls inside the box.
@@ -287,7 +287,7 @@ const SEPARATOR: u32 = 0x00E0_E0E0;
 struct Composition {
     engine: Composer,
     /// Horizontal extent (client coordinates) of each candidate on this page, for mouse clicks.
-    hits: Vec<(i32, i32)>,
+    hits: Vec<(i32, i32, i32)>,
     row_top: i32,
 }
 impl std::ops::Deref for Composition {
@@ -355,6 +355,7 @@ struct State {
     user_words: RefCell<UserWordsReloader>,
     finished: Cell<bool>,
     /// A TSF commit that got no reply, kept as a draft until the DLL confirms it landed.
+    pending_history: RefCell<Option<(String, String)>>,
     unconfirmed: Cell<Option<yiime_core::UnconfirmedCommit>>,
     /// The current session's field is private (WM_TSF_PRIVATE); reset at each session start.
     private_field: Cell<bool>,
@@ -538,11 +539,12 @@ fn history() -> Option<History<'static>> {
 fn load_history() -> Vec<HistoryEntry> {
     history().map(|history| history.load()).unwrap_or_default()
 }
-fn save_history(entries: &[HistoryEntry]) -> bool {
-    history().is_some_and(|history| history.save(entries))
-}
 fn clear_history() -> bool {
-    history().is_none_or(|history| history.clear())
+    let cleared = history().is_none_or(|history| history.clear());
+    if cleared {
+        history::refresh_open_history();
+    }
+    cleared
 }
 fn local_time() -> String {
     let mut time: windows_sys::Win32::Foundation::SYSTEMTIME = unsafe { std::mem::zeroed() };
@@ -594,8 +596,8 @@ unsafe fn show_history(hwnd: HWND, state: &State, index: usize) -> bool {
 }
 /// History shortcut: load the newest entry as the draft.
 unsafe fn recall_latest(hwnd: HWND, state: &State) {
-    state.recall_session.set(true);
     let shown = option(Flag::HistoryEnabled) && unsafe { show_history(hwnd, state, 0) };
+    state.recall_session.set(shown);
     if !shown {
         unsafe {
             set_status(
@@ -626,7 +628,6 @@ unsafe fn set_clipboard(owner: HWND, text: &str) -> bool {
         if OpenClipboard(owner) == 0 {
             return false;
         }
-        EmptyClipboard();
         let memory = GlobalAlloc(GMEM_MOVEABLE, units.len() * 2);
         let mut ok = false;
         if !memory.is_null() {
@@ -635,7 +636,7 @@ unsafe fn set_clipboard(owner: HWND, text: &str) -> bool {
                 std::ptr::copy_nonoverlapping(units.as_ptr(), target, units.len());
                 GlobalUnlock(memory);
                 // CF_UNICODETEXT = 13; on success the system owns the memory.
-                ok = !SetClipboardData(13, memory).is_null();
+                ok = EmptyClipboard() != 0 && !SetClipboardData(13, memory).is_null();
             }
             if !ok {
                 GlobalFree(memory);
@@ -1112,6 +1113,7 @@ unsafe fn activate(hwnd: HWND, state: &State, target: HWND, anchor: Option<RECT>
     // late (Word answers the read only with the commit), so unknown must not block translation.
     state.private_field.set(false);
     state.history_pos.set(None);
+    state.pending_history.borrow_mut().take();
     state.english.set(false);
     state.generation.set(state.generation.get() + 1);
     let placed = anchor.unwrap_or_else(|| unsafe { caret_of(target) });
@@ -1429,7 +1431,10 @@ unsafe fn commit_to_target(hwnd: HWND, state: &State, text: &str) {
         Err("提交未完成，请检查原应用中的文字")
     };
     match result {
-        Ok(()) => unsafe { clear_box(hwnd, state) },
+        Ok(()) => unsafe {
+            record_confirmed_history(state, text);
+            clear_box(hwnd, state)
+        },
         Err(error) => unsafe {
             service_log(&format!("commit failed: {error}"));
             *state.status.borrow_mut() = Some((format!("{error}，草稿已保留"), true));
@@ -1483,12 +1488,23 @@ fn refresh_user_words(state: &State) {
         full.set_user_words(&contents);
     }
 }
+fn record_confirmed_history(state: &State, text: &str) {
+    if let Some((source, english)) = state.pending_history.borrow_mut().take()
+        && !state.private_field.get()
+        && text == english
+        && source == unsafe { get_text(state.edit) }
+    {
+        remember_translation(&source, &english);
+    }
+}
 unsafe fn on_translated(hwnd: HWND, state: &State, response: TranslationResult) {
     if response.generation != state.generation.get() || !state.pending.get() {
         return;
     }
     state.pending.set(false);
-    if response.source != unsafe { get_text(state.edit) } {
+    if !state.composition.borrow().code.is_empty()
+        || response.source != unsafe { get_text(state.edit) }
+    {
         unsafe {
             set_status(
                 hwnd,
@@ -1502,7 +1518,7 @@ unsafe fn on_translated(hwnd: HWND, state: &State, response: TranslationResult) 
         Ok(english) => unsafe {
             *state.status.borrow_mut() = None;
             if !state.private_field.get() {
-                remember_translation(&response.source, &english);
+                *state.pending_history.borrow_mut() = Some((response.source, english.clone()));
             }
             commit_to_target(hwnd, state, &english);
         },
@@ -1580,14 +1596,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 let y = ((l >> 16) & 0xffff) as i16 as i32;
                 let hit = {
                     let composition = state.composition.borrow();
-                    (y >= composition.row_top && y < composition.row_top + scaled_line_h(state))
-                        .then(|| {
-                            composition
-                                .hits
-                                .iter()
-                                .position(|(left, right)| x >= left - 3 && x <= right + 3)
-                        })
-                        .flatten()
+                    let height = scaled_line_h(state);
+                    composition.hits.iter().position(|&(left, right, line)| {
+                        let top = composition.row_top + line * height;
+                        y >= top && y < top + height && x >= left - 3 && x <= right + 3
+                    })
                 };
                 unsafe {
                     if let Some(index) = hit {
@@ -1629,9 +1642,10 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 && notification == EN_CHANGE_CODE
             {
                 let mut status = state.status.borrow_mut();
-                if !state.pending.get() {
-                    *status = None;
+                if state.pending.replace(false) {
+                    state.generation.set(state.generation.get().wrapping_add(1));
                 }
+                *status = None;
                 drop(status);
                 unsafe {
                     relayout(hwnd, state);
@@ -1841,6 +1855,16 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 // The red "not accepted" was wrong: the text is in the application. Drop the
                 // draft so it is not sent twice.
                 service_log("commit confirmed after the reply was lost");
+                let english = state
+                    .pending_history
+                    .borrow()
+                    .as_ref()
+                    .map(|(_, text)| text.clone());
+                if let Some(text) = english
+                    && yiime_core::commit_digest(&single_line(&text)) == l as u32
+                {
+                    record_confirmed_history(state, &text);
+                }
                 state.unconfirmed.set(None);
                 state.finished.set(true);
                 unsafe {
@@ -2096,6 +2120,7 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
             user_words: RefCell::new(user_words_reloader),
             shown_at: Cell::new(None),
             finished: Cell::new(false),
+            pending_history: RefCell::new(None),
             unconfirmed: Cell::new(None),
             private_field: Cell::new(false),
             swallow_char: Cell::new(false),

@@ -312,10 +312,13 @@ pub fn translate(settings: &ApiSettings, source: &str) -> Outcome {
             }
             Err(error) if fallback && engine == Engine::Azure && !google_blocked() => {
                 provider = Engine::GoogleFree;
-                run(settings, Engine::GoogleFree, source, &mut attempts)
-                    .map_err(|google| format!("{error}；改用 Google 也失败：{google}"))
+                let retry = run(settings, Engine::GoogleFree, source, &mut attempts);
+                set_google_blocked(
+                    attempts.last().and_then(|a| a.failure.as_deref()) == Some("http 429"),
+                );
+                retry.map_err(|google| format!("{error}；改用 Google 也失败：{google}"))
             }
-            Err(error) if could_fall_back => Err(format!("{error}{NO_FALLBACK_NOTE}")),
+            Err(error) if !fallback && could_fall_back => Err(format!("{error}{NO_FALLBACK_NOTE}")),
             other => other,
         }
     };
@@ -443,8 +446,10 @@ fn google_free(
     started: Instant,
 ) -> Result<String, Fail> {
     let mut out = String::new();
+    let mut newline = false;
     for piece in chunks(source, GOOGLE_FREE_CHUNK) {
         if piece.trim().is_empty() {
+            newline |= piece.contains('\n');
             continue;
         }
         let response = agent(false)
@@ -465,9 +470,14 @@ fn google_free(
             .map_err(|_| "Google 翻译返回格式不对")?;
         let text = parse_google_free(&json)?;
         if !out.is_empty() && !out.ends_with(char::is_whitespace) {
-            out.push(if piece.starts_with('\n') { '\n' } else { ' ' });
+            out.push(if newline || piece.starts_with('\n') {
+                '\n'
+            } else {
+                ' '
+            });
         }
         out.push_str(&text);
+        newline = piece.ends_with('\n');
     }
     if out.is_empty() {
         return Err(Fail::new("empty", "译文为空"));
@@ -726,7 +736,7 @@ fn llm(
             mark_minimal(endpoint, model);
         }
     }
-    if truncated_empty(&choice) {
+    if choice["finish_reason"].as_str() == Some("length") {
         return Err(Fail::new(
             "truncated",
             "模型输出被截断（可能是推理模型思考过长），请换用非推理模型",
@@ -1013,6 +1023,10 @@ mod tests {
                         "400 Bad Request",
                         json!({"error": {"message": "Unsupported parameter: temperature"}}),
                     ),
+                    "partial" => (
+                        "200 OK",
+                        json!({"choices":[{"finish_reason":"length","message":{"content":"Half a sentence"}}]}),
+                    ),
                     "broken" => (
                         "500 Internal Server Error",
                         json!({"error": {"message": format!("echo: {body}")}}),
@@ -1044,6 +1058,12 @@ mod tests {
         translate_openai_with("你好", url, model, "k", TranslationStyle::default(), "")
     }
 
+    #[test]
+    fn nonempty_truncation_is_an_error() {
+        let (url, server) = fake_llm(1);
+        assert!(ask(&url, "partial").is_err());
+        server.join().unwrap();
+    }
     #[test]
     fn reduced_request_is_remembered_per_model() {
         // picky: full (400) + minimal; picky again: minimal; other: full; picky: minimal.

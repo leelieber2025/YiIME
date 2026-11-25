@@ -55,15 +55,19 @@ impl<'a> History<'a> {
     }
     /// Newest first; empty if the file is missing or cannot be decrypted.
     pub fn load(&self) -> Vec<HistoryEntry> {
-        let Ok(bytes) = std::fs::read(&self.path) else {
-            return Vec::new();
+        self.try_load().unwrap_or_default()
+    }
+    fn try_load(&self) -> Option<Vec<HistoryEntry>> {
+        let bytes = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
+            Err(_) => return None,
         };
-        let Some(plain) = self.sealer.open(&bytes) else {
-            return Vec::new();
-        };
-        String::from_utf8_lossy(&plain)
+        let plain = self.sealer.open(&bytes)?;
+        std::str::from_utf8(&plain)
+            .ok()?
             .lines()
-            .filter_map(|line| {
+            .map(|line| {
                 let mut fields = line.split('\t');
                 Some(HistoryEntry {
                     time: unescape_field(fields.next()?),
@@ -90,9 +94,26 @@ impl<'a> History<'a> {
             return false;
         };
         let _ = std::fs::create_dir_all(self.path.parent().unwrap_or(&self.path));
-        std::fs::write(&self.path, sealed).is_ok()
+        crate::write_atomically(&self.path, &sealed)
+    }
+    pub fn promote(&self, entry: &HistoryEntry) -> bool {
+        let Ok(_lock) = crate::storage::lock(&self.path) else {
+            return false;
+        };
+        let Some(mut entries) = self.try_load() else {
+            return false;
+        };
+        let Some(index) = entries.iter().position(|item| item == entry) else {
+            return false;
+        };
+        let entry = entries.remove(index);
+        entries.insert(0, entry);
+        self.save(&entries)
     }
     pub fn clear(&self) -> bool {
+        let Ok(_lock) = crate::storage::lock(&self.path) else {
+            return false;
+        };
         !self.path.exists() || std::fs::remove_file(&self.path).is_ok()
     }
     /// Records a committed translation (blank text is skipped). A repeated sentence keeps only its
@@ -101,7 +122,12 @@ impl<'a> History<'a> {
         if chinese.trim().is_empty() {
             return false;
         }
-        let mut entries = self.load();
+        let Ok(_lock) = crate::storage::lock(&self.path) else {
+            return false;
+        };
+        let Some(mut entries) = self.try_load() else {
+            return false;
+        };
         entries.retain(|entry| entry.chinese != chinese);
         entries.insert(
             0,
@@ -168,6 +194,16 @@ mod tests {
             }),
             format!("2026-11-21 15:00   一 二   →   {}…", "x".repeat(40))
         );
+        let stale = entries[0].clone();
+        assert!(history.clear());
+        assert!(!history.promote(&stale));
+        std::fs::write(&history.path, [0xff]).unwrap();
+        assert!(!history.remember("新记录", "new", "now".into()));
+        assert_eq!(std::fs::read(&history.path).unwrap(), [0xff]);
+        let malformed = b"t1\t\xe4\xbd\xa0\xe5\xa5\xbd\tHello\nt2\tbroken\n";
+        std::fs::write(&history.path, malformed).unwrap();
+        assert!(!history.remember("新记录", "new", "now".into()));
+        assert_eq!(std::fs::read(&history.path).unwrap(), malformed);
         assert!(history.clear());
         assert!(history.load().is_empty());
         let _ = std::fs::remove_dir_all(&dir);

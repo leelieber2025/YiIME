@@ -5,6 +5,14 @@ thread_local! {
     static HISTORY_WINDOW: Cell<HWND> = const { Cell::new(null_mut()) };
     static HISTORY_VIEW: RefCell<Vec<HistoryEntry>> = const { RefCell::new(Vec::new()) };
 }
+pub(super) fn refresh_open_history() {
+    let window = HISTORY_WINDOW.with(Cell::get);
+    if !window.is_null() {
+        unsafe {
+            fill_history(window);
+        }
+    }
+}
 unsafe fn fill_history(window: HWND) {
     let entries = load_history();
     unsafe {
@@ -97,7 +105,11 @@ pub(super) unsafe extern "system" fn history_proc(
     let selected = |hwnd: HWND| -> Option<HistoryEntry> {
         let index = unsafe { SendMessageW(GetDlgItem(hwnd, HISTORY_LIST), LB_GETCURSEL, 0, 0) };
         let index = usize::try_from(index).ok()?;
-        HISTORY_VIEW.with(|view| view.borrow().get(index).cloned())
+        let entry = HISTORY_VIEW.with(|view| view.borrow().get(index).cloned())?;
+        if !option(Flag::HistoryEnabled) {
+            return None;
+        }
+        load_history().into_iter().find(|item| item == &entry)
     };
     match msg {
         WM_CREATE => unsafe {
@@ -176,6 +188,7 @@ pub(super) unsafe extern "system" fn history_proc(
             0
         },
         WM_DESTROY => {
+            HISTORY_VIEW.with(|view| view.borrow_mut().clear());
             HISTORY_WINDOW.with(|cell| cell.set(null_mut()));
             0
         }
@@ -187,12 +200,10 @@ unsafe fn reuse_history(window: HWND, entry: Option<HistoryEntry>) {
     let Some(entry) = entry else {
         return;
     };
-    let mut entries = load_history();
-    entries.retain(|item| item.chinese != entry.chinese);
-    entries.insert(0, entry.clone());
-    let saved = option(Flag::HistoryEnabled) && save_history(&entries);
+    let saved =
+        option(Flag::HistoryEnabled) && history().is_some_and(|store| store.promote(&entry));
     unsafe {
-        let copied = set_clipboard(window, &entry.chinese);
+        let copied = saved && set_clipboard(window, &entry.chinese);
         fill_history(window);
         set_text(
             GetDlgItem(window, HISTORY_STATUS),
@@ -204,7 +215,7 @@ unsafe fn reuse_history(window: HWND, entry: Option<HistoryEntry>) {
                         history_key_text()
                     )
                 } else {
-                    String::new()
+                    "此记录已变更或无法保存。".to_owned()
                 },
                 if copied { "中文已复制。" } else { "" }
             ),

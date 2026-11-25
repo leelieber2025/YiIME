@@ -750,6 +750,11 @@ impl MixedInput {
                 })
                 .take(limit)
                 .collect::<Vec<_>>();
+            let umlaut_alias = matches!(code.as_str(), "lve" | "nve");
+            homophones.retain(|(_, _, syllables)| {
+                let own = boundaries(syllables, ' ');
+                umlaut_alias || wanted.iter().all(|offset| own.contains(offset))
+            });
             if !separated.is_empty() {
                 return separated;
             }
@@ -823,19 +828,21 @@ impl MixedInput {
         } else {
             limit
         };
-        push(
-            self.abbreviation(
-                &code,
-                abbreviation_limit,
-                if common_only {
-                    COMMON_FREQUENCY_FLOOR
-                } else {
-                    0
-                },
-            ),
-            Source::Abbreviation,
-            true,
-        );
+        if wanted.is_empty() {
+            push(
+                self.abbreviation(
+                    &code,
+                    abbreviation_limit,
+                    if common_only {
+                        COMMON_FREQUENCY_FLOOR
+                    } else {
+                        0
+                    },
+                ),
+                Source::Abbreviation,
+                true,
+            );
+        }
         if spelled && wanted.is_empty() {
             push(
                 self.mixed_abbreviation(py, limit),
@@ -986,6 +993,13 @@ mod tests {
         assert_eq!(texts("lvewei")[0], "略微");
         assert_eq!(texts("luewei")[0], "略微");
         assert!(input.pinyin_continues("lve"));
+        let boundary = MixedInput::from_rime("...\n", "...\n先\txian\t99\n");
+        assert!(
+            !boundary
+                .candidates("x'ian", 9)
+                .iter()
+                .any(|c| c.text == "先")
+        );
         // With `'` nothing comes from Wubi (no `男女朋友` prefix match, no `恨`).
         assert_eq!(texts("lv'e"), ["略"]);
         assert_eq!(texts("n've"), ["虐"]);

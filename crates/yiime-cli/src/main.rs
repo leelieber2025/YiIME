@@ -206,12 +206,13 @@ fn import(args: &[String]) -> ExitCode {
         }
         return ExitCode::SUCCESS;
     };
-    let existing = std::fs::read_to_string(into).unwrap_or_default();
-    let (contents, added) = yiime_core::merge_user_words(&existing, &words);
-    if let Err(error) = std::fs::write(into, contents) {
-        eprintln!("写入 {into} 失败：{error}");
-        return ExitCode::FAILURE;
-    }
+    let added = match yiime_core::import_into(std::path::Path::new(into), &words) {
+        Ok(added) => added,
+        Err(error) => {
+            eprintln!("写入 {into} 失败：{error}");
+            return ExitCode::FAILURE;
+        }
+    };
     eprintln!("已导入 {added} 个新词（共读到 {} 个）", words.len());
     ExitCode::SUCCESS
 }

@@ -1022,6 +1022,15 @@ pub(super) unsafe extern "system" fn settings_proc(
                             hwnd,
                             "快捷键无效：用 + 连接 Ctrl/Shift/Alt 与 Space、字母、数字或 F1～F12，且须含 Ctrl 或 Alt（F 键除外）",
                         );
+                    } else if parse_hotkey(&hotkey) == parse_hotkey(&history_key)
+                        || ["Ctrl+Space", "Ctrl+Alt+T", "Ctrl+Shift+F"]
+                            .iter()
+                            .any(|fixed| {
+                                [parse_hotkey(&hotkey), parse_hotkey(&history_key)]
+                                    .contains(&parse_hotkey(fixed))
+                            })
+                    {
+                        message(hwnd, "快捷键与其他输入法动作冲突");
                     } else if let Err(error) = api_check {
                         message(hwnd, error);
                     } else if !set_plain_mode(plain)
@@ -1167,14 +1176,9 @@ unsafe fn import_dictionary(hwnd: HWND) {
         .map_err(|error| error.to_string())
         .and_then(|bytes| yiime_core::import_words(&bytes).map_err(str::to_owned))
         .and_then(|words| {
-            let existing = std::fs::read_to_string(&target).unwrap_or_default();
-            let (contents, added) = yiime_core::merge_user_words(&existing, &words);
-            let _ = std::fs::create_dir_all(target.parent().unwrap_or(&target));
-            if yiime_core::write_atomically(&target, contents.as_bytes()) {
-                Ok((added, words.len()))
-            } else {
-                Err(format!("无法写入 {}", target.display()))
-            }
+            yiime_core::import_into(&target, &words)
+                .map(|added| (added, words.len()))
+                .map_err(|e| e.to_string())
         });
     let text = match result {
         Ok((added, total)) => {
