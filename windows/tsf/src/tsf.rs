@@ -985,12 +985,15 @@ const LANGBAR_SINK_COOKIE: u32 = 0x4954_4c42;
 /// Mode button added to the language bar, with its OPENCLOSE compartment advise cookies.
 type ModeButton = Option<(ITfLangBarItemButton, Vec<(ITfSource, u32)>, LangBarSink)>;
 /// A commit waiting for the box to confirm it landed (digest, outcome, field, target).
-type PendingCommit = (
-    u32,
-    Rc<Cell<Option<bool>>>,
-    ITfContext,
-    yiime_core::CommitTarget,
-);
+struct PendingCommit {
+    digest: u32,
+    request: u32,
+    editor: HWND,
+    session: u64,
+    held_id: u64,
+    outcome: Rc<Cell<Option<bool>>>,
+    target: yiime_core::CommitTarget,
+}
 
 #[implement(
     ITfTextInputProcessor,
@@ -1012,6 +1015,7 @@ struct TextService {
     /// Last reason logged for letters passed to the application (logged again only on change).
     pass_logged: Cell<Option<yiime_core::PassReason>>,
     /// Digest and time of the last text inserted for the box (see yiime_core::duplicate_commit).
+    session_revision: Cell<u64>,
     pending_commit: RefCell<Option<PendingCommit>>,
     last_commit: Cell<Option<(u32, std::time::Instant)>>,
     /// Last good caret rectangle (shared with the asynchronous CaretQuery).
@@ -1071,6 +1075,7 @@ impl TextService {
             session_document: RefCell::new(None),
             session_window: Cell::new(null_mut()),
             pass_logged: Cell::new(None),
+            session_revision: Cell::new(0),
             pending_commit: RefCell::new(None),
             last_commit: Cell::new(None),
             caret: Rc::new(Cell::new(yiime_core::SegmentAnchor::default())),
@@ -1843,6 +1848,8 @@ impl TextService {
         private
     }
     fn open_editor(&self, context: ITfContext, first_key: u8) -> bool {
+        self.session_revision
+            .set(self.session_revision.get().wrapping_add(1));
         let target = unsafe { GetForegroundWindow() } as usize;
         // Keys buffered for the previous session do not carry over.
         self.pending_keys.borrow_mut().clear();
@@ -2062,7 +2069,7 @@ impl TextService {
             SetTimer(self.receiver.get(), READY_TIMER, READY_POLL_MS, None);
         }
     }
-    fn commit(&self, text: String) -> bool {
+    fn commit(&self, text: String, request: u32) -> LRESULT {
         if text.is_empty() {
             // Empty: the box closed its session. With no session open, release a parked field
             // (the box was not told about it yet).
@@ -2071,10 +2078,10 @@ impl TextService {
             } else if self.held_id.get() != 0 {
                 self.commit_held(self.held_id.get(), String::new());
             }
-            return true;
+            return 1;
         }
         if self.pending_commit.borrow().is_some() {
-            return false;
+            return 0;
         }
         let session = self
             .editor_open
@@ -2089,8 +2096,8 @@ impl TextService {
             .map(|(previous, at)| (previous, at.elapsed().as_millis() as u64));
         if yiime_core::duplicate_commit(session.is_some(), held.is_some(), last, digest) {
             log("重复的上屏请求（上一次已上屏），忽略");
-            self.confirm_commit(digest);
-            return true;
+            self.report_commit(self.editor_window.get(), request, true);
+            return 1;
         }
         let focused = self.focused_context();
         let session_window = self.session_window.get();
@@ -2147,8 +2154,16 @@ impl TextService {
                 false,
             ) {
                 if outcome.get().is_none() {
-                    *self.pending_commit.borrow_mut() = Some((digest, outcome, context, target));
-                    return false; // The GUI retains its draft until the existing late confirmation arrives.
+                    *self.pending_commit.borrow_mut() = Some(PendingCommit {
+                        digest,
+                        outcome,
+                        target,
+                        request,
+                        editor: self.editor_window.get(),
+                        session: self.session_revision.get(),
+                        held_id: self.held_id.get(),
+                    });
+                    return 2;
                 }
                 if outcome.get() == Some(false) {
                     continue;
@@ -2156,7 +2171,7 @@ impl TextService {
                 log(&format!("上屏成功：{which}"));
                 self.last_commit
                     .set(Some((digest, std::time::Instant::now())));
-                self.confirm_commit(digest);
+                self.report_commit(self.editor_window.get(), request, true);
                 match target {
                     yiime_core::CommitTarget::Session => self.finish_editor(),
                     yiime_core::CommitTarget::Held => self.clear_held(),
@@ -2167,52 +2182,49 @@ impl TextService {
                         self.finish_editor();
                     }
                 }
-                return true;
+                return 1;
             }
             log(&format!("上屏失败：{which}"));
         }
         log("没有可上屏的输入框");
-        false
+        0
     }
-    /// Tells the box the text landed (WM_APP + 10, wParam = receiver, lParam = digest), posted
-    /// besides the COPYDATA reply: that reply can be lost to a timeout while the focus moves, and
-    /// the box would keep a draft that was already inserted.
     fn finish_pending_commit(&self) {
-        let ready = self
+        if self
             .pending_commit
             .borrow()
             .as_ref()
-            .is_some_and(|(_, result, _, _)| result.get().is_some());
-        if !ready {
+            .is_none_or(|p| p.outcome.get().is_none())
+        {
             return;
         }
-        let pending = self.pending_commit.borrow_mut().take();
-        if let Some((digest, result, context, target)) = pending
-            && result.get() == Some(true)
-        {
+        let Some(p) = self.pending_commit.borrow_mut().take() else {
+            return;
+        };
+        let landed = p.outcome.get() == Some(true);
+        self.report_commit(p.editor, p.request, landed);
+        if !landed {
+            return;
+        }
+        if self.session_revision.get() == p.session {
             self.last_commit
-                .set(Some((digest, std::time::Instant::now())));
-            self.confirm_commit(digest);
-            if self.context.borrow().as_ref() == Some(&context) {
+                .set(Some((p.digest, std::time::Instant::now())));
+            if p.target != yiime_core::CommitTarget::Held {
                 self.finish_editor();
             }
-            if target == yiime_core::CommitTarget::Held
-                && self.held_context.borrow().as_ref() == Some(&context)
-            {
-                self.clear_held();
-            }
+        }
+        if p.target == yiime_core::CommitTarget::Held && self.held_id.get() == p.held_id {
+            self.clear_held();
         }
     }
-    fn confirm_commit(&self, digest: u32) {
-        let editor_window = self.editor_window.get();
-        let receiver = self.receiver.get();
-        if !editor_window.is_null() && !receiver.is_null() {
+    fn report_commit(&self, editor: HWND, id: u32, landed: bool) {
+        if id != 0 && !editor.is_null() {
             unsafe {
-                let _ = PostMessageW(
-                    editor_window,
-                    WM_APP + 10,
-                    receiver as usize,
-                    digest as isize,
+                PostMessageW(
+                    editor,
+                    WM_APP + if landed { 10 } else { 16 },
+                    self.receiver.get() as usize,
+                    id as isize,
                 );
             }
         }

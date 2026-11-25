@@ -18,14 +18,27 @@ pub(super) fn watch_tsf_owner(receiver: HWND, pid: u32, editor: HWND) {
     });
 }
 pub(super) unsafe fn send_tsf_text(receiver: HWND, sender: HWND, text: &str) -> bool {
-    let mut utf16: Vec<u16> = text.encode_utf16().collect();
+    matches!(
+        unsafe { send_commit(receiver, sender, text, 0) },
+        Some(1 | 2)
+    )
+}
+/// Protocol 4. None means no reply; 0 rejected, 1 inserted, 2 queued.
+pub(super) unsafe fn send_commit(
+    receiver: HWND,
+    sender: HWND,
+    text: &str,
+    id: u32,
+) -> Option<usize> {
+    let mut units = vec![id as u16, (id >> 16) as u16];
+    units.extend(text.encode_utf16());
     let packet = COPYDATASTRUCT {
-        dwData: 0,
-        cbData: (utf16.len() * 2) as u32,
-        lpData: utf16.as_mut_ptr() as _,
+        dwData: 6,
+        cbData: (units.len() * 2) as u32,
+        lpData: units.as_mut_ptr() as _,
     };
-    let mut accepted = 0usize;
-    unsafe {
+    let mut result = 0;
+    (unsafe {
         SendMessageTimeoutW(
             receiver,
             WM_COPYDATA,
@@ -33,10 +46,10 @@ pub(super) unsafe fn send_tsf_text(receiver: HWND, sender: HWND, text: &str) -> 
             &packet as *const _ as isize,
             SMTO_ABORTIFHUNG,
             3000,
-            &mut accepted,
-        ) != 0
-            && accepted != 0
-    }
+            &mut result,
+        )
+    } != 0)
+        .then_some(result)
 }
 /// Commits `text` into the text field the DLL parked under `id` (COPYDATA dwData 5). Empty text
 /// only releases that field. A session that started afterwards is left running.

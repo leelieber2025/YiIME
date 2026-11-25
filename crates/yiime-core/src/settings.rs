@@ -299,6 +299,8 @@ pub struct ApiSettings {
     /// DeepL API key (stored encrypted in `DEEPL_KEY_FILE`). A key ending in `:fx` uses the free
     /// endpoint.
     pub deepl_key: String,
+    /// Loading the encrypted bundle failed. Preserve its ciphertext on unrelated saves.
+    pub keys_unreadable: bool,
 }
 
 /// Encrypted Google Cloud key file (separate from the LLM key).
@@ -372,17 +374,34 @@ impl Default for ApiSettings {
             azure_key: String::new(),
             azure_region: String::new(),
             deepl_key: String::new(),
+            keys_unreadable: false,
         }
     }
+}
+
+fn open_key_bundle(blob: &serde_json::Value, sealer: &dyn Sealer) -> Option<[String; 4]> {
+    let bytes = serde_json::from_value::<Vec<u8>>(blob.clone()).ok()?;
+    serde_json::from_slice(&sealer.open(&bytes)?).ok()
 }
 
 impl ApiSettings {
     /// Reads settings.json and the encrypted keys under `dir`; missing fields take defaults.
     pub fn load(dir: &Path, sealer: &dyn Sealer) -> Self {
         let mut settings = Self::default();
-        let value = std::fs::read(dir.join(SETTINGS_FILE))
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        let value = match std::fs::read(dir.join(SETTINGS_FILE)) {
+            Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
+                Ok(value) => Some(value),
+                Err(_) => {
+                    settings.keys_unreadable = true;
+                    return settings;
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => {
+                settings.keys_unreadable = true;
+                return settings;
+            }
+        };
         if let Some(value) = value {
             if let Some(text) = value["url"].as_str() {
                 settings.url = text.to_owned();
@@ -406,48 +425,33 @@ impl ApiSettings {
                 settings.allow_fallback = on;
             }
             if let Some(blob) = value.get("sealed_keys") {
-                if let Ok(bytes) = serde_json::from_value::<Vec<u8>>(blob.clone()) {
-                    if let Some(clear) = sealer.open(&bytes) {
-                        if let Ok([key, google, azure, deepl]) =
-                            serde_json::from_slice::<[String; 4]>(&clear)
-                        {
-                            settings.key = key;
-                            settings.google_key = google;
-                            settings.azure_key = azure;
-                            settings.deepl_key = deepl;
-                        }
-                    }
+                if let Some([key, google, azure, deepl]) = open_key_bundle(blob, sealer) {
+                    settings.key = key;
+                    settings.google_key = google;
+                    settings.azure_key = azure;
+                    settings.deepl_key = deepl;
+                } else {
+                    settings.keys_unreadable = true;
                 }
                 return settings;
             }
         }
-        let key = std::fs::read(dir.join(KEY_FILE))
-            .ok()
-            .and_then(|bytes| sealer.open(&bytes))
-            .and_then(|clear| String::from_utf8(clear).ok());
-        if let Some(text) = key {
-            settings.key = text;
-        }
-        let google = std::fs::read(dir.join(GOOGLE_KEY_FILE))
-            .ok()
-            .and_then(|bytes| sealer.open(&bytes))
-            .and_then(|clear| String::from_utf8(clear).ok());
-        if let Some(text) = google {
-            settings.google_key = text;
-        }
-        let azure = std::fs::read(dir.join(AZURE_KEY_FILE))
-            .ok()
-            .and_then(|bytes| sealer.open(&bytes))
-            .and_then(|clear| String::from_utf8(clear).ok());
-        if let Some(text) = azure {
-            settings.azure_key = text;
-        }
-        let deepl = std::fs::read(dir.join(DEEPL_KEY_FILE))
-            .ok()
-            .and_then(|bytes| sealer.open(&bytes))
-            .and_then(|clear| String::from_utf8(clear).ok());
-        if let Some(text) = deepl {
-            settings.deepl_key = text;
+        for (file, key) in [
+            (KEY_FILE, &mut settings.key),
+            (GOOGLE_KEY_FILE, &mut settings.google_key),
+            (AZURE_KEY_FILE, &mut settings.azure_key),
+            (DEEPL_KEY_FILE, &mut settings.deepl_key),
+        ] {
+            match std::fs::read(dir.join(file)) {
+                Ok(bytes) => match sealer.open(&bytes).and_then(|v| String::from_utf8(v).ok()) {
+                    Some(clear) => *key = clear,
+                    None => settings.keys_unreadable = true,
+                },
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    settings.keys_unreadable = true
+                }
+                Err(_) => {}
+            }
         }
         settings
     }
@@ -459,9 +463,57 @@ impl ApiSettings {
             self.azure_key.trim(),
             self.deepl_key.trim(),
         ])?;
-        let encrypted = sealer
-            .seal(&keys)
-            .ok_or_else(|| std::io::Error::other("密钥加密失败"))?;
+        let file = dir.join(SETTINGS_FILE);
+        let _lock = crate::storage::lock(&file)?;
+        let old: serde_json::Value = match std::fs::read(&file) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
+            Err(e) => return Err(e),
+        };
+        if old.get("sealed_keys").is_none() {
+            if self.keys_unreadable {
+                return Err(std::io::Error::other("请重新打开设置后再迁移原密钥"));
+            }
+            // A failed migration must leave the legacy key files intact.
+            for name in [KEY_FILE, GOOGLE_KEY_FILE, AZURE_KEY_FILE, DEEPL_KEY_FILE] {
+                match std::fs::read(dir.join(name)) {
+                    Ok(bytes)
+                        if sealer
+                            .open(&bytes)
+                            .and_then(|v| String::from_utf8(v).ok())
+                            .is_none() =>
+                    {
+                        return Err(std::io::Error::other("原密钥无法读取，未迁移设置"));
+                    }
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                    _ => {}
+                }
+            }
+        }
+        let encrypted = match old.get("sealed_keys") {
+            Some(blob) if self.keys_unreadable || open_key_bundle(blob, sealer).is_none() => {
+                if [
+                    &self.key,
+                    &self.azure_key,
+                    &self.google_key,
+                    &self.deepl_key,
+                ]
+                .iter()
+                .any(|k| !k.is_empty())
+                    || old["url"].as_str() != Some(self.url.as_str())
+                {
+                    return Err(std::io::Error::other(
+                        "原密钥暂时无法解密，已保留原设置；请恢复密钥后再更改密钥或 API 地址",
+                    ));
+                }
+                blob.clone()
+            }
+            _ => serde_json::to_value(
+                sealer
+                    .seal(&keys)
+                    .ok_or_else(|| std::io::Error::other("密钥加密失败"))?,
+            )?,
+        };
         let snapshot = serde_json::to_vec(&serde_json::json!({
             "sealed_keys": encrypted,
             "url": self.url,
@@ -482,7 +534,14 @@ impl ApiSettings {
     }
     /// Checks before sending a request. Free Google needs nothing; Google Cloud needs a key; see
     /// [`Self::validate_llm`] for the LLM.
+    pub(crate) fn check_key_access(&self) -> Result<(), &'static str> {
+        if self.keys_unreadable && self.engine != Engine::GoogleFree {
+            return Err("翻译密钥暂时无法读取，已保留原文");
+        }
+        Ok(())
+    }
     pub fn validate(&self) -> Result<(), &'static str> {
+        self.check_key_access()?;
         match self.engine {
             Engine::Azure | Engine::GoogleFree => Ok(()),
             Engine::GoogleCloud if self.google_key.trim().is_empty() => {
@@ -633,6 +692,53 @@ mod tests {
     }
 
     #[test]
+    fn save_after_transient_key_failure_preserves_all_keys_and_endpoint() {
+        struct Locked;
+        impl Sealer for Locked {
+            fn seal(&self, _: &[u8]) -> Option<Vec<u8>> {
+                None
+            }
+            fn open(&self, _: &[u8]) -> Option<Vec<u8>> {
+                None
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("yiime-key-recovery-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let original = ApiSettings {
+            key: "test-only".into(),
+            ..ApiSettings::default()
+        };
+        original.save(&dir, &PlainSealer).unwrap();
+        let mut draft = ApiSettings::load(&dir, &Locked);
+        assert!(draft.keys_unreadable);
+        draft.custom = "another style".into();
+        draft.save(&dir, &PlainSealer).unwrap();
+        let roundtrip = ApiSettings::load(&dir, &PlainSealer);
+        assert_eq!(roundtrip.key, original.key);
+        assert_eq!(roundtrip.custom, draft.custom);
+        draft.url.push_str("/different");
+        assert!(draft.save(&dir, &PlainSealer).is_err());
+        assert_eq!(ApiSettings::load(&dir, &PlainSealer), roundtrip);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn corrupt_settings_json_does_not_look_like_missing_keys() {
+        let dir = std::env::temp_dir().join(format!("yiime-bad-json-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let broken = b"{not json";
+        std::fs::write(dir.join(SETTINGS_FILE), broken).unwrap();
+        let loaded = ApiSettings::load(&dir, &PlainSealer);
+        assert!(loaded.keys_unreadable);
+        assert!(loaded.check_key_access().is_err());
+        let mut draft = loaded;
+        draft.custom = "x".into();
+        assert!(draft.save(&dir, &PlainSealer).is_err());
+        assert_eq!(std::fs::read(dir.join(SETTINGS_FILE)).unwrap(), broken);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn api_settings_round_trip_and_validation() {
         struct Xor;
         impl Sealer for Xor {
@@ -658,6 +764,7 @@ mod tests {
             azure_key: "akey".into(),
             azure_region: "eastus".into(),
             deepl_key: "dkey:fx".into(),
+            keys_unreadable: false,
         };
         settings.save(&dir, &Xor).unwrap();
         let json = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();

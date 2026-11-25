@@ -51,6 +51,7 @@ struct DisplayCandidate {
 struct CandidateView {
     code: String,
     rows: Vec<DisplayCandidate>,
+    size: usize,
     page: usize,
 }
 
@@ -192,12 +193,12 @@ fn page_len() -> usize {
     page_size().max(1)
 }
 
-fn page_count(total: usize) -> usize {
-    total.div_ceil(page_len()).max(1)
+fn page_count(view: &CandidateView) -> usize {
+    view.rows.len().div_ceil(view.size).max(1)
 }
 
 fn page_items(view: &CandidateView) -> &[DisplayCandidate] {
-    let size = page_len();
+    let size = view.size;
     let start = view.page.saturating_mul(size);
     let end = (start + size).min(view.rows.len());
     if start >= view.rows.len() {
@@ -550,13 +551,16 @@ impl ITfCandidateListUIElement_Impl for CandidateElement_Impl {
         unsafe { state.as_ref().ok_or(E_FAIL)?.context.GetDocumentMgr() }
     }
     fn GetCount(&self) -> Result<u32> {
-        Ok(page_items(&self.view.borrow()).len() as u32)
+        Ok(self.view.borrow().rows.len() as u32)
     }
     fn GetSelection(&self) -> Result<u32> {
-        Ok(0)
+        let view = self.view.borrow();
+        Ok((view.page * view.size) as u32)
     }
     fn GetString(&self, index: u32) -> Result<BSTR> {
-        page_items(&self.view.borrow())
+        self.view
+            .borrow()
+            .rows
             .get(index as usize)
             .map(|candidate| BSTR::from(candidate.text.as_str()))
             .ok_or(E_FAIL.into())
@@ -565,8 +569,9 @@ impl ITfCandidateListUIElement_Impl for CandidateElement_Impl {
         if count.is_null() || (size > 0 && index.is_null()) {
             return Err(E_FAIL.into());
         }
-        let pages = page_count(self.view.borrow().rows.len()) as u32;
-        let step = page_len() as u32;
+        let view = self.view.borrow();
+        let pages = page_count(&view) as u32;
+        let step = view.size as u32;
         unsafe {
             *count = pages;
             let n = size.min(pages);
@@ -727,13 +732,7 @@ impl ComposeEdit_Impl {
             .map(|state| state.code.clone());
         if let Some(code) = code {
             self.ui.advise_layout(&self.context, self.client_id);
-            self.ui.refresh_element();
-            if self.ui.shown.get() {
-                self.ui.show(&self.context, position, &code);
-            } else {
-                log("候选窗未显示：宿主要求无界面");
-                self.ui.hide();
-            }
+            self.ui.show(&self.context, position, &code);
         } else {
             self.ui.end_ui();
         }
@@ -1026,7 +1025,7 @@ fn paint_candidates(hwnd: HWND) {
         FillRect(hdc, &mid, divider);
         DeleteObject(divider as _);
     }
-    let pages = page_count(view.rows.len());
+    let pages = page_count(view);
     let prev_color = if view.page > 0 { MUTED } else { DISABLED };
     let next_color = if view.page + 1 < pages {
         MUTED
@@ -1138,10 +1137,16 @@ impl CandidateUi {
             *view = CandidateView {
                 code: code.to_owned(),
                 rows,
+                size: page_len(),
                 page,
             };
-            let last = page_count(view.rows.len()).saturating_sub(1);
+            let last = page_count(&view).saturating_sub(1);
             view.page = view.page.min(last);
+        }
+        self.refresh_element();
+        if !self.shown.get() {
+            self.hide();
+            return;
         }
         let mut window = self.window.get();
         if window.is_null() || unsafe { IsWindow(window) } == 0 {
@@ -1226,7 +1231,7 @@ impl CandidateUi {
     fn turn_page(&self, forward: bool) -> bool {
         let changed = {
             let mut view = self.view.borrow_mut();
-            let last = page_count(view.rows.len()).saturating_sub(1);
+            let last = page_count(&view).saturating_sub(1);
             let next = if forward {
                 view.page.saturating_add(1).min(last)
             } else {
@@ -1245,6 +1250,11 @@ impl CandidateUi {
         true
     }
     fn relayout(&self) {
+        self.refresh_element();
+        if !self.shown.get() {
+            self.hide();
+            return;
+        }
         let window = self.window.get();
         if window.is_null() || unsafe { IsWindow(window) } == 0 {
             return;
@@ -1266,7 +1276,6 @@ impl CandidateUi {
         if let Some(position) = self.last_caret.get() {
             place(window, position);
         }
-        self.refresh_element();
     }
     fn page_choice(&self, index: usize) -> Option<String> {
         page_items(&self.view.borrow())
@@ -1325,6 +1334,7 @@ impl InlineInput {
                 view: Rc::new(RefCell::new(CandidateView {
                     code: String::new(),
                     rows: Vec::new(),
+                    size: page_len(),
                     page: 0,
                 })),
                 last_caret: Rc::new(Cell::new(None)),
@@ -1475,5 +1485,39 @@ impl InlineInput {
     pub(super) fn deactivate(&self, client_id: u32) {
         self.cancel(client_id);
         self.ui.manager.borrow_mut().take();
+    }
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+
+    #[test]
+    fn host_reads_the_last_page_using_global_indices() {
+        let view = CandidateView {
+            code: "x".into(),
+            size: 5,
+            page: 2,
+            rows: (0..12)
+                .map(|n| DisplayCandidate {
+                    text: n.to_string(),
+                    hint: String::new(),
+                    complete: true,
+                })
+                .collect(),
+        };
+        let element: ITfCandidateListUIElement = CandidateElement {
+            state: Rc::new(RefCell::new(None)),
+            shown: Rc::new(Cell::new(false)),
+            view: Rc::new(RefCell::new(view)),
+        }
+        .into();
+        unsafe {
+            assert_eq!(element.GetCount().unwrap(), 12);
+            assert_eq!(element.GetCurrentPage().unwrap(), 2);
+            assert_eq!(element.GetSelection().unwrap(), 10);
+            assert_eq!(element.GetString(11).unwrap().to_string(), "11");
+            assert!(element.GetString(12).is_err());
+        }
     }
 }

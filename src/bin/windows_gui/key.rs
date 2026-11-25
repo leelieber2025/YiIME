@@ -2,7 +2,7 @@ use super::*;
 use yiime_core::KeyAction;
 
 pub(super) unsafe fn set_code(hwnd: HWND, state: &State, code: String) {
-    if state.pending.get() && state.composition.borrow().code != code {
+    if state.composition.borrow().code != code {
         state.pending.set(false);
         state.generation.set(state.generation.get().wrapping_add(1));
         *state.status.borrow_mut() = None;
@@ -254,6 +254,9 @@ unsafe fn run_key_action(hwnd: HWND, state: &State, ch: char, action: KeyAction)
         // In plain mode a commit produced here goes out together with the next one (flushing
         // now would end the session and lose the new letter).
         KeyAction::Compose(letter) => {
+            state.generation.set(state.generation.get().wrapping_add(1));
+            state.pending.set(false);
+            *state.status.borrow_mut() = None;
             let rules = LetterRules {
                 push_fifth: option(Flag::PushFifth),
                 auto_commit4: option(Flag::AutoCommit4),
@@ -476,11 +479,11 @@ pub(super) unsafe extern "system" fn edit_proc(
                 && option(Flag::HistoryEnabled) =>
         {
             let draft = unsafe { get_text(state.edit) };
-            let current = state.history_pos.get().and_then(|_| {
-                load_history()
-                    .iter()
-                    .position(|entry| entry.chinese == draft)
-            });
+            let entries = load_history();
+            let current = state
+                .history_pos
+                .get()
+                .and_then(|_| entries.iter().position(|entry| entry.chinese == draft));
             let untouched = draft.is_empty() || current.is_some();
             if untouched {
                 let older = [VK_UP, VK_PRIOR].contains(&(w as u16));
@@ -491,7 +494,7 @@ pub(super) unsafe extern "system" fn edit_proc(
                     (Some(index), false) => index.checked_sub(1),
                 };
                 if let Some(index) = next
-                    && unsafe { show_history(hwnd, state, index) }
+                    && unsafe { show_history(hwnd, state, &entries, index) }
                 {
                     state.recall_session.set(true);
                 }

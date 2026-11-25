@@ -566,6 +566,7 @@ pub(super) unsafe extern "system" fn settings_proc(
                 return -1;
             };
             let settings = current_settings(state);
+            state.dialog_keys_unreadable.set(settings.keys_unreadable);
             let dpi = window_dpi(hwnd);
             let font = settings_dialog_font(dpi);
             let previous = state.settings_font.replace(font);
@@ -948,6 +949,7 @@ pub(super) unsafe extern "system" fn settings_proc(
                     let engine_index =
                         SendMessageW(GetDlgItem(hwnd, SETTINGS_ENGINE), CB_GETCURSEL, 0, 0);
                     let settings = ApiSettings {
+                        keys_unreadable: state.dialog_keys_unreadable.get(),
                         engine: usize::try_from(engine_index)
                             .ok()
                             .and_then(|index| Engine::ALL.get(index).copied())
@@ -1010,7 +1012,9 @@ pub(super) unsafe extern "system" fn settings_proc(
                     // Plain Wubi mode never translates, so API settings are not required. With
                     // Google selected the LLM is an optional fallback, but once a key is
                     // entered the whole LLM configuration must be valid.
-                    let api_check = if plain && settings.key.is_empty() {
+                    let api_check = if settings.keys_unreadable
+                        || (plain && settings.key.is_empty())
+                    {
                         Ok(())
                     } else if settings.engine != Engine::Llm && !settings.key.trim().is_empty() {
                         settings.validate().and_then(|_| settings.validate_llm())

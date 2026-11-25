@@ -95,28 +95,27 @@ unsafe fn receiver_proc_impl(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> 
             };
             return unsafe { (*pointer).commit_held(id, text) } as LRESULT;
         }
-        if packet.dwData != 0 {
-            return 0;
-        }
-        if packet.cbData == 0 {
-            return unsafe { (*pointer).commit(String::new()) as LRESULT };
-        }
-        if packet.cbData as usize > 1_000_000
+        if packet.dwData != 6
+            || !(4..=1_000_004).contains(&packet.cbData)
             || !packet.cbData.is_multiple_of(2)
             || packet.lpData.is_null()
         {
             return 0;
         }
         let units = unsafe {
-            std::slice::from_raw_parts(packet.lpData as *const u16, packet.cbData as usize / 2)
+            std::slice::from_raw_parts(packet.lpData.cast::<u16>(), packet.cbData as usize / 2)
         };
-        let Ok(text) = String::from_utf16(units) else {
+        let request = u32::from(units[0]) | (u32::from(units[1]) << 16);
+        let Ok(text) = String::from_utf16(&units[2..]) else {
             return 0;
         };
+        if text.is_empty() {
+            return unsafe { (*pointer).commit(text, request) };
+        }
         if unsafe { (*pointer).waiting_for_editor() } {
             let _ = unsafe { (*pointer).editor_ready(w as HWND) };
         }
-        return unsafe { (*pointer).commit(text) as LRESULT };
+        return unsafe { (*pointer).commit(text, request) };
     }
     if message == WM_SCOPE_READ || message == WM_CARET_READ {
         let pointer = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const TextService_Impl };

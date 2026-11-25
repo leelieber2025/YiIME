@@ -272,6 +272,12 @@ fn cache_key(settings: &ApiSettings, source: &str) -> CacheKey {
 /// Translates with the selected engine; if Google (free or Cloud) fails and an LLM is configured,
 /// falls back to the LLM. Recent results are cached; free Google is skipped for a while after 429.
 pub fn translate(settings: &ApiSettings, source: &str) -> Outcome {
+    if let Err(e) = settings.check_key_access() {
+        return Outcome {
+            result: Err(e.to_owned()),
+            attempts: Vec::new(),
+        };
+    }
     let key = cache_key(settings, source);
     let engine = match settings.engine {
         Engine::Azure if settings.azure_key.trim().is_empty() => Engine::GoogleFree,
@@ -759,6 +765,9 @@ fn truncated_empty(choice: &Value) -> bool {
 /// finish while typing. Sends only a HEAD request without key or text; failures are ignored. At
 /// most once per 30 seconds.
 pub fn prewarm(settings: &ApiSettings) {
+    if settings.check_key_access().is_err() {
+        return;
+    }
     static LAST: Mutex<Option<Instant>> = Mutex::new(None);
     {
         let mut last = LAST.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -1309,6 +1318,19 @@ mod tests {
         let json = serde_json::json!([{"translations": [{"text": " Hello ", "to": "en"}]}]);
         assert_eq!(super::parse_azure(&json).unwrap(), "Hello");
         assert!(super::parse_azure(&serde_json::json!([])).is_err());
+    }
+
+    #[test]
+    fn unavailable_azure_keys_never_route_to_google() {
+        let settings = ApiSettings {
+            engine: Engine::Azure,
+            keys_unreadable: true,
+            allow_fallback: true,
+            ..Default::default()
+        };
+        let result = translate(&settings, "本地测试");
+        assert!(result.result.is_err());
+        assert!(result.attempts.is_empty());
     }
 
     #[test]

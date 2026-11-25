@@ -168,8 +168,10 @@ const WM_TSF_FOCUS_MOVED: u32 = WM_APP + 8;
 /// From the TSF DLL (wParam = receiver): that application switched to English (Shift tap,
 /// Ctrl+Space, the mode button…); its session ends.
 const WM_TSF_ENGLISH: u32 = WM_APP + 9;
-/// From the TSF DLL (wParam = receiver, lParam = yiime_core::commit_digest): a commit landed. Sent
+/// From the TSF DLL (wParam = receiver, lParam = request ID): a commit landed. Sent
 /// besides the COPYDATA reply, which can be lost to a timeout while the focus moves.
+const COMMIT_TIMER: usize = 11;
+const WM_TSF_COMMIT_FAILED: u32 = WM_APP + 16;
 const WM_TSF_COMMITTED: u32 = WM_APP + 10;
 /// From the TSF DLL (wParam = receiver, lParam 1 = private): the session's field declared a
 /// private InputScope (password, PIN, or a browser's private window). Nothing typed there is
@@ -300,6 +302,12 @@ impl std::ops::DerefMut for Composition {
     }
 }
 
+struct AwaitingCommit {
+    identity: yiime_core::CommitIdentity,
+    history: Option<(String, String)>,
+    started: std::time::Instant,
+    notified: bool,
+}
 struct State {
     input: RefCell<Arc<MixedInput>>,
     full_input: Arc<OnceLock<Arc<MixedInput>>>,
@@ -319,6 +327,7 @@ struct State {
     /// Stamp of the settings files behind `settings` (see [`current_settings`]).
     settings_stamp: Cell<Option<yiime_core::SettingsStamp>>,
     settings_window: Cell<HWND>,
+    dialog_keys_unreadable: Cell<bool>,
     /// Dialog font for the settings window (message font, scaled to the window DPI).
     settings_font: Cell<HFONT>,
     settings_dpi: Cell<u32>,
@@ -354,7 +363,8 @@ struct State {
     finished: Cell<bool>,
     /// A TSF commit that got no reply, kept as a draft until the DLL confirms it landed.
     pending_history: RefCell<Option<(String, String)>>,
-    unconfirmed: Cell<Option<yiime_core::UnconfirmedCommit>>,
+    receipts: RefCell<Vec<AwaitingCommit>>,
+    next_request: Cell<u32>,
     /// The current session's field is private (WM_TSF_PRIVATE); reset at each session start.
     private_field: Cell<bool>,
     /// The plain-mode shortcut was pressed in the box: swallow the WM_CHAR it produces.
@@ -564,8 +574,7 @@ fn remember_translation(chinese: &str, english: &str) {
 }
 /// Loads history entry `index` into the draft (replacing it); the status line shows its time
 /// and translation.
-unsafe fn show_history(hwnd: HWND, state: &State, index: usize) -> bool {
-    let entries = load_history();
+unsafe fn show_history(hwnd: HWND, state: &State, entries: &[HistoryEntry], index: usize) -> bool {
     let Some(entry) = entries.get(index) else {
         return false;
     };
@@ -594,7 +603,8 @@ unsafe fn show_history(hwnd: HWND, state: &State, index: usize) -> bool {
 }
 /// History shortcut: load the newest entry as the draft.
 unsafe fn recall_latest(hwnd: HWND, state: &State) {
-    let shown = option(Flag::HistoryEnabled) && unsafe { show_history(hwnd, state, 0) };
+    let shown =
+        option(Flag::HistoryEnabled) && unsafe { show_history(hwnd, state, &load_history(), 0) };
     state.recall_session.set(shown);
     if !shown {
         unsafe {
@@ -864,7 +874,7 @@ fn load_settings() -> ApiSettings {
 fn current_settings(state: &State) -> ApiSettings {
     if let Some(dir) = settings_dir() {
         let stamp = yiime_core::SettingsStamp::of(&dir);
-        if state.settings_stamp.get() != Some(stamp) {
+        if state.settings_stamp.get() != Some(stamp) || state.settings.borrow().keys_unreadable {
             let settings = ApiSettings::load(&dir, &Dpapi);
             service_log(&format!(
                 "settings reloaded: engine={} fallback={}",
@@ -1383,6 +1393,12 @@ unsafe fn submit(hwnd: HWND, state: &State, chinese: bool) {
 /// Switches back to the application and commits the text (through the DLL's edit session under
 /// TSF, SendInput when portable).
 unsafe fn commit_to_target(hwnd: HWND, state: &State, text: &str) {
+    if state.receipts.borrow().iter().any(|p| {
+        p.identity
+            .owns_draft(state.tsf_receiver.get() as usize, state.generation.get())
+    }) {
+        return;
+    }
     let target = state.target.get();
     if target.is_null() || unsafe { IsWindow(target) } == 0 {
         unsafe {
@@ -1407,20 +1423,37 @@ unsafe fn commit_to_target(hwnd: HWND, state: &State, text: &str) {
         Err("原应用尚未取得输入焦点")
     } else if !state.tsf_receiver.get().is_null() {
         let receiver = state.tsf_receiver.get();
-        let digest = yiime_core::commit_digest(&line);
-        state.unconfirmed.set(None);
-        if unsafe { send_tsf_text(receiver, hwnd, &line) }
-            || unsafe { take_commit_confirmation(hwnd, receiver, digest) }
-        {
-            state.finished.set(true);
-            Ok(())
-        } else {
-            let kept = yiime_core::commit_digest(&single_line(&unsafe { get_text(state.edit) }));
-            state
-                .unconfirmed
-                .set(Some((receiver as usize, digest, kept)));
-            Err("输入法没有接受提交")
+        let revision = state.generation.get();
+        let id = state.next_request.get().wrapping_add(1).max(1);
+        state.next_request.set(id);
+        let history = state
+            .pending_history
+            .borrow_mut()
+            .take()
+            .filter(|(source, english)| {
+                english == text
+                    && !state.private_field.get()
+                    && source == &unsafe { get_text(state.edit) }
+            });
+        state.receipts.borrow_mut().push(AwaitingCommit {
+            identity: yiime_core::CommitIdentity {
+                receiver: receiver as usize,
+                request: id,
+                revision,
+            },
+            history,
+            started: std::time::Instant::now(),
+            notified: false,
+        });
+        unsafe {
+            SetTimer(hwnd, COMMIT_TIMER, 1000, None);
         }
+        match unsafe { ipc::send_commit(receiver, hwnd, &line, id) } {
+            Some(1) => unsafe { finish_receipt(hwnd, state, receiver as usize, id, true) },
+            Some(0) => unsafe { finish_receipt(hwnd, state, receiver as usize, id, false) },
+            _ => {} // Queued or the transport timed out; the DLL posts the definitive result.
+        }
+        return;
     } else if unsafe { send_unicode(&line) } {
         // UIPI may silently block SendInput (e.g. to an elevated window); that cannot be
         // detected here.
@@ -1440,24 +1473,41 @@ unsafe fn commit_to_target(hwnd: HWND, state: &State, text: &str) {
         },
     }
 }
-/// Whether the DLL already posted that `digest` landed (its COPYDATA reply was lost). Removes the
-/// confirmations that are waiting.
-unsafe fn take_commit_confirmation(hwnd: HWND, receiver: HWND, digest: u32) -> bool {
-    let mut landed = false;
-    let mut message: MSG = unsafe { std::mem::zeroed() };
-    while unsafe {
-        PeekMessageW(
-            &mut message,
-            hwnd,
-            WM_TSF_COMMITTED,
-            WM_TSF_COMMITTED,
-            PM_REMOVE,
-        )
-    } != 0
+unsafe fn finish_receipt(hwnd: HWND, state: &State, receiver: usize, id: u32, landed: bool) {
+    let receipt = {
+        let mut pending = state.receipts.borrow_mut();
+        let Some(i) = pending
+            .iter()
+            .position(|p| p.identity.matches_reply(receiver, id))
+        else {
+            return;
+        };
+        pending.remove(i)
+    };
+    if landed
+        && let Some((source, english)) = receipt.history
+        && !state.private_field.get()
     {
-        landed |= message.wParam == receiver as usize && message.lParam as u32 == digest;
+        remember_translation(&source, &english);
     }
-    landed
+    if !receipt
+        .identity
+        .owns_draft(state.tsf_receiver.get() as usize, state.generation.get())
+    {
+        return;
+    }
+    if landed {
+        state.finished.set(true);
+        unsafe {
+            clear_box(hwnd, state);
+            hide_box(hwnd, state);
+        }
+    } else {
+        unsafe {
+            set_status(hwnd, state, Some(("上屏失败，草稿已保留".into(), true)));
+            show_box(hwnd, state);
+        }
+    }
 }
 /// Switches to the dictionary with the large lexicon once it is loaded, between compositions;
 /// mid-composition the tray timer retries.
@@ -1538,6 +1588,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             | WM_TSF_FOCUS_MOVED
             | WM_TSF_ENGLISH
             | WM_TSF_COMMITTED
+            | WM_TSF_COMMIT_FAILED
             | WM_TSF_PRIVATE
     ) {
         yiime_core::handle_from_wire(w as u64) as WPARAM
@@ -1640,9 +1691,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 && notification == EN_CHANGE_CODE
             {
                 let mut status = state.status.borrow_mut();
-                if state.pending.replace(false) {
-                    state.generation.set(state.generation.get().wrapping_add(1));
-                }
+                state.pending.set(false);
+                state.generation.set(state.generation.get().wrapping_add(1));
                 *status = None;
                 drop(status);
                 unsafe {
@@ -1832,6 +1882,16 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 && w as HWND == state.tsf_receiver.get()
                 && state.private_field.replace(l != 0) != (l != 0)
             {
+                if l != 0 {
+                    for receipt in state
+                        .receipts
+                        .borrow_mut()
+                        .iter_mut()
+                        .filter(|p| p.identity.receiver == w)
+                    {
+                        receipt.history = None;
+                    }
+                }
                 service_log(if l != 0 {
                     "session: private field (no learning, history or translation)"
                 } else {
@@ -1840,34 +1900,50 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             }
             0
         }
-        WM_TSF_COMMITTED => {
+        WM_TSF_COMMITTED | WM_TSF_COMMIT_FAILED => {
             if let Some(state) = state
                 && state.tsf_service
-                && yiime_core::late_commit_landed(
-                    state.unconfirmed.get(),
-                    w,
-                    l as u32,
-                    &single_line(&unsafe { get_text(state.edit) }),
-                )
             {
-                // The red "not accepted" was wrong: the text is in the application. Drop the
-                // draft so it is not sent twice.
-                service_log("commit confirmed after the reply was lost");
-                let english = state
-                    .pending_history
-                    .borrow()
-                    .as_ref()
-                    .map(|(_, text)| text.clone());
-                if let Some(text) = english
-                    && yiime_core::commit_digest(&single_line(&text)) == l as u32
-                {
-                    record_confirmed_history(state, &text);
-                }
-                state.unconfirmed.set(None);
-                state.finished.set(true);
                 unsafe {
-                    clear_box(hwnd, state);
-                    hide_box(hwnd, state);
+                    finish_receipt(hwnd, state, w, l as u32, msg == WM_TSF_COMMITTED);
+                }
+            }
+            0
+        }
+        WM_TIMER if w == COMMIT_TIMER => {
+            if let Some(state) = state {
+                let warn = {
+                    let mut pending = state.receipts.borrow_mut();
+                    let mut warn = false;
+                    for p in pending.iter_mut() {
+                        if !p.notified && p.started.elapsed().as_secs() >= 10 {
+                            p.notified = true;
+                            warn |= p.identity.owns_draft(
+                                state.tsf_receiver.get() as usize,
+                                state.generation.get(),
+                            );
+                        }
+                    }
+                    pending.retain(|p| p.started.elapsed().as_secs() < 1800);
+                    if pending.is_empty() {
+                        unsafe {
+                            KillTimer(hwnd, COMMIT_TIMER);
+                        }
+                    }
+                    warn
+                };
+                if warn {
+                    unsafe {
+                        set_status(
+                            hwnd,
+                            state,
+                            Some((
+                                "尚未收到上屏确认，请先核对原输入框；草稿已保留".into(),
+                                true,
+                            )),
+                        );
+                        show_box(hwnd, state);
+                    }
                 }
             }
             0
@@ -2099,6 +2175,7 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
             ),
             settings: RefCell::new(load_settings()),
             settings_window: Cell::new(null_mut()),
+            dialog_keys_unreadable: Cell::new(false),
             settings_font: Cell::new(null_mut()),
             settings_dpi: Cell::new(0),
             settings_min: Cell::new((0, 0)),
@@ -2119,7 +2196,8 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
             shown_at: Cell::new(None),
             finished: Cell::new(false),
             pending_history: RefCell::new(None),
-            unconfirmed: Cell::new(None),
+            receipts: RefCell::new(Vec::new()),
+            next_request: Cell::new(0),
             private_field: Cell::new(false),
             swallow_char: Cell::new(false),
             last_plain: Cell::new(plain_mode()),

@@ -35,6 +35,7 @@ fn pinyin_code(spelling: &str) -> Option<String> {
 pub fn parse_text_export(text: &str) -> Vec<ImportedWord> {
     let mut words = Vec::new();
     for line in text.lines() {
+        let line = line.split_once('#').map_or(line, |(body, _)| body);
         let line = line.trim_start_matches('\u{feff}').trim();
         if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
             continue;
@@ -75,6 +76,9 @@ pub fn parse_text_export(text: &str) -> Vec<ImportedWord> {
 /// is not supported (re-save it as UTF-8). None if it is not valid text.
 pub fn decode_text(bytes: &[u8]) -> Option<String> {
     let utf16 = |little: bool, data: &[u8]| {
+        if data.len() % 2 != 0 {
+            return None;
+        }
         let units: Vec<u16> = data
             .chunks_exact(2)
             .map(|pair| {
@@ -231,6 +235,15 @@ mod tests {
             .iter()
             .map(|(word, code)| (word.to_string(), code.to_string()))
             .collect()
+    }
+
+    #[test]
+    fn trailing_comment_and_truncated_utf16() {
+        assert_eq!(
+            parse_text_export("你好\tni hao\t12 # imported"),
+            pairs(&[("你好", "nihao")])
+        );
+        assert!(decode_text(&[0xff, 0xfe, 0x41]).is_none());
     }
 
     #[test]

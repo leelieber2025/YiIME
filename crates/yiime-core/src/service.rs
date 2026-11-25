@@ -171,14 +171,31 @@ pub fn may_share_service(host: &ProcessSecurity, service: Option<&ProcessSecurit
         })
 }
 
+/// Identity of one GUI-to-TSF write. Document contents may be identical across sessions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommitIdentity {
+    pub receiver: usize,
+    pub request: u32,
+    pub revision: u64,
+}
+
+impl CommitIdentity {
+    pub fn matches_reply(self, receiver: usize, request: u32) -> bool {
+        self.receiver == receiver && self.request == request
+    }
+    pub fn owns_draft(self, receiver: usize, revision: u64) -> bool {
+        self.receiver == receiver && self.revision == revision
+    }
+}
+
 /// Version of the DLL ↔ input-box protocol (window messages and COPYDATA packets). It is part of
 /// the receiver window class and the service window title, so a DLL and a service of different
 /// protocol versions never find or accept each other: after an upgrade without a restart, an
 /// application still running an old DLL keeps its own old input box instead of talking to the new
 /// one. Bump it whenever a message or packet changes meaning.
-pub const TSF_PROTOCOL: u32 = 3;
+pub const TSF_PROTOCOL: u32 = 4;
 /// Window class of the TSF DLL's receiver window (the input box accepts sessions only from it).
-pub const TSF_RECEIVER_CLASS: &str = concat!("YiIMETsfReceiver.", 3);
+pub const TSF_RECEIVER_CLASS: &str = concat!("YiIMETsfReceiver.", 4);
 /// Window class of YiIME.exe's tray and input-box windows, which the TSF DLL looks up.
 pub const APP_WINDOW_CLASS: &str = "YiIMEWindow";
 /// Title of the tray instance's window: the TSF DLL asks it to open settings or history.
@@ -1184,14 +1201,29 @@ mod tests {
     }
 
     #[test]
+    fn delayed_reply_for_an_older_edit_only_confirms_its_own_write() {
+        let a = CommitIdentity {
+            receiver: 1,
+            request: 7,
+            revision: 20,
+        };
+        assert!(a.matches_reply(1, 7));
+        assert!(!a.matches_reply(2, 7));
+        assert!(!a.matches_reply(1, 8));
+        assert!(a.owns_draft(1, 20));
+        assert!(!a.owns_draft(1, 21));
+        assert!(!a.owns_draft(2, 20));
+    }
+
+    #[test]
     fn window_titles_per_level() {
         assert_eq!(
             service_window_title(MEDIUM_INTEGRITY, false),
-            "YiIME 译 · TSF · p3"
+            "YiIME 译 · TSF · p4"
         );
         assert_eq!(
             service_window_title(0x1000, false),
-            "YiIME 译 · TSF · IL1000 · p3"
+            "YiIME 译 · TSF · IL1000 · p4"
         );
         // 0.2.0-rc.1 and earlier used unversioned names; they must not match the new ones.
         assert_ne!(
