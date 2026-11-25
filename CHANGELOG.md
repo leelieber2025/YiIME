@@ -6,6 +6,25 @@
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-11-24
+
+**升级后请重启电脑。**
+
+### 修复
+
+- 带分隔符的拼音按音节边界匹配：`x'ian` 不再出「先」。
+- 数字后面的 `.` 和 `:` 保持半角（如 `3.5`、`10:30`）。
+- 翻译历史上屏确认后才写入；历史或词库文件读不出来时不再用空内容覆盖。
+- 同时导入词库不会互相覆盖。自学习的旧明文记录只迁移一次。
+- 免费 Google 翻译保留换行。大模型输出被截断时不上屏半句。
+- 候选条换行后，点选点到对应的那一行。
+- macOS：翻译进行中按键会先结束这次翻译。
+
+### 变更
+
+- 翻译密钥并入设置文件，整份加密保存，不再分成多个密钥文件。
+- 输入法 DLL 会加载同目录下的 `YiIME-words.txt`。
+
 ## [0.2.3] - 2026-11-23
 
 **升级后请重启电脑。**
@@ -311,7 +330,8 @@ Linux：
 
 - 命令行工具 `yiime`（`query` 查候选、`translate` 测试翻译），提供 tar.gz 与 .deb。
 
-[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/leelieber2025/YiIME/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/leelieber2025/YiIME/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/leelieber2025/YiIME/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/leelieber2025/YiIME/compare/v0.1.5...v0.2.1
