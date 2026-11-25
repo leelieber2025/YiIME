@@ -295,6 +295,15 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn option_value_preserves_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let non_utf8 = OsString::from_vec(b"words-\xff.txt".to_vec());
+        assert_eq!(option_value(Some(&non_utf8)), Some(non_utf8.as_os_str()));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
     fn import_accepts_non_utf8_paths() {
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStringExt;
