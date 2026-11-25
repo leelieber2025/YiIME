@@ -492,12 +492,15 @@ fn google_free(
 }
 
 fn parse_google_free(json: &Value) -> Result<String, String> {
-    let text: String = json[0]
-        .as_array()
-        .ok_or("Google 翻译返回格式不对")?
-        .iter()
-        .filter_map(|segment| segment[0].as_str())
-        .collect();
+    let segments = json[0].as_array().ok_or("Google 翻译返回格式不对")?;
+    let mut text = String::new();
+    for segment in segments {
+        if let Some(piece) = segment[0].as_str() {
+            text.push_str(piece);
+        } else if segment[1].as_str().is_some_and(|src| !src.is_empty()) {
+            return Err("Google 翻译返回不完整".into());
+        }
+    }
     let text = text.trim();
     if text.is_empty() {
         Err("译文为空".into())
@@ -742,11 +745,23 @@ fn llm(
             mark_minimal(endpoint, model);
         }
     }
-    if choice["finish_reason"].as_str() == Some("length") {
-        return Err(Fail::new(
-            "truncated",
-            "模型输出被截断（可能是推理模型思考过长），请换用非推理模型",
-        ));
+    match choice["finish_reason"].as_str() {
+        None | Some("stop" | "end_turn" | "eos" | "stop_sequence") => {}
+        Some("length" | "model_context_window_exceeded") => {
+            return Err(Fail::new(
+                "truncated",
+                "模型输出被截断（可能是推理模型思考过长），请换用非推理模型",
+            ));
+        }
+        Some("content_filter" | "safety" | "recitation") => {
+            return Err(Fail::new(
+                "content_filter",
+                "模型输出被内容安全策略拦截，已保留原文",
+            ));
+        }
+        Some(_) => {
+            return Err(Fail::new("incomplete", "模型输出未正常结束，已保留原文"));
+        }
     }
     let content = choice["message"]["content"]
         .as_str()
@@ -755,10 +770,12 @@ fn llm(
 }
 
 fn truncated_empty(choice: &Value) -> bool {
-    choice["finish_reason"].as_str() == Some("length")
-        && choice["message"]["content"]
-            .as_str()
-            .is_none_or(|c| c.trim().is_empty())
+    matches!(
+        choice["finish_reason"].as_str(),
+        Some("length" | "model_context_window_exceeded")
+    ) && choice["message"]["content"]
+        .as_str()
+        .is_none_or(|c| c.trim().is_empty())
 }
 
 /// Opens connections to the translation server early (when the input box opens) so DNS/TCP/TLS
@@ -776,6 +793,10 @@ pub fn prewarm(settings: &ApiSettings) {
         }
         *last = Some(Instant::now());
     }
+    prewarm_urls(&prewarm_targets(settings));
+}
+
+fn prewarm_targets(settings: &ApiSettings) -> Vec<(String, bool)> {
     let mut targets = Vec::new();
     match settings.engine {
         Engine::Azure if settings.azure_key.trim().is_empty() => {
@@ -789,15 +810,21 @@ pub fn prewarm(settings: &ApiSettings) {
         }
         Engine::DeepL | Engine::Llm => {}
     }
-    if settings.validate_llm().is_ok() {
+    if (settings.engine == Engine::Llm || settings.allow_fallback)
+        && settings.validate_llm().is_ok()
+    {
         let url = settings.url.trim().to_owned();
         let bypass = bypass_proxy(&url);
         targets.push((url, bypass));
     }
+    targets
+}
+
+fn prewarm_urls(targets: &[(String, bool)]) {
     for (url, bypass) in targets {
         // A connection returns to the pool only after its response (4xx included) is read.
-        let _ = match agent(bypass)
-            .head(&url)
+        let _ = match agent(*bypass)
+            .head(url)
             .timeout(Duration::from_secs(5))
             .call()
         {
@@ -913,6 +940,8 @@ fn matches_cidr(host: &str, network: &str, bits: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     #[test]
     fn local_endpoint_and_reasoning_cleanup() {
         assert!(bypass_proxy("http://[::1]:8765/v1"));
@@ -995,7 +1024,7 @@ mod tests {
     /// whose body echoes the request; others answer `full` or `minimal` by request shape.
     fn fake_llm(requests: usize) -> (String, std::thread::JoinHandle<()>) {
         use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!(
             "http://{}/v1/chat/completions",
             listener.local_addr().unwrap()
@@ -1222,7 +1251,7 @@ mod tests {
         reply: &'static str,
     ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         use std::io::{Read, Write};
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}/translate", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let mut requests = Vec::new();
@@ -1321,6 +1350,33 @@ mod tests {
     }
 
     #[test]
+    fn unknown_engine_makes_zero_external_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = std::env::temp_dir().join(format!("yiime-zero-req-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(crate::SETTINGS_FILE),
+            format!(
+                r#"{{"engine":"future_engine","allow_fallback":true,"url":"http://127.0.0.1:{port}/v1","model":"m"}}"#
+            ),
+        )
+        .unwrap();
+        let settings = ApiSettings::load(&dir, &crate::PlainSealer);
+        assert!(settings.unknown_engine);
+        let outcome = translate(&settings, "测试不会发出请求");
+        assert_eq!(outcome.result, Err(crate::UNKNOWN_ENGINE.to_owned()));
+        assert!(outcome.attempts.is_empty());
+        assert!(matches!(
+            listener.accept(),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn broken_settings_file_never_routes_to_google() {
         let settings = ApiSettings {
             keys_unreadable: true,
@@ -1393,5 +1449,172 @@ mod tests {
             cache.entries.iter().filter(|(k, _, _)| *k == key).count(),
             1
         );
+    }
+
+    #[test]
+    fn google_free_rejects_partial_null_segments_and_recovers_on_retry() {
+        let incomplete = serde_json::json!([[["Hello ", "你好"], [null, "世界"]], [null, null]]);
+        assert!(parse_google_free(&incomplete).is_err());
+
+        let with_metadata = serde_json::json!([[["Hello world", "你好世界"], [null, null]]]);
+        assert_eq!(
+            parse_google_free(&with_metadata).as_deref(),
+            Ok("Hello world")
+        );
+
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for idx in 0..2 {
+                let (mut stream, _) = server.accept().unwrap();
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let body = if idx == 0 {
+                    r#"[[["Hello ","你好"],[null,"世界"]]]"#
+                } else {
+                    r#"[[["Hello world","你好世界"]]]"#
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+
+        let cache = TranslationCache::new();
+        let settings = ApiSettings {
+            engine: Engine::GoogleFree,
+            ..ApiSettings::default()
+        };
+        let url = format!("http://{addr}/translate_a/single");
+        let first = agent(true)
+            .get(&url)
+            .call()
+            .unwrap()
+            .into_json::<Value>()
+            .map_err(|_| "parse".to_owned())
+            .and_then(|v| parse_google_free(&v));
+        assert!(first.is_err());
+        assert_eq!(
+            cache.get(&cache_key(&settings, "你好世界"), Engine::GoogleFree, false),
+            None
+        );
+
+        let second = agent(true)
+            .get(&url)
+            .call()
+            .unwrap()
+            .into_json::<Value>()
+            .map_err(|_| "parse".to_owned())
+            .and_then(|v| parse_google_free(&v));
+        assert_eq!(second.as_deref(), Ok("Hello world"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn llm_rejects_non_normal_finish_reasons_and_allows_normal_ones() {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let reasons = [
+            "content_filter",
+            "tool_calls",
+            "model_context_window_exceeded",
+            "end_turn",
+        ];
+        let handle = std::thread::spawn(move || {
+            for reason in reasons {
+                let (mut stream, _) = server.accept().unwrap();
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let body = format!(
+                    r#"{{"choices":[{{"finish_reason":"{reason}","message":{{"content":"Hello"}}}}]}}"#
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+            }
+        });
+        let settings = ApiSettings {
+            engine: Engine::Llm,
+            url: format!("http://{addr}/v1"),
+            model: "test".into(),
+            key: "k".into(),
+            ..ApiSettings::default()
+        };
+        assert!(translate(&settings, "一").result.is_err());
+        assert!(translate(&settings, "二").result.is_err());
+        assert!(translate(&settings, "三").result.is_err());
+        assert_eq!(translate(&settings, "四").result.as_deref(), Ok("Hello"));
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn prewarm_skips_llm_unless_primary_or_fallback_allowed() {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_srv = count.clone();
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        server.set_nonblocking(true).unwrap();
+        let handle = std::thread::spawn(move || {
+            while stop_rx.try_recv().is_err() {
+                if let Ok((mut stream, _)) = server.accept() {
+                    let _ = stream.set_nonblocking(false);
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf);
+                    count_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK
+Content-Length: 0
+Connection: close
+
+",
+                    );
+                } else {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        });
+
+        let llm_url = format!("http://{addr}/v1");
+        let base = ApiSettings {
+            engine: Engine::GoogleFree,
+            allow_fallback: false,
+            url: llm_url.clone(),
+            model: "m".into(),
+            key: "k".into(),
+            ..ApiSettings::default()
+        };
+        let targets = prewarm_targets(&base);
+        assert!(!targets.iter().any(|(u, _)| u == &llm_url));
+        let llm_only: Vec<_> = targets.into_iter().filter(|(u, _)| u == &llm_url).collect();
+        prewarm_urls(&llm_only);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        let mut with_fallback = base.clone();
+        with_fallback.allow_fallback = true;
+        let targets_fb = prewarm_targets(&with_fallback);
+        assert!(targets_fb.iter().any(|(u, _)| u == &llm_url));
+        let llm_only: Vec<_> = targets_fb
+            .into_iter()
+            .filter(|(u, _)| u == &llm_url)
+            .collect();
+        prewarm_urls(&llm_only);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let mut primary_llm = base;
+        primary_llm.engine = Engine::Llm;
+        let targets_llm = prewarm_targets(&primary_llm);
+        assert_eq!(targets_llm, vec![(llm_url, true)]);
+        prewarm_urls(&targets_llm);
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let _ = stop_tx.send(());
+        handle.join().unwrap();
     }
 }

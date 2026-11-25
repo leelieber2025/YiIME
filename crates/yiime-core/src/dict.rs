@@ -95,6 +95,20 @@ fn pinyin_spelling(code: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// Normalizes `lve`/`nve` per `'`-separated syllable segment before stripping separators, so `lve`
+/// maps to `lue` while `lv'e` remains `lve` (separate syllables `lv` and `e`).
+fn normalize_raw_pinyin(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase().replace(' ', "");
+    if !lower.contains("ve") {
+        return lower;
+    }
+    lower
+        .split('\'')
+        .map(|seg| pinyin_spelling(seg).into_owned())
+        .collect::<Vec<_>>()
+        .join("'")
+}
+
 /// Words below this frequency are left out of initials (`bjdx`) matches and single-character
 /// pinyin homophones when only common characters are shown: they are mostly classical idioms and
 /// variant characters (伯喈倒屣, 鞎).
@@ -692,12 +706,13 @@ impl MixedInput {
         common_only: bool,
         prefer_gb2312: bool,
     ) -> Vec<Candidate> {
+        let normalized_raw = normalize_raw_pinyin(raw);
         let code = raw.to_ascii_lowercase().replace([' ', '\''], "");
         if code.is_empty() {
             return Vec::new();
         }
-        // Pinyin lookups read lve/nve as lüe/nüe; Wubi lookups keep the code as typed.
-        let spelling = pinyin_spelling(&code).into_owned();
+        // Pinyin lookups read lve/nve per syllable as lue/nue; Wubi lookups keep the code as typed.
+        let spelling = normalized_raw.replace('\'', "");
         let py = spelling.as_str();
         // A `'` separator only exists in pinyin, so such a code never matches Wubi.
         let pinyin_only = raw.contains('\'');
@@ -713,7 +728,7 @@ impl MixedInput {
             homophones.sort_by_key(|(text, _, _)| is_non_gb2312_char(text));
         }
         let wanted = if raw.contains('\'') {
-            boundaries(&raw.to_ascii_lowercase().replace(' ', ""), '\'')
+            boundaries(&normalized_raw, '\'')
         } else {
             Vec::new()
         };
@@ -728,7 +743,7 @@ impl MixedInput {
         let user_set: HashSet<Arc<str>> = user.iter().cloned().collect();
         if raw.contains('\'') {
             let mut seen = HashSet::new();
-            let separated = user
+            let mut separated = user
                 .iter()
                 .cloned()
                 .chain(
@@ -740,7 +755,7 @@ impl MixedInput {
                         })
                         .map(|(text, _, _)| text.clone()),
                 )
-                .filter(|text| seen.insert(text.clone()))
+                .filter(|text| (!common_only || is_common_text(text)) && seen.insert(text.clone()))
                 .map(|text| Candidate {
                     user: user_set.contains(text.as_ref()),
                     text: text.to_string(),
@@ -750,12 +765,30 @@ impl MixedInput {
                 })
                 .take(limit)
                 .collect::<Vec<_>>();
-            let umlaut_alias = matches!(code.as_str(), "lve" | "nve");
             homophones.retain(|(_, _, syllables)| {
                 let own = boundaries(syllables, ' ');
-                umlaut_alias || wanted.iter().all(|offset| own.contains(offset))
+                wanted.iter().all(|offset| own.contains(offset))
             });
             if !separated.is_empty() {
+                if fuzzy && separated.len() < limit {
+                    for text in self.fuzzy(py, &wanted, limit) {
+                        if common_only && !is_common_text(&text) {
+                            continue;
+                        }
+                        if separated.len() >= limit {
+                            break;
+                        }
+                        if seen.insert(text.clone()) {
+                            separated.push(Candidate {
+                                user: user_set.contains(text.as_ref()),
+                                text: text.to_string(),
+                                source: Source::Pinyin,
+                                complete: true,
+                                rest: String::new(),
+                            });
+                        }
+                    }
+                }
                 return separated;
             }
         }
@@ -845,7 +878,15 @@ impl MixedInput {
         }
         if spelled && wanted.is_empty() {
             push(
-                self.mixed_abbreviation(py, limit),
+                self.mixed_abbreviation(
+                    py,
+                    limit,
+                    if common_only {
+                        COMMON_FREQUENCY_FLOOR
+                    } else {
+                        0
+                    },
+                ),
                 Source::Abbreviation,
                 true,
             );
@@ -869,7 +910,7 @@ impl MixedInput {
 }
 
 /// Separator positions in the code with separators removed: `xi'an` → `[2]`.
-fn boundaries(code: &str, separator: char) -> Vec<usize> {
+pub(super) fn boundaries(code: &str, separator: char) -> Vec<usize> {
     let mut letters = 0;
     let mut result = Vec::new();
     for ch in code.chars() {
@@ -888,7 +929,11 @@ fn boundaries(code: &str, separator: char) -> Vec<usize> {
 /// Parses user words (`word code` per line, whitespace-separated, `#` starts a comment) into
 /// `user`; a later line for the same word and code moves it to the front.
 fn parse_user_words(user: &mut UserWords, contents: &str) {
-    for line in contents.lines() {
+    for line in contents
+        .strip_prefix('\u{feff}')
+        .unwrap_or(contents)
+        .lines()
+    {
         let mut fields = line.split_whitespace();
         let (Some(text), Some(code)) = (fields.next(), fields.next()) else {
             continue;
@@ -1000,10 +1045,14 @@ mod tests {
                 .iter()
                 .any(|c| c.text == "先")
         );
-        // With `'` nothing comes from Wubi (no `男女朋友` prefix match, no `恨`).
-        assert_eq!(texts("lv'e"), ["略"]);
-        assert_eq!(texts("n've"), ["虐"]);
+        // Trailing `'` keeps the single syllable while suppressing Wubi (no `男女朋友`, no `恨`),
+        // whereas an interior `'` forces two syllables so `lv'e`/`nv'e`/`n've` do not match `略`/`虐`.
+        assert_eq!(texts("lve'"), ["略"]);
+        assert_eq!(texts("nve'"), ["虐"]);
+        assert!(texts("lv'e").is_empty());
+        assert!(texts("n've").is_empty());
         assert!(!texts("nv'e").contains(&"恨".to_owned()));
+        assert!(!texts("nv'e").contains(&"虐".to_owned()));
         // The real dictionaries: lve/nve no longer fall through to Wubi words.
         let full = MixedInput::bundled();
         assert_eq!(full.candidates("lve", 9)[0].text, "略");
@@ -1277,5 +1326,59 @@ mod tests {
         for code in ["aaaa", "aaab", "aaac"] {
             assert_eq!(input.candidates(code, 1).len(), 1, "{code}");
         }
+    }
+
+    #[test]
+    fn bom_user_words_and_common_only_on_separated_and_mixed_abbrev() {
+        let pinyin = "...\n河\the\t50\n\u{20000}\the\t40\n伯喈倒屣\tbo jie dao xi\t0\n";
+        let input = MixedInput::from_rime("...\n", pinyin)
+            .with_user_words("\u{feff}\u{20001} he\n常用 he\n");
+        let common = input.candidates_filtered("he'", 9, 9, false, true, true, false);
+        assert!(
+            common
+                .iter()
+                .all(|c| !c.text.starts_with('\u{feff}') && is_common_text(&c.text))
+        );
+        assert!(common.iter().any(|c| c.text == "常用"));
+        assert!(!common.iter().any(|c| c.text == "\u{20001}"));
+
+        // Mixed abbreviation respects COMMON_FREQUENCY_FLOOR when common_only is true.
+        let mixed_common = input.candidates_filtered("bojiedx", 9, 9, false, true, true, false);
+        assert!(!mixed_common.iter().any(|c| c.text == "伯喈倒屣"));
+        let mixed_all = input.candidates_filtered("bojiedx", 9, 9, false, true, false, false);
+        assert!(mixed_all.iter().any(|c| c.text == "伯喈倒屣"));
+    }
+
+    #[test]
+    fn lve_nve_and_fuzzy_respect_apostrophe_boundaries() {
+        let pinyin = "...\n略\tlue\t100\n虐\tnue\t100\n字\tzi\t100\n只\tzhi\t90\n西安\txi an\t100\n先\txian\t200\n";
+        let input = MixedInput::from_rime("...\n", pinyin);
+        assert!(input.candidates("lve", 9).iter().any(|c| c.text == "略"));
+        assert!(!input.candidates("lv'e", 9).iter().any(|c| c.text == "略"));
+        assert!(input.candidates("nve", 9).iter().any(|c| c.text == "虐"));
+        assert!(!input.candidates("nv'e", 9).iter().any(|c| c.text == "虐"));
+
+        // Shuangpin expands `zi` as `z'i` / contains `'`: fuzzy still keeps `只` after `字`.
+        let fuzzy_on: Vec<_> = input
+            .candidates_filtered("zi'", 9, 9, true, true, false, false)
+            .into_iter()
+            .map(|c| c.text)
+            .collect();
+        assert_eq!(fuzzy_on, vec!["字", "只"]);
+        let fuzzy_off: Vec<_> = input
+            .candidates_filtered("zi'", 9, 9, false, true, false, false)
+            .into_iter()
+            .map(|c| c.text)
+            .collect();
+        assert_eq!(fuzzy_off, vec!["字"]);
+
+        // Corrections respect forced boundaries (`ix'an` -> 西安, never 先).
+        let corr: Vec<_> = input
+            .candidates_filtered("ix'an", 9, 9, false, true, false, false)
+            .into_iter()
+            .map(|c| c.text)
+            .collect();
+        assert!(corr.contains(&"西安".to_owned()), "{corr:?}");
+        assert!(!corr.contains(&"先".to_owned()), "{corr:?}");
     }
 }

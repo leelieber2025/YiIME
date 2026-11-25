@@ -210,6 +210,9 @@ impl CommitReply {
 
 /// Seconds without a receipt after which the box asks the user to check the field.
 pub const RECEIPT_WARN_SECS: u64 = 10;
+/// Seconds without a receipt after which the box stops waiting for a receipt; any stashed draft is
+/// still kept until restored, confirmed landed, or discarded.
+pub const RECEIPT_GIVEUP_SECS: u64 = 1800;
 
 /// A commit of the current draft that has not been confirmed yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,6 +268,24 @@ pub fn restore_left_draft(failed: bool, unconfirmed: bool, draft_empty: bool) ->
     }
 }
 
+/// Whether a kept draft may auto-restore on box activation/timer: never across fields inside the
+/// same application (where the new field shares the receiver), never over an active draft or
+/// composition, and never when the user opened the box by typing a key.
+pub fn can_auto_restore(
+    same_app: bool,
+    draft_empty: bool,
+    composition_empty: bool,
+    key_started: bool,
+) -> bool {
+    !same_app && draft_empty && composition_empty && !key_started
+}
+
+/// Receipt entries still awaiting a reply or holding a kept draft survive timer cleanup; receipt
+/// timeout alone never drops a stashed draft.
+pub fn retain_receipt(awaiting_receipt: bool, has_stash: bool) -> bool {
+    awaiting_receipt || has_stash
+}
+
 /// Requests (input box window, request id) the DLL inserted lately. The box re-sends a commit
 /// under its original id when its receipt was lost; one that already landed is confirmed again
 /// instead of being inserted twice.
@@ -289,14 +310,34 @@ impl LandedRequests {
     }
 }
 
+/// Decides what an incoming commit `(editor, request)` should do given `landed` history and any
+/// currently queued `pending` `(editor, request)`.
+/// Order matters: an already-landed retry must be confirmed even if another request is queued.
+pub fn commit_request_state(
+    landed: &LandedRequests,
+    pending: Option<(usize, u32)>,
+    editor: usize,
+    request: u32,
+) -> Option<CommitReply> {
+    if landed.contains(editor, request) {
+        Some(CommitReply::Landed)
+    } else if request != 0 && pending == Some((editor, request)) {
+        Some(CommitReply::Waiting)
+    } else if pending.is_some() {
+        Some(CommitReply::Rejected)
+    } else {
+        None
+    }
+}
+
 /// Version of the DLL ↔ input-box protocol (window messages and COPYDATA packets). It is part of
 /// the receiver window class and the service window title, so a DLL and a service of different
 /// protocol versions never find or accept each other: after an upgrade without a restart, an
 /// application still running an old DLL keeps its own old input box instead of talking to the new
 /// one. Bump it whenever a message or packet changes meaning.
-pub const TSF_PROTOCOL: u32 = 4;
+pub const TSF_PROTOCOL: u32 = 5;
 /// Window class of the TSF DLL's receiver window (the input box accepts sessions only from it).
-pub const TSF_RECEIVER_CLASS: &str = concat!("YiIMETsfReceiver.", 4);
+pub const TSF_RECEIVER_CLASS: &str = concat!("YiIMETsfReceiver.", 5);
 /// Window class of YiIME.exe's tray and input-box windows, which the TSF DLL looks up.
 pub const APP_WINDOW_CLASS: &str = "YiIMEWindow";
 /// Title of the tray instance's window: the TSF DLL asks it to open settings or history.
@@ -378,6 +419,22 @@ impl WatchedHosts {
     /// current host (end its session); false for a stale notice about an earlier owner of a
     /// reused handle.
     pub fn host_exited(&mut self, receiver: usize, pid: u32) -> bool {
+        if self
+            .watched
+            .get(&receiver)
+            .is_some_and(|owner| owner.pid == pid)
+        {
+            self.watched.remove(&receiver);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Watching `pid` for `receiver` failed (`OpenProcess` or `WaitForSingleObject` failed).
+    /// Clears the entry only if it still refers to `pid` so the next session retries watching
+    /// without disturbing a newer host that reused the handle.
+    pub fn watch_failed(&mut self, receiver: usize, pid: u32) -> bool {
         if self
             .watched
             .get(&receiver)
@@ -1320,11 +1377,11 @@ mod tests {
     fn window_titles_per_level() {
         assert_eq!(
             service_window_title(MEDIUM_INTEGRITY, false),
-            "YiIME 译 · TSF · p4"
+            "YiIME 译 · TSF · p5"
         );
         assert_eq!(
             service_window_title(0x1000, false),
-            "YiIME 译 · TSF · IL1000 · p4"
+            "YiIME 译 · TSF · IL1000 · p5"
         );
         // 0.2.0-rc.1 and earlier used unversioned names; they must not match the new ones.
         assert_ne!(
@@ -1403,6 +1460,29 @@ mod tests {
         assert!(!hosts.session_started(2, Some(HostOwner { pid: 0, thread: 0 })));
         assert!(hosts.is_empty());
         assert!(!hosts.host_exited(1, 5));
+    }
+
+    #[test]
+    fn watch_failed_allows_retry_and_ignores_stale_pid() {
+        let first = HostOwner {
+            pid: 100,
+            thread: 7,
+        };
+        let second = HostOwner {
+            pid: 200,
+            thread: 9,
+        };
+        let mut hosts = WatchedHosts::default();
+        assert!(hosts.session_started(0x10, Some(first)));
+        // While first watch fails, same receiver retries on next session.
+        assert!(hosts.watch_failed(0x10, 100));
+        assert!(hosts.is_empty());
+        assert!(hosts.session_started(0x10, Some(first)));
+        // Handle reused by second host; stale failure from first must not drop second.
+        assert!(hosts.session_started(0x10, Some(second)));
+        assert!(!hosts.watch_failed(0x10, 100));
+        assert_eq!(hosts.len(), 1);
+        assert!(hosts.host_exited(0x10, 200));
     }
 
     #[test]
@@ -1536,6 +1616,47 @@ mod tests {
         }
         assert!(!landed.contains(7, 41), "bounded");
         assert!(landed.contains(7, 163));
+    }
+
+    #[test]
+    fn commit_request_state_checks_landed_before_pending_queue() {
+        const EDITOR: usize = 7;
+        const A: u32 = 101;
+        const B: u32 = 102;
+        let mut landed = LandedRequests::default();
+        landed.remember(EDITOR, A);
+        let pending = Some((EDITOR, B));
+        // Retrying A while B is queued must report Landed, not Rejected.
+        assert_eq!(
+            commit_request_state(&landed, pending, EDITOR, A),
+            Some(CommitReply::Landed)
+        );
+        // Retrying B while B is still queued reports Waiting.
+        assert_eq!(
+            commit_request_state(&landed, pending, EDITOR, B),
+            Some(CommitReply::Waiting)
+        );
+        // An unrelated new request while B is queued is Rejected.
+        assert_eq!(
+            commit_request_state(&landed, pending, EDITOR, 103),
+            Some(CommitReply::Rejected)
+        );
+        // Without a pending commit, a fresh request proceeds normally.
+        assert_eq!(commit_request_state(&landed, None, EDITOR, 103), None);
+    }
+
+    #[test]
+    fn auto_restore_and_retention_rules() {
+        assert!(can_auto_restore(false, true, true, false));
+        assert!(!can_auto_restore(true, true, true, false));
+        assert!(!can_auto_restore(false, false, true, false));
+        assert!(!can_auto_restore(false, true, false, false));
+        assert!(!can_auto_restore(false, true, true, true));
+
+        assert!(retain_receipt(true, false));
+        assert!(!retain_receipt(false, false));
+        // Even after receipt timeout (awaiting_receipt = false), stashed drafts stay kept.
+        assert!(retain_receipt(false, true));
     }
 
     #[test]

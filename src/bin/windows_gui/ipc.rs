@@ -1,21 +1,28 @@
 use super::*;
 
 /// Ends the session of `receiver` in the input box (`editor`) once its owner process `pid`
-/// exits (WM_TSF_EXIT with the receiver as wParam and the pid as lParam, so the box can tell a
-/// stale notice for a reused window handle from its current host).
-pub(super) fn watch_tsf_owner(receiver: HWND, pid: u32, editor: HWND) {
+/// exits (`WAIT_OBJECT_0`, posting `WM_TSF_EXIT` with receiver as `wParam` and `pid` as `lParam`).
+/// Returns `false` synchronously if `OpenProcess` fails; if `WaitForSingleObject` returns anything
+/// other than `WAIT_OBJECT_0` (e.g. `WAIT_FAILED`), posts `WM_TSF_WATCH_FAILED` instead of
+/// treating a live host as exited.
+pub(super) fn watch_tsf_owner(receiver: HWND, pid: u32, editor: HWND) -> bool {
     let process = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
     if process.is_null() {
-        return;
+        return false;
     }
     let process = process as usize;
     let editor = editor as usize;
     let receiver = receiver as usize;
     std::thread::spawn(move || unsafe {
-        WaitForSingleObject(process as _, u32::MAX);
+        let wait = WaitForSingleObject(process as _, u32::MAX);
         CloseHandle(process as _);
-        PostMessageW(editor as HWND, WM_TSF_EXIT, receiver, pid as isize);
+        if wait == 0 {
+            PostMessageW(editor as HWND, WM_TSF_EXIT, receiver, pid as isize);
+        } else {
+            PostMessageW(editor as HWND, WM_TSF_WATCH_FAILED, receiver, pid as isize);
+        }
     });
+    true
 }
 pub(super) unsafe fn send_tsf_text(receiver: HWND, sender: HWND, text: &str) -> bool {
     matches!(
@@ -51,22 +58,31 @@ pub(super) unsafe fn send_commit(
     } != 0)
         .then_some(result)
 }
-/// Commits `text` into the text field the DLL parked under `id` (COPYDATA dwData 5). Empty text
-/// only releases that field. A session that started afterwards is left running.
-pub(super) unsafe fn send_tsf_held(receiver: HWND, sender: HWND, id: u64, text: &str) -> bool {
+/// Commits `text` into the text field the DLL parked under `id` (COPYDATA dwData 5, carrying
+/// `[u64 held_id][u32 request][utf16 text]`). Empty text only releases that field. Returns
+/// `None` on no reply, or `Some(0|1|2)` (rejected / landed / queued).
+pub(super) unsafe fn send_tsf_held(
+    receiver: HWND,
+    sender: HWND,
+    id: u64,
+    request: u32,
+    text: &str,
+) -> Option<usize> {
     let bytes = id.to_le_bytes();
     let mut units: Vec<u16> = bytes
         .chunks_exact(2)
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
+    units.push(request as u16);
+    units.push((request >> 16) as u16);
     units.extend(text.encode_utf16());
     let packet = COPYDATASTRUCT {
         dwData: 5,
         cbData: (units.len() * 2) as u32,
         lpData: units.as_mut_ptr() as _,
     };
-    let mut accepted = 0usize;
-    unsafe {
+    let mut result = 0usize;
+    (unsafe {
         SendMessageTimeoutW(
             receiver,
             WM_COPYDATA,
@@ -74,10 +90,10 @@ pub(super) unsafe fn send_tsf_held(receiver: HWND, sender: HWND, id: u64, text: 
             &packet as *const _ as isize,
             SMTO_ABORTIFHUNG,
             3000,
-            &mut accepted,
-        ) != 0
-            && accepted != 0
-    }
+            &mut result,
+        )
+    } != 0)
+        .then_some(result)
 }
 /// Asks the TSF DLL to switch its application to English input (COPYDATA dwData 4), as a Shift
 /// tap there would.

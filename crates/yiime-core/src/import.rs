@@ -115,25 +115,32 @@ pub fn parse_scel(bytes: &[u8]) -> Result<Vec<ImportedWord>, &'static str> {
             .ok_or("词库文件不完整")
     };
     let text_at = |at: usize, len: usize| -> Result<String, &'static str> {
-        let data = bytes.get(at..at + len).ok_or("词库文件不完整")?;
+        if len % 2 != 0 {
+            return Err("词库文件不完整");
+        }
+        let end = at.checked_add(len).ok_or("词库文件不完整")?;
+        let data = bytes.get(at..end).ok_or("词库文件不完整")?;
         let units: Vec<u16> = data
             .chunks_exact(2)
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect();
         String::from_utf16(&units).map_err(|_| "词库文件编码错误")
     };
-    let mut syllables: Vec<String> = Vec::new();
+    let mut syllables: Vec<Option<String>> = Vec::new();
     while at < SCEL_WORDS {
         let index = u16_at(at)?;
         let len = u16_at(at + 2)?;
         if len == 0 {
             break;
         }
+        if at + 4 + len > SCEL_WORDS {
+            return Err("词库文件不完整");
+        }
         let syllable = text_at(at + 4, len)?;
         if syllables.len() <= index {
-            syllables.resize(index + 1, String::new());
+            syllables.resize(index + 1, None);
         }
-        syllables[index] = syllable;
+        syllables[index] = Some(syllable);
         at += 4 + len;
     }
     let mut words = Vec::new();
@@ -141,11 +148,19 @@ pub fn parse_scel(bytes: &[u8]) -> Result<Vec<ImportedWord>, &'static str> {
     while at + 4 <= bytes.len() {
         let same = u16_at(at)?;
         let pinyin_len = u16_at(at + 2)?;
+        if pinyin_len % 2 != 0 {
+            return Err("词库文件不完整");
+        }
         at += 4;
+        bytes.get(at..at + pinyin_len).ok_or("词库文件不完整")?;
         let mut code = String::new();
         for slot in 0..pinyin_len / 2 {
             let index = u16_at(at + slot * 2)?;
-            code.push_str(syllables.get(index).ok_or("拼音索引越界")?);
+            let syl = syllables
+                .get(index)
+                .and_then(|s| s.as_deref())
+                .ok_or("拼音索引越界")?;
+            code.push_str(syl);
         }
         at += pinyin_len;
         for _ in 0..same {
@@ -187,6 +202,7 @@ pub fn import_words(bytes: &[u8]) -> Result<Vec<ImportedWord>, &'static str> {
 /// Appends imported words to the user words file contents, skipping pairs already there.
 /// Returns the new contents and how many words were added.
 pub fn merge_user_words(existing: &str, words: &[ImportedWord]) -> (String, usize) {
+    let existing = existing.strip_prefix('\u{feff}').unwrap_or(existing);
     let mut seen: std::collections::HashSet<(String, String)> = existing
         .lines()
         .filter_map(|line| {
@@ -362,5 +378,38 @@ mod tests {
         assert_eq!(contents, "# header\n你好 nihao\n中国 zhongguo\r\n");
         let input = crate::MixedInput::bundled().with_user_words(&contents);
         assert_eq!(input.candidates("zhongguo", 1)[0].text, "中国");
+    }
+
+    #[test]
+    fn bom_user_words_dedup_on_reimport() {
+        let (contents, added) =
+            merge_user_words("\u{feff}你好 nihao\n", &pairs(&[("你好", "nihao")]));
+        assert_eq!(added, 0);
+        assert_eq!(contents, "你好 nihao\n");
+    }
+
+    #[test]
+    fn scel_rejects_odd_lengths_and_sparse_pinyin_table() {
+        let mut buf = vec![0u8; SCEL_WORDS + 20];
+        buf[4..8].copy_from_slice(&[0x44, 0x43, 0x53, 0x01]);
+        // Entry at index 2 (leaving 0 and 1 missing), len = 4 ("ni")
+        let p = SCEL_PINYIN_TABLE + 4;
+        buf[p..p + 2].copy_from_slice(&2u16.to_le_bytes());
+        buf[p + 2..p + 4].copy_from_slice(&4u16.to_le_bytes());
+        buf[p + 4..p + 8].copy_from_slice(&[b'n', 0, b'i', 0]);
+        // Word record referencing missing syllable index 1
+        let w = SCEL_WORDS;
+        buf[w..w + 2].copy_from_slice(&1u16.to_le_bytes());
+        buf[w + 2..w + 4].copy_from_slice(&2u16.to_le_bytes());
+        buf[w + 4..w + 6].copy_from_slice(&1u16.to_le_bytes());
+        assert_eq!(parse_scel(&buf), Err("拼音索引越界"));
+
+        // Odd pinyin_len
+        buf[w + 2..w + 4].copy_from_slice(&3u16.to_le_bytes());
+        assert_eq!(parse_scel(&buf), Err("词库文件不完整"));
+
+        // Odd syllable len
+        buf[p + 2..p + 4].copy_from_slice(&3u16.to_le_bytes());
+        assert_eq!(parse_scel(&buf), Err("词库文件不完整"));
     }
 }

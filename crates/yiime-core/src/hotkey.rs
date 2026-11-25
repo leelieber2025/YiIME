@@ -44,6 +44,21 @@ pub fn parse_hotkey(text: &str) -> Option<Hotkey> {
     (hotkey.vk != 0 && (hotkey.ctrl || hotkey.alt || function_key)).then_some(hotkey)
 }
 
+/// Built-in shortcuts reserved by the IME / input box (must not be bound as mode/history hotkeys):
+/// Ctrl+Space, Ctrl+Alt+T, Ctrl+Shift+F, and Ctrl+Shift+1..9 (forget learned pick).
+pub fn conflicts_with_builtin(hotkey: Hotkey) -> bool {
+    if hotkey.ctrl
+        && hotkey.shift
+        && !hotkey.alt
+        && (b'1' as u16..=b'9' as u16).contains(&hotkey.vk)
+    {
+        return true;
+    }
+    ["Ctrl+Space", "Ctrl+Alt+T", "Ctrl+Shift+F"]
+        .iter()
+        .any(|fixed| parse_hotkey(fixed) == Some(hotkey))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,5 +79,20 @@ mod tests {
         assert_eq!(parse_hotkey("Ctrl+A+B"), None);
         assert_eq!(parse_hotkey("Ctrl+F13"), None);
         assert_eq!(parse_hotkey("Ctrl"), None);
+        assert!(conflicts_with_builtin(
+            parse_hotkey("Ctrl+Shift+1").unwrap()
+        ));
+        assert!(conflicts_with_builtin(
+            parse_hotkey("Ctrl+Shift+9").unwrap()
+        ));
+        assert!(conflicts_with_builtin(
+            parse_hotkey("Ctrl+Shift+F").unwrap()
+        ));
+        assert!(conflicts_with_builtin(parse_hotkey("Ctrl+Space").unwrap()));
+        assert!(conflicts_with_builtin(parse_hotkey("Ctrl+Alt+T").unwrap()));
+        assert!(!conflicts_with_builtin(
+            parse_hotkey(DEFAULT_PLAIN_TOGGLE).unwrap()
+        ));
+        assert!(!conflicts_with_builtin(parse_hotkey("Ctrl+Alt+1").unwrap()));
     }
 }

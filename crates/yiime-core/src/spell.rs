@@ -3,6 +3,7 @@
 //! word with the rest left in the code for the next pick. Behaviour follows Microsoft Pinyin.
 
 use super::{Arc, BTreeSet, HashSet, MixedInput, folded_initials, partition};
+use std::collections::BTreeMap;
 
 /// Valid syllables, taken from the pinyin dictionary (without vowel-less interjections such as
 /// m/n/ng/hm).
@@ -177,6 +178,10 @@ impl MixedInput {
             found.extend(
                 self.homophones(variant)
                     .into_iter()
+                    .filter(|(_, _, syllables)| {
+                        let own = crate::dict::boundaries(syllables, ' ');
+                        forced.iter().all(|offset| own.contains(offset))
+                    })
                     .map(|(text, weight, _)| (text, weight)),
             );
         }
@@ -186,9 +191,9 @@ impl MixedInput {
     /// Fuzzy pinyin (when enabled): swap syllables for their fuzzy counterparts; results go after
     /// exact matches.
     pub(super) fn fuzzy(&self, code: &str, forced: &[usize], limit: usize) -> Vec<Arc<str>> {
-        let mut variants: BTreeSet<String> = BTreeSet::new();
+        let mut variants: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for ends in self.segmentations(code, forced).into_iter().take(4) {
-            let mut partial = vec![String::new()];
+            let mut partial: Vec<(String, String)> = vec![(String::new(), String::new())];
             let mut start = 0;
             for end in ends {
                 let syllable = &code[start..end];
@@ -200,23 +205,35 @@ impl MixedInput {
                     .into_iter()
                     .collect();
                 let mut next = Vec::new();
-                for head in &partial {
+                for (head, head_syl) in &partial {
                     for option in &options {
                         if next.len() < 64 {
-                            next.push(format!("{head}{option}"));
+                            let joined = format!("{head}{option}");
+                            let syl = if head_syl.is_empty() {
+                                option.clone()
+                            } else {
+                                format!("{head_syl} {option}")
+                            };
+                            next.push((joined, syl));
                         }
                     }
                 }
                 partial = next;
             }
-            variants.extend(partial);
+            for (joined, syl) in partial {
+                if joined != code {
+                    variants.entry(joined).or_default().insert(syl);
+                }
+            }
         }
-        variants.remove(code);
         let mut found = Vec::new();
-        for variant in &variants {
+        for (variant, expected_syllables) in &variants {
             found.extend(
                 self.homophones(variant)
                     .into_iter()
+                    .filter(|(_, _, syllables)| {
+                        forced.is_empty() || expected_syllables.contains(syllables.as_ref())
+                    })
                     .map(|(text, weight, _)| (text, weight)),
             );
         }
@@ -226,7 +243,12 @@ impl MixedInput {
     /// Mixed full syllables and initials: each segment is a full syllable or an initial (the last
     /// may be half a syllable), e.g. zhongg, zgren, zhongguor, xiandai'h. At least one segment is
     /// full and one is not; pure full pinyin and pure initials are handled elsewhere.
-    pub(super) fn mixed_abbreviation(&self, code: &str, limit: usize) -> Vec<Arc<str>> {
+    pub(super) fn mixed_abbreviation(
+        &self,
+        code: &str,
+        limit: usize,
+        min_weight: u64,
+    ) -> Vec<Arc<str>> {
         if code.len() < 3 || code.len() > 24 || !code.bytes().all(|b| b.is_ascii_lowercase()) {
             return Vec::new();
         }
@@ -261,7 +283,7 @@ impl MixedInput {
                 if !folded_initials(entry.syllables).eq(key.bytes()) {
                     break;
                 }
-                if matches(entry.syllables) {
+                if entry.weight >= min_weight && matches(entry.syllables) {
                     found.push((Arc::from(entry.text), entry.weight));
                 }
             }
@@ -274,7 +296,7 @@ impl MixedInput {
                     if !folded_initials(line.pinyin).eq(key.bytes()) {
                         break;
                     }
-                    if matches(line.pinyin) {
+                    if line.weight >= min_weight && matches(line.pinyin) {
                         found.push((Arc::from(line.text), line.weight));
                     }
                 }

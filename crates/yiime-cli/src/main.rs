@@ -40,14 +40,27 @@ fn find_words() -> Option<PathBuf> {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("translate") {
-        return translate(&args[1..]);
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    run(&args)
+}
+
+fn run(args: &[std::ffi::OsString]) -> ExitCode {
+    let sub = args.first().and_then(|s| s.to_str());
+    if sub == Some("translate") {
+        let mut texts = Vec::with_capacity(args.len().saturating_sub(1));
+        for arg in &args[1..] {
+            let Some(text) = arg.to_str() else {
+                eprintln!("translate 参数不是有效的 UTF-8");
+                return ExitCode::from(2);
+            };
+            texts.push(text.to_owned());
+        }
+        return translate(&texts);
     }
-    if args.first().map(String::as_str) == Some("import") {
+    if sub == Some("import") {
         return import(&args[1..]);
     }
-    if args.first().map(String::as_str) != Some("query") {
+    if sub != Some("query") {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     }
@@ -67,12 +80,19 @@ fn main() -> ExitCode {
         ExitCode::from(2)
     };
     while let Some(arg) = rest.next() {
-        match arg.as_str() {
+        let Some(arg_str) = arg.to_str() else {
+            return fail("query 参数不是有效的 UTF-8");
+        };
+        match arg_str {
             "--page-size" | "--pages" => {
-                let Some(value) = rest.next().and_then(|value| value.parse::<usize>().ok()) else {
-                    return fail(&format!("{arg} 需要一个数字"));
+                let Some(value) = rest
+                    .next()
+                    .and_then(|s| s.to_str())
+                    .and_then(|value| value.parse::<usize>().ok())
+                else {
+                    return fail(&format!("{arg_str} 需要一个数字"));
                 };
-                if arg == "--pages" {
+                if arg_str == "--pages" {
                     pages = value.max(1);
                 } else {
                     page_size = value.clamp(*PAGE_SIZE_RANGE.start(), *PAGE_SIZE_RANGE.end());
@@ -83,7 +103,11 @@ fn main() -> ExitCode {
             "--pinyin-first" => pinyin_first = true,
             "--all-chars" => common_only = false,
             "--shuangpin" => {
-                let Some(scheme) = rest.next().and_then(|id| Shuangpin::from_id(id)) else {
+                let Some(scheme) = rest
+                    .next()
+                    .and_then(|s| s.to_str())
+                    .and_then(Shuangpin::from_id)
+                else {
                     return fail("--shuangpin 需要 xiaohe、microsoft 或 ziranma");
                 };
                 shuangpin = Some(scheme);
@@ -178,10 +202,12 @@ fn main() -> ExitCode {
 
 /// `yiime import <file> [--into user_words.txt]`: converts another IME's exported user
 /// dictionary into user words.
-fn import(args: &[String]) -> ExitCode {
+fn import(args: &[std::ffi::OsString]) -> ExitCode {
     let (file, into) = match args {
-        [file] => (file, None),
-        [file, flag, into] if flag == "--into" => (file, Some(into)),
+        [file] => (std::path::Path::new(file), None),
+        [file, flag, into] if flag.to_str() == Some("--into") => {
+            (std::path::Path::new(file), Some(std::path::Path::new(into)))
+        }
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -191,12 +217,12 @@ fn import(args: &[String]) -> ExitCode {
         Ok(bytes) => match yiime_core::import_words(&bytes) {
             Ok(words) => words,
             Err(error) => {
-                eprintln!("{file}：{error}");
+                eprintln!("{}：{error}", file.display());
                 return ExitCode::FAILURE;
             }
         },
         Err(error) => {
-            eprintln!("读取 {file} 失败：{error}");
+            eprintln!("读取 {} 失败：{error}", file.display());
             return ExitCode::FAILURE;
         }
     };
@@ -206,10 +232,10 @@ fn import(args: &[String]) -> ExitCode {
         }
         return ExitCode::SUCCESS;
     };
-    let added = match yiime_core::import_into(std::path::Path::new(into), &words) {
+    let added = match yiime_core::import_into(into, &words) {
         Ok(added) => added,
         Err(error) => {
-            eprintln!("写入 {into} 失败：{error}");
+            eprintln!("写入 {} 失败：{error}", into.display());
             return ExitCode::FAILURE;
         }
     };
@@ -218,10 +244,10 @@ fn import(args: &[String]) -> ExitCode {
 }
 
 /// Value of an option that takes a path: missing or another option (`-…`) is an error.
-fn option_value(value: Option<&String>) -> Option<&str> {
+fn option_value(value: Option<&std::ffi::OsString>) -> Option<&std::ffi::OsStr> {
     value
-        .map(String::as_str)
-        .filter(|value| !value.is_empty() && !value.starts_with('-'))
+        .map(std::ffi::OsString::as_os_str)
+        .filter(|value| !value.is_empty() && !value.to_str().is_some_and(|s| s.starts_with('-')))
 }
 
 /// Free Google Translate (the Windows default) over one reused connection, printing timings.
@@ -258,11 +284,35 @@ mod tests {
 
     #[test]
     fn option_value_rejects_missing_and_flags() {
-        let path = "words.txt".to_owned();
-        let flag = "--tsv".to_owned();
-        assert_eq!(option_value(Some(&path)), Some("words.txt"));
+        use std::ffi::OsString;
+        let path = OsString::from("words.txt");
+        let flag = OsString::from("--tsv");
+        assert_eq!(option_value(Some(&path)), Some(path.as_os_str()));
         assert_eq!(option_value(Some(&flag)), None);
-        assert_eq!(option_value(Some(&String::new())), None);
+        assert_eq!(option_value(Some(&OsString::new())), None);
         assert_eq!(option_value(None), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn import_accepts_non_utf8_paths() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let dir = std::env::temp_dir().join(format!("yiime-cli-nonutf8-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join(OsString::from_vec(b"src-\xff.txt".to_vec()));
+        let dst = dir.join(OsString::from_vec(b"dst-\xfe.txt".to_vec()));
+        std::fs::write(&src, "你好 nihao\n").unwrap();
+        let code = super::run(&[
+            OsString::from("import"),
+            src.into_os_string(),
+            OsString::from("--into"),
+            dst.clone().into_os_string(),
+        ]);
+        assert_eq!(code, std::process::ExitCode::SUCCESS);
+        let saved = std::fs::read_to_string(&dst).unwrap();
+        assert!(saved.contains("你好 nihao"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

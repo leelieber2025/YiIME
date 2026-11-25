@@ -153,6 +153,91 @@ jobs:
               if ($result.ExitCode -ne 0) { throw "unregister failed: $($pair[1]) $($result.ExitCode)" }
             }
           }
+      - name: Installer and uninstaller PowerShell unit tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:YIIME_PS_TEST = '1'
+          $tmp = Join-Path ([IO.Path]::GetTempPath()) ("yiime-ps-test-" + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+          try {
+            . .\windows\Install-YiIME.ps1
+            # 1. Directory boundary checks
+            $dir = Join-Path $tmp 'YiIME'
+            if (-not (Test-PathUnderDirectory (Join-Path $dir 'v1\YiIME.exe') $dir)) { throw 'expected match inside directory' }
+            if (Test-PathUnderDirectory (Join-Path $tmp 'YiIME2\YiIME.exe') $dir) { throw 'must not match sibling prefix YiIME2' }
+            if (Test-PathUnderDirectory (Join-Path $tmp 'YiIME-old\YiIME.exe') $dir) { throw 'must not match sibling prefix YiIME-old' }
+
+            # 2. SHA256 copy verification
+            $src = Join-Path $tmp 'src.bin'
+            $dst = Join-Path $tmp 'dst.bin'
+            [IO.File]::WriteAllBytes($src, [byte[]](1, 2, 3, 4, 5))
+            [IO.File]::WriteAllBytes($dst, [byte[]](9, 9))
+            Copy-VerifiedFile $src $dst
+            if ((Get-FileHash $dst -Algorithm SHA256).Hash -ne (Get-FileHash $src -Algorithm SHA256).Hash) {
+              throw 'corrupted destination was not replaced'
+            }
+            Copy-VerifiedFile $src $dst
+
+            # 3. Registration rollback for both arches + CurrentDir
+            $old64 = Join-Path $tmp 'old64.dll'
+            $old32 = Join-Path $tmp 'old32.dll'
+            $new64 = Join-Path $tmp 'new64.dll'
+            $new32 = Join-Path $tmp 'new32.dll'
+            foreach ($f in @($old64, $old32, $new64, $new32)) { [IO.File]::WriteAllBytes($f, [byte[]](0)) }
+
+            $script:reg64 = $old64
+            $script:reg32 = $old32
+            $script:curDir = 'C:\OldDir'
+            $threw = $false
+            try {
+              Invoke-DllRegistration -Dll $new64 -Dll32 $new32 -OldDll $old64 -OldDll32 $old32 -Destination 'C:\NewDir' `
+                -RunRegsvr64 { param($a) if ($a[0] -eq '/u') { $script:reg64 = $null } else { $script:reg64 = $a[1].Trim('"') }; 0 } `
+                -RunRegsvr32 { param($a) if ($a[0] -eq '/u') { $script:reg32 = $null; 0 } elseif ($a[1].Trim('"') -eq $new32) { 5 } else { $script:reg32 = $a[1].Trim('"'); 0 } } `
+                -SetCurrentDir { param($d) $script:curDir = $d } `
+                -RestoreCurrentDir { $script:curDir = 'C:\OldDir' }
+            } catch { $threw = $true }
+            if (-not $threw) { throw 'expected x86 registration failure' }
+            if ($script:reg64 -ne $old64 -or $script:reg32 -ne $old32 -or $script:curDir -ne 'C:\OldDir') {
+              throw "rollback failed after x86 failure: 64=$($script:reg64) 32=$($script:reg32) dir=$($script:curDir)"
+            }
+
+            $threw = $false
+            try {
+              Invoke-DllRegistration -Dll $new64 -Dll32 $new32 -OldDll $old64 -OldDll32 $old32 -Destination 'C:\NewDir' `
+                -RunRegsvr64 { param($a) if ($a[0] -eq '/u') { $script:reg64 = $null } else { $script:reg64 = $a[1].Trim('"') }; 0 } `
+                -RunRegsvr32 { param($a) if ($a[0] -eq '/u') { $script:reg32 = $null } else { $script:reg32 = $a[1].Trim('"') }; 0 } `
+                -SetCurrentDir { param($d) throw 'write failed' } `
+                -RestoreCurrentDir { $script:curDir = 'C:\OldDir' }
+            } catch { $threw = $true }
+            if (-not $threw) { throw 'expected CurrentDir failure' }
+            if ($script:reg64 -ne $old64 -or $script:reg32 -ne $old32 -or $script:curDir -ne 'C:\OldDir') {
+              throw "rollback failed after CurrentDir failure: 64=$($script:reg64) 32=$($script:reg32) dir=$($script:curDir)"
+            }
+
+            # 4. Uninstaller boundary check + x86/x64 unregister exit codes
+            . .\windows\Uninstall-YiIME.ps1
+            if (Test-PathUnderDirectory (Join-Path $tmp 'YiIME2\YiIME.exe') $dir) { throw 'uninstaller must not match YiIME2' }
+            $threw = $false
+            $called64 = $false
+            try {
+              Invoke-DllUnregistration -Dll $old64 -Dll32 $old32 `
+                -RunRegsvr64 { param($a) $script:called64 = $true; 0 } `
+                -RunRegsvr32 { param($a) 5 }
+            } catch { $threw = $true }
+            if (-not $threw -or $called64) { throw 'expected x86 unregister failure to stop immediately' }
+            $threw = $false
+            try {
+              Invoke-DllUnregistration -Dll $old64 -Dll32 $old32 `
+                -RunRegsvr64 { param($a) 3 } `
+                -RunRegsvr32 { param($a) 0 }
+            } catch { $threw = $true }
+            if (-not $threw) { throw 'expected x64 unregister failure to throw' }
+            Invoke-DllUnregistration -Dll $old64 -Dll32 $old32 -RunRegsvr64 { param($a) 0 } -RunRegsvr32 { param($a) 0 }
+          } finally {
+            Remove-Item Env:YIIME_PS_TEST -ErrorAction SilentlyContinue
+            Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+          }
 
   linux-cli:
     strategy:

@@ -87,10 +87,15 @@ class YiIMEInputController: IMKInputController {
         default:
             break
         }
-        guard let chars = event.characters, let scalar = chars.unicodeScalars.first, chars.unicodeScalars.count == 1 else {
+        guard let chars = event.characters, !chars.isEmpty else {
             return active
         }
-        return send(Character(scalar), client: client)
+        if chars.unicodeScalars.count == 1, let scalar = chars.unicodeScalars.first {
+            return send(Character(scalar), client: client)
+        }
+        let handled = yiime_insert_text(ime, chars)
+        if handled { refresh(client: client) }
+        return handled
     }
 
     private func handleFlags(_ event: NSEvent, client: IMKTextInput) -> Bool {
@@ -171,7 +176,7 @@ class YiIMEInputController: IMKInputController {
             let value = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) as? [String: Any] ?? [:]
             let ok = value["ok"] as? Bool ?? false
             let text = ok ? (value["text"] as? String ?? source) : source
-            if !ok { NSLog("YiIME: 翻译失败，上屏中文：%@", value["error"] as? String ?? "") }
+            if !ok { NSLog("YiIME: 翻译失败（%@），上屏中文", value["category"] as? String ?? "unknown") }
             DispatchQueue.main.async {
                 guard yiime_finish_request(self.ime, request),
                       self.currentClient == nil || self.currentClient === requestClient else {

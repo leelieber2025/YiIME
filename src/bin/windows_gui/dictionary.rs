@@ -23,10 +23,16 @@ pub(super) fn load_full_in_background(
     ready: Arc<OnceLock<Arc<MixedInput>>>,
     hwnd: usize,
     message: u32,
+    error_message: u32,
 ) {
     std::thread::spawn(move || {
-        let Ok(words) = std::fs::read_to_string(path) else {
-            return;
+        let words = match std::fs::read_to_string(&path) {
+            Ok(words) => words,
+            Err(err) => {
+                let permanent = usize::from(err.kind() == std::io::ErrorKind::NotFound);
+                unsafe { PostMessageW(hwnd as _, error_message, permanent, 0) };
+                return;
+            }
         };
         let mut full = MixedInput::bundled().with_frequency_words(words);
         if let Some(user_words) = &user_words {

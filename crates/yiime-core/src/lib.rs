@@ -54,10 +54,12 @@ pub use engine::{
     pushes_fifth, selection_index,
 };
 pub use history::{HISTORY_CAP, HISTORY_FILE, History, HistoryEntry, history_label};
-pub use hotkey::{DEFAULT_PLAIN_TOGGLE, Hotkey, parse_hotkey};
+pub use hotkey::{DEFAULT_PLAIN_TOGGLE, Hotkey, conflicts_with_builtin, parse_hotkey};
 pub use import::{
     ImportedWord, decode_text, import_words, merge_user_words, parse_scel, parse_text_export,
 };
+#[cfg(feature = "engine")]
+pub use inline::ui as inline_ui;
 pub use inline::{
     SHIFT_TAP_MAX, ShiftTap, is_literal_in_english, is_numpad_digit, is_shift_key, literal_code,
 };
@@ -67,7 +69,8 @@ pub use keys::{
 };
 #[cfg(feature = "engine")]
 pub use learn::{
-    HALF_LIFE_DAYS, LEARNED_FILE, LEGACY_LEARNED_FILE, Learned, MAX_ENTRIES, PROMOTE_SCORE,
+    ForgetResult, HALF_LIFE_DAYS, LEARNED_FILE, LEGACY_LEARNED_FILE, Learned, MAX_ENTRIES,
+    PROMOTE_SCORE,
 };
 pub use reload::{FileStamp, SettingsStamp, UserWordsReloader};
 pub use request::RequestGate;
@@ -75,21 +78,21 @@ pub use service::{
     APP_WINDOW_CLASS, Activation, BACKOFF_RESET, BoxView, CommitIdentity, CommitReply,
     CommitTarget, DUPLICATE_COMMIT_MS, EMPTY_BOX_GRACE_MS, FIRST_BACKOFF, FieldScope,
     FieldSwitches, HIGH_INTEGRITY, HostOwner, KeyRoute, LandedRequests, LeftField, MAX_BACKOFF,
-    MEDIUM_INTEGRITY, Outstanding, PRIVATE_SCOPES, PassReason, ProcessSecurity, RECEIPT_WARN_SECS,
-    REQUEST_TIMEOUT_MS, Restore, Resubmit, SegmentAnchor, ServiceHealth, ShiftTapAction, Startup,
-    TRAY_WINDOW_TITLE, TSF_PROTOCOL, TSF_RECEIVER_CLASS, UnconfirmedCommit, WATCHDOG_GRACE,
-    WATCHDOG_LIMIT, Watchdog, WatchedHosts, caret_anchor, commit_digest, commit_targets,
-    duplicate_commit, english_ends_session, field_scope, focused_first, handle_from_wire,
-    hide_empty_box, key_route, keys_to_give_back, late_commit_landed, left_field,
-    may_share_service, needs_private_editor, next_held_id, pass_reason, private_scope,
-    redirect_to_focused, restore_left_draft, resubmit, service_window_title, shift_tap_action,
-    startup_state,
+    MEDIUM_INTEGRITY, Outstanding, PRIVATE_SCOPES, PassReason, ProcessSecurity,
+    RECEIPT_GIVEUP_SECS, RECEIPT_WARN_SECS, REQUEST_TIMEOUT_MS, Restore, Resubmit, SegmentAnchor,
+    ServiceHealth, ShiftTapAction, Startup, TRAY_WINDOW_TITLE, TSF_PROTOCOL, TSF_RECEIVER_CLASS,
+    UnconfirmedCommit, WATCHDOG_GRACE, WATCHDOG_LIMIT, Watchdog, WatchedHosts, can_auto_restore,
+    caret_anchor, commit_digest, commit_request_state, commit_targets, duplicate_commit,
+    english_ends_session, field_scope, focused_first, handle_from_wire, hide_empty_box, key_route,
+    keys_to_give_back, late_commit_landed, left_field, may_share_service, needs_private_editor,
+    next_held_id, pass_reason, private_scope, redirect_to_focused, restore_left_draft, resubmit,
+    retain_receipt, service_window_title, shift_tap_action, startup_state,
 };
 pub use settings::{
     AZURE_KEY_FILE, ApiSettings, DEFAULT_HISTORY_KEY, DEFAULT_URL, Engine, Flag, GOOGLE_KEY_FILE,
-    KEY_FILE, MemoryStore, OptionStore, Options, PAGE_SIZE, PAGE_SIZE_RANGE, PlainSealer,
-    SETTINGS_BROKEN, SETTINGS_FILE, Sealer, USER_WORDS_FILE, llm_url_allowed, parse_page_size,
-    plain_cell,
+    KEY_FILE, LEGACY_MIGRATION_MARKER, MemoryStore, OptionStore, Options, PAGE_SIZE,
+    PAGE_SIZE_RANGE, PlainSealer, SETTINGS_BROKEN, SETTINGS_FILE, Sealer, UNKNOWN_ENGINE,
+    USER_WORDS_FILE, llm_url_allowed, parse_page_size, plain_cell,
 };
 pub use shuangpin::Shuangpin;
 pub use style::{TranslationStyle, system_prompt};

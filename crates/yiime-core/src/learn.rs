@@ -14,7 +14,7 @@
 use crate::dict::Candidate;
 use crate::settings::{PlainSealer, Sealer};
 use crate::write_atomically;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -56,6 +56,17 @@ fn now_secs() -> u64 {
         .map_or(0, |time| time.as_secs())
 }
 
+/// Outcome of [`Learned::forget`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForgetResult {
+    /// No learned record existed for `(code, word)`.
+    NotFound,
+    /// Removed from memory and persisted to disk.
+    Persisted,
+    /// Removed from memory only (saving to disk failed).
+    MemoryOnly,
+}
+
 pub struct Learned {
     stats: HashMap<String, HashMap<String, Stat>>,
     path: Option<PathBuf>,
@@ -63,6 +74,9 @@ pub struct Learned {
     /// Number of `(code, word)` pairs in `stats`.
     count: usize,
     migrated_legacy: bool,
+    /// Existing file could not be read or decrypted on load: do not overwrite it; merge on recovery.
+    unreadable: bool,
+    forgotten: HashSet<(String, String)>,
     dirty: bool,
     last_save: Option<Instant>,
 }
@@ -76,6 +90,8 @@ impl Default for Learned {
             count: 0,
             dirty: false,
             migrated_legacy: false,
+            unreadable: false,
+            forgotten: HashSet::new(),
             last_save: None,
         }
     }
@@ -101,16 +117,36 @@ impl Learned {
             count: 0,
             dirty: false,
             migrated_legacy: false,
+            unreadable: false,
+            forgotten: HashSet::new(),
             last_save: None,
         };
         let Some(path) = learned.path.clone() else {
             return learned;
         };
-        let plain = std::fs::read(&path)
-            .ok()
-            .and_then(|bytes| learned.sealer.open(&bytes));
-        if let Some(plain) = plain {
-            learned.parse(&String::from_utf8_lossy(&plain));
+        match std::fs::read(&path) {
+            Ok(bytes) => match learned.sealer.open(&bytes) {
+                Some(plain) => {
+                    let ok = std::str::from_utf8(&plain)
+                        .ok()
+                        .is_some_and(|text| learned.parse(text));
+                    if !ok {
+                        learned.unreadable = true;
+                        return learned;
+                    }
+                }
+                None => {
+                    // Decrypt failure: keep original file intact until recovery.
+                    learned.unreadable = true;
+                    return learned;
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                // Transient read error: keep original file intact until recovery.
+                learned.unreadable = true;
+                return learned;
+            }
         }
         let legacy = path.with_file_name(LEGACY_LEARNED_FILE);
         if !learned.migrated_legacy {
@@ -136,10 +172,10 @@ impl Learned {
         learned
     }
 
-    fn parse(&mut self, text: &str) {
+    fn parse(&mut self, text: &str) -> bool {
         let mut lines = text.lines();
         if lines.next() != Some(HEADER) {
-            return;
+            return false;
         }
         for line in lines {
             if line == "# migrated legacy" {
@@ -167,6 +203,7 @@ impl Learned {
                 self.count += 1;
             }
         }
+        true
     }
 
     fn bump(&mut self, code: &str, word: &str, now: u64) {
@@ -213,6 +250,7 @@ impl Learned {
         if code.is_empty() || code.contains(['\t', '\n']) || word.contains(['\t', '\n']) {
             return false;
         }
+        self.forgotten.remove(&(code.to_owned(), word.to_owned()));
         self.bump(code, word, now);
         self.dirty = true;
         // Compact with some slack so a full store does not re-sort on every pick.
@@ -229,22 +267,29 @@ impl Learned {
     }
 
     /// Deletes the record of `word` under `code` (Ctrl+Shift+digit in Microsoft Pinyin,
-    /// Ctrl+Delete in Rime) and saves at once; returns whether anything was recorded.
-    pub fn forget(&mut self, code: &str, word: &str) -> bool {
+    /// Ctrl+Delete in Rime) and saves at once, reporting whether the delete was persisted.
+    pub fn forget(&mut self, code: &str, word: &str) -> ForgetResult {
         let removed = self
             .stats
             .get_mut(code)
             .and_then(|words| words.remove(word))
             .is_some();
-        if removed {
-            self.count -= 1;
-            if self.stats.get(code).is_some_and(HashMap::is_empty) {
-                self.stats.remove(code);
-            }
-            self.dirty = true;
-            self.save();
+        if !removed {
+            return ForgetResult::NotFound;
         }
-        removed
+        self.count -= 1;
+        if self.stats.get(code).is_some_and(HashMap::is_empty) {
+            self.stats.remove(code);
+        }
+        if self.unreadable {
+            self.forgotten.insert((code.to_owned(), word.to_owned()));
+        }
+        self.dirty = true;
+        if self.save() {
+            ForgetResult::Persisted
+        } else {
+            ForgetResult::MemoryOnly
+        }
     }
 
     /// Forgets everything (and deletes the file).
@@ -294,6 +339,57 @@ impl Learned {
             self.dirty = false;
             return true;
         };
+        if self.unreadable {
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    let Some(plain) = self.sealer.open(&bytes) else {
+                        return false;
+                    };
+                    // Recovered: parse disk table and merge in-memory picks/deletes made while unreadable.
+                    let mut recovered = Learned::default();
+                    let ok = std::str::from_utf8(&plain)
+                        .ok()
+                        .is_some_and(|text| recovered.parse(text));
+                    if !ok {
+                        return false;
+                    }
+                    for (code, words) in std::mem::take(&mut self.stats) {
+                        for (word, stat) in words {
+                            let target = recovered.stats.entry(code.clone()).or_default();
+                            match target.get_mut(&word) {
+                                Some(existing) => {
+                                    existing.score = existing.score_at(stat.last) + stat.score;
+                                    existing.last = existing.last.max(stat.last);
+                                }
+                                None => {
+                                    target.insert(word, stat);
+                                    recovered.count += 1;
+                                }
+                            }
+                        }
+                    }
+                    for (code, word) in std::mem::take(&mut self.forgotten) {
+                        if let Some(words) = recovered.stats.get_mut(&code) {
+                            if words.remove(&word).is_some() {
+                                recovered.count -= 1;
+                                if words.is_empty() {
+                                    recovered.stats.remove(&code);
+                                }
+                            }
+                        }
+                    }
+                    self.stats = std::mem::take(&mut recovered.stats);
+                    self.count = recovered.count;
+                    self.migrated_legacy |= recovered.migrated_legacy;
+                    self.unreadable = false;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.forgotten.clear();
+                    self.unreadable = false;
+                }
+                Err(_) => return false,
+            }
+        }
         self.compact(now_secs());
         let mut text = String::from(HEADER);
         text.push('\n');
@@ -442,15 +538,22 @@ mod tests {
         // Forgetting updates memory and file and keeps other records.
         let mut learned = Learned::load(Some(path.clone()), Box::new(Xor));
         assert!(learned.record("aaaa", "甲"));
-        assert!(learned.forget("aaaa", "乙"));
-        assert!(!learned.forget("aaaa", "乙"));
+        assert_eq!(learned.forget("aaaa", "乙"), ForgetResult::Persisted);
+        assert_eq!(learned.forget("aaaa", "乙"), ForgetResult::NotFound);
         drop(learned);
         let reloaded = Learned::load(Some(path.clone()), Box::new(Xor));
         assert_eq!(reloaded.score("aaaa", "乙"), 0.0);
         assert!(reloaded.score("aaaa", "甲") > 0.9);
-        // A file that does not decrypt is ignored, not fatal.
+        // A file that does not decrypt is not overwritten when a new pick arrives.
         std::fs::write(&path, b"garbage").unwrap();
-        assert!(Learned::load(Some(path.clone()), Box::new(Xor)).is_empty());
+        let mut damaged = Learned::load(Some(path.clone()), Box::new(Xor));
+        assert!(damaged.is_empty());
+        assert!(damaged.record("aaaa", "甲"));
+        assert!(!damaged.flush());
+        assert_eq!(damaged.forget("aaaa", "甲"), ForgetResult::MemoryOnly);
+        assert_eq!(std::fs::read(&path).unwrap(), b"garbage");
+        drop(damaged);
+        assert_eq!(std::fs::read(&path).unwrap(), b"garbage");
         // No temporary files are left behind.
         drop(reloaded);
         let leftovers = std::fs::read_dir(&dir)
@@ -536,6 +639,51 @@ mod tests {
         drop(learned);
         let reloaded = Learned::load(Some(path), Box::new(Xor));
         assert_eq!(reloaded.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn transient_decrypt_failure_preserves_old_file_and_merges_after_recovery() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct Flaky(Arc<AtomicBool>);
+        impl Sealer for Flaky {
+            fn seal(&self, data: &[u8]) -> Option<Vec<u8>> {
+                Xor.seal(data)
+            }
+            fn open(&self, data: &[u8]) -> Option<Vec<u8>> {
+                if self.0.load(Ordering::Relaxed) {
+                    Xor.open(data)
+                } else {
+                    None
+                }
+            }
+        }
+        let dir = temp_dir("flaky");
+        let path = dir.join(LEARNED_FILE);
+        let mut initial = Learned::load(Some(path.clone()), Box::new(Xor));
+        assert!(initial.record_at("aaaa", "甲", NOW));
+        assert!(initial.flush());
+        drop(initial);
+        let original_bytes = std::fs::read(&path).unwrap();
+
+        // Decryptor fails once on load (and on save while still failing): original bytes stay intact.
+        let allow_open = Arc::new(AtomicBool::new(false));
+        let mut session = Learned::load(Some(path.clone()), Box::new(Flaky(allow_open.clone())));
+        assert!(session.is_empty());
+        assert!(session.record_at("bbbb", "乙", NOW + 1));
+        assert_eq!(std::fs::read(&path).unwrap(), original_bytes);
+
+        // Decryptor recovers: flushing merges old ("甲") + new ("乙") instead of overwriting.
+        allow_open.store(true, Ordering::Relaxed);
+        assert!(session.flush());
+        drop(session);
+
+        let recovered = Learned::load(Some(path), Box::new(Xor));
+        assert!(recovered.score_at("aaaa", "甲", NOW + 1) > 0.9);
+        assert!(recovered.score_at("bbbb", "乙", NOW + 1) > 0.9);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

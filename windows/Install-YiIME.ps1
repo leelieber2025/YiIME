@@ -1,5 +1,85 @@
-﻿# Run from an elevated 64-bit PowerShell window.
+# Run from an elevated 64-bit PowerShell window.
 $ErrorActionPreference = 'Stop'
+
+function Test-PathUnderDirectory([string]$CandidatePath, [string]$DirectoryPath) {
+    if ([string]::IsNullOrWhiteSpace($CandidatePath) -or [string]::IsNullOrWhiteSpace($DirectoryPath)) {
+        return $false
+    }
+    $cand = [IO.Path]::GetFullPath($CandidatePath)
+    $dir = [IO.Path]::GetFullPath($DirectoryPath).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    return $cand.StartsWith($dir, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Copy-VerifiedFile([string]$Source, [string]$Destination) {
+    $expectedHash = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash
+    if (Test-Path -LiteralPath $Destination) {
+        $existingHash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash
+        if ($existingHash -eq $expectedHash) {
+            return
+        }
+    }
+    Copy-Item -LiteralPath $Source -Destination $Destination -Force -ErrorAction Stop
+    $actualHash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash
+    if ($actualHash -ne $expectedHash) {
+        throw "文件校验失败：$Destination"
+    }
+}
+
+function Invoke-DllRegistration(
+    [string]$Dll,
+    [string]$Dll32,
+    [string]$OldDll,
+    [string]$OldDll32,
+    [string]$Destination,
+    [scriptblock]$RunRegsvr64,
+    [scriptblock]$RunRegsvr32,
+    [scriptblock]$SetCurrentDir,
+    [scriptblock]$RestoreCurrentDir
+) {
+    $unregisteredOld64 = $false
+    $unregisteredOld32 = $false
+    $registeredNew64 = $false
+    $registeredNew32 = $false
+    try {
+        if ($OldDll -and (Test-Path -LiteralPath $OldDll) -and $OldDll -ne $Dll) {
+            $code = & $RunRegsvr64 @('/u', '/s', "`"$OldDll`"")
+            if ($code -ne 0) { throw "旧版输入法注销失败：$code" }
+            $unregisteredOld64 = $true
+        }
+        if ($OldDll32 -and (Test-Path -LiteralPath $OldDll32) -and $OldDll32 -ne $Dll32) {
+            $code = & $RunRegsvr32 @('/u', '/s', "`"$OldDll32`"")
+            if ($code -ne 0) { throw "旧版 32 位输入法注销失败：$code" }
+            $unregisteredOld32 = $true
+        }
+        $code = & $RunRegsvr64 @('/s', "`"$Dll`"")
+        if ($code -ne 0) { throw "新版输入法注册失败：$code" }
+        $registeredNew64 = $true
+
+        $code = & $RunRegsvr32 @('/s', "`"$Dll32`"")
+        if ($code -ne 0) { throw "32 位输入法注册失败：$code" }
+        $registeredNew32 = $true
+
+        & $SetCurrentDir $Destination
+    } catch {
+        try { & $RestoreCurrentDir } catch {}
+        if ($registeredNew32 -and $Dll32 -ne $OldDll32) {
+            try { [void](& $RunRegsvr32 @('/u', '/s', "`"$Dll32`"")) } catch {}
+        }
+        if ($registeredNew64 -and $Dll -ne $OldDll) {
+            try { [void](& $RunRegsvr64 @('/u', '/s', "`"$Dll`"")) } catch {}
+        }
+        if ($unregisteredOld32 -and $OldDll32 -and (Test-Path -LiteralPath $OldDll32)) {
+            try { [void](& $RunRegsvr32 @('/s', "`"$OldDll32`"")) } catch {}
+        }
+        if ($unregisteredOld64 -and $OldDll -and (Test-Path -LiteralPath $OldDll)) {
+            try { [void](& $RunRegsvr64 @('/s', "`"$OldDll`"")) } catch {}
+        }
+        throw
+    }
+}
+
+if ($env:YIIME_PS_TEST -eq '1') { return }
+
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw '请以管理员身份运行 PowerShell，再执行此脚本。'
@@ -15,7 +95,14 @@ function Invoke-Regsvr32([string[]]$RegArgs, [string]$Tool = $regsvr32) {
 }
 $clsid = '{A72091C2-7459-4C47-85F4-4626AE42A6C8}'
 $registryPath = "Registry::HKEY_CLASSES_ROOT\CLSID\$clsid\InprocServer32"
+$registryPath32 = "Registry::HKEY_CLASSES_ROOT\WOW6432Node\CLSID\$clsid\InprocServer32"
 $oldDll = if (Test-Path $registryPath) { (Get-Item $registryPath).GetValue('') } else { $null }
+$oldDll32 = if (Test-Path $registryPath32) { (Get-Item $registryPath32).GetValue('') } else { $null }
+$stateKey = 'HKLM:\Software\YiIME'
+$oldCurrentDirProp = if (Test-Path $stateKey) { Get-ItemProperty -Path $stateKey -Name 'CurrentDir' -ErrorAction SilentlyContinue } else { $null }
+$hadCurrentDir = $null -ne $oldCurrentDirProp
+$oldCurrentDir = if ($hadCurrentDir) { $oldCurrentDirProp.CurrentDir } else { $null }
+
 $sourceDll = Join-Path $source 'yiime_tsf.dll'
 $sourceDll32 = Join-Path $source 'yiime_tsf_x86.dll'
 $sourceExe = Join-Path $source 'YiIME.exe'
@@ -31,30 +118,39 @@ New-Item -ItemType Directory -Force -Path $destination | Out-Null
 $dll = Join-Path $destination 'yiime_tsf.dll'
 $dll32 = Join-Path $destination 'yiime_tsf_x86.dll'
 $exe = Join-Path $destination 'YiIME.exe'
-if (-not (Test-Path $dll)) { Copy-Item $sourceDll $dll }
-if (-not (Test-Path $dll32)) { Copy-Item $sourceDll32 $dll32 }
-if (-not (Test-Path $exe)) { Copy-Item $sourceExe $exe }
+Copy-VerifiedFile $sourceDll $dll
+Copy-VerifiedFile $sourceDll32 $dll32
+Copy-VerifiedFile $sourceExe $exe
 # The large lexicon (derived from rime-frost, GPL-3.0) is a separate file read by the EXE at
 # runtime; every install overwrites it.
 $sourceWords = Join-Path $source 'data\frost\YiIME-words.txt'
 if (Test-Path $sourceWords) { Copy-Item $sourceWords (Join-Path $destination 'YiIME-words.txt') -Force -ErrorAction SilentlyContinue }
-# Stage both files before touching the current registration. Loaded DLLs remain in their old version directory.
-if ($oldDll -and (Test-Path $oldDll) -and $oldDll -ne $dll) {
-    $unregCode = Invoke-Regsvr32 @('/u', '/s', "`"$oldDll`"")
-    if ($unregCode -ne 0) { throw "旧版输入法注销失败：$unregCode" }
-}
-$registrationError = Invoke-Regsvr32 @('/s', "`"$dll`"")
-if ($registrationError -ne 0) {
-    if ($oldDll -and (Test-Path $oldDll) -and $oldDll -ne $dll) { [void](Invoke-Regsvr32 @('/s', "`"$oldDll`"")) }
-    throw "新版输入法注册失败：$registrationError"
-}
-$registrationError = Invoke-Regsvr32 @('/s', "`"$dll32`"") $regsvr32x86
-if ($registrationError -ne 0) { throw "32 位输入法注册失败：$registrationError" }
-# Record the current version directory, for an older DLL (still loaded by a running application)
-# that cannot find the EXE next to it.
-$stateKey = 'HKLM:\Software\YiIME'
-New-Item -Path $stateKey -Force | Out-Null
-Set-ItemProperty -Path $stateKey -Name 'CurrentDir' -Value $destination
+
+# Stage all verified binaries before touching the current registration. Loaded DLLs remain in
+# their old version directory. On any registration or CurrentDir write failure, roll back both
+# architectures and CurrentDir.
+Invoke-DllRegistration `
+    -Dll $dll `
+    -Dll32 $dll32 `
+    -OldDll $oldDll `
+    -OldDll32 $oldDll32 `
+    -Destination $destination `
+    -RunRegsvr64 { param($RegArgs) Invoke-Regsvr32 $RegArgs $regsvr32 } `
+    -RunRegsvr32 { param($RegArgs) Invoke-Regsvr32 $RegArgs $regsvr32x86 } `
+    -SetCurrentDir {
+        param($dest)
+        New-Item -Path $stateKey -Force | Out-Null
+        Set-ItemProperty -Path $stateKey -Name 'CurrentDir' -Value $dest -ErrorAction Stop
+    } `
+    -RestoreCurrentDir {
+        if ($hadCurrentDir) {
+            New-Item -Path $stateKey -Force | Out-Null
+            Set-ItemProperty -Path $stateKey -Name 'CurrentDir' -Value $oldCurrentDir
+        } elseif (Test-Path $stateKey) {
+            Remove-ItemProperty -Path $stateKey -Name 'CurrentDir' -ErrorAction SilentlyContinue
+        }
+    }
+
 # Add the IME to the current user's Chinese input list; the taskbar switcher hides IMEs not in the
 # list.
 $tip = '0804:{A72091C2-7459-4C47-85F4-4626AE42A6C8}{54A39D73-0625-4560-B878-94660908C69D}'
@@ -92,7 +188,12 @@ Remove-Item (Join-Path $env:APPDATA "YiIME\ime-list-added"), (Join-Path $env:APP
 # Trays of this version and of 0.1.x (InputTranslation-Portable.exe under Program Files\InputTranslation).
 $legacyBase = Join-Path $env:ProgramFiles 'InputTranslation'
 Get-CimInstance Win32_Process -Filter "Name='YiIME.exe' OR Name='InputTranslation-Portable.exe'" -ErrorAction SilentlyContinue |
-    Where-Object { $_.CommandLine -notmatch '--tsf-hwnd' -and ($_.ExecutablePath -like "$base*" -or $_.ExecutablePath -like "$legacyBase*") } |
+    Where-Object {
+        $_.CommandLine -notmatch '--tsf-hwnd' -and (
+            (Test-PathUnderDirectory $_.ExecutablePath $base) -or
+            (Test-PathUnderDirectory $_.ExecutablePath $legacyBase)
+        )
+    } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 try {
     Start-Process -FilePath (Join-Path $env:WINDIR 'explorer.exe') -ArgumentList "`"$exe`""

@@ -18,8 +18,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use tray::{add_tray, tray_data, tray_menu, update_tray_tip};
-use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, HWND, LPARAM, LRESULT,
+    LocalFree, POINT, RECT, SIZE, WPARAM,
+};
 use windows_sys::Win32::Graphics::Dwm::{
     DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUNDSMALL, DwmSetWindowAttribute,
 };
@@ -39,12 +41,13 @@ use windows_sys::Win32::Security::Cryptography::{
 use windows_sys::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Registry::{
-    HKEY_CURRENT_USER, KEY_ALL_ACCESS, KEY_READ, REG_DWORD, REG_SZ, RRF_RT_REG_DWORD,
-    RRF_RT_REG_SZ, RegCloseKey, RegCopyTreeW, RegCreateKeyExW, RegGetValueW, RegOpenKeyExW,
-    RegSetKeyValueW,
+    HKEY_CURRENT_USER, KEY_READ, KEY_WRITE, REG_DWORD, REG_SZ, RRF_RT_REG_DWORD, RRF_RT_REG_SZ,
+    RegCloseKey, RegCreateKeyExW, RegEnumValueW, RegGetValueW, RegOpenKeyExW, RegQueryValueExW,
+    RegSetKeyValueW, RegSetValueExW,
 };
 use windows_sys::Win32::System::Threading::{
-    AttachThreadInput, GetCurrentThreadId, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+    AttachThreadInput, CreateMutexW, GetCurrentThreadId, OpenProcess, PROCESS_SYNCHRONIZE,
+    ReleaseMutex, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::Controls::Dialogs::{
     GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
@@ -58,9 +61,9 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::Input::Ime::ImmAssociateContextEx;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
-    SendInput, SetFocus, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_HOME, VK_LEFT,
-    VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_UP,
+    EnableWindow, GetKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
+    KEYEVENTF_UNICODE, SendInput, SetFocus, VK_CAPITAL, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END,
+    VK_HOME, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RIGHT, VK_RWIN, VK_SHIFT, VK_UP,
 };
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
@@ -171,12 +174,21 @@ const WM_TSF_ENGLISH: u32 = WM_APP + 9;
 /// From the TSF DLL (wParam = receiver, lParam = request ID): a commit landed. Sent
 /// besides the COPYDATA reply, which can be lost to a timeout while the focus moves.
 const COMMIT_TIMER: usize = 11;
+const DICT_RETRY_TIMER: usize = 12;
+const MAX_DICT_RETRIES: u8 = 3;
 const WM_TSF_COMMIT_FAILED: u32 = WM_APP + 16;
 const WM_TSF_COMMITTED: u32 = WM_APP + 10;
 /// From the TSF DLL (wParam = receiver, lParam 1 = private): the session's field declared a
 /// private InputScope (password, PIN, or a browser's private window). Nothing typed there is
 /// learned, kept in the history or sent to a translation service.
 const WM_TSF_PRIVATE: u32 = WM_APP + 11;
+/// Host-exit watch failed (`WaitForSingleObject` did not return `WAIT_OBJECT_0`): do not drop
+/// stashes or close a live host; mark watch failed so the next session re-registers.
+const WM_TSF_WATCH_FAILED: u32 = WM_APP + 17;
+/// Background user-dictionary import finished.
+const WM_IMPORT_DONE: u32 = WM_APP + 18;
+/// Background lexicon load failed (`wParam == 1` if missing / permanent, `0` if transient).
+const WM_FULL_INPUT_ERROR: u32 = WM_APP + 19;
 /// Tray (portable) and TSF editor instances use different titles so each can find its single
 /// instance.
 const TRAY_TITLE: &str = yiime_core::TRAY_WINDOW_TITLE;
@@ -307,6 +319,7 @@ struct AwaitingCommit {
     history: Option<(String, String)>,
     started: std::time::Instant,
     notified: bool,
+    awaiting_receipt: bool,
     /// Text sent; a retry ("未上屏，重试") sends exactly this again under the same request id.
     text: String,
     /// Chinese draft committed back into an application the user left mid-translation. Kept
@@ -315,6 +328,10 @@ struct AwaitingCommit {
     stash: Option<String>,
     /// The DLL reported that the stashed write failed.
     failed: bool,
+    /// Parked across fields inside the same application (never auto-restored into a new field).
+    same_app: bool,
+    /// Owner PID of `identity.receiver` when the stash was created (guards handle reuse).
+    host_pid: Option<u32>,
 }
 /// Status shown when a commit got no receipt: the two choices the user has.
 const UNCONFIRMED_STATUS: &str =
@@ -363,6 +380,8 @@ struct State {
     /// Stamp of the settings files behind `settings` (see [`current_settings`]).
     settings_stamp: Cell<Option<yiime_core::SettingsStamp>>,
     settings_window: Cell<HWND>,
+    /// Snapshot of settings when the settings window opened, for merge-on-save.
+    dialog_base: RefCell<Option<ApiSettings>>,
     dialog_keys_unreadable: Cell<bool>,
     /// Dialog font for the settings window (message font, scaled to the window DPI).
     settings_font: Cell<HFONT>,
@@ -422,6 +441,13 @@ struct State {
     shift_tap: Cell<yiime_core::ShiftTap>,
     /// A numpad digit was just pressed: its WM_CHAR does not pick a candidate.
     numpad: Cell<bool>,
+    /// Current session was opened by typing a key (blocks cross-app draft auto-restore).
+    key_started: Cell<bool>,
+    import_tx: Sender<Result<(usize, usize), String>>,
+    import_rx: Receiver<Result<(usize, usize), String>>,
+    import_busy: Cell<bool>,
+    dict_retries: Cell<u8>,
+    dict_words_path: RefCell<Option<PathBuf>>,
 }
 
 struct TranslationResult {
@@ -537,6 +563,9 @@ impl OptionStore for Registry {
 }
 const OPTIONS: Options<Registry> = Options(Registry);
 fn option(flag: Flag) -> bool {
+    if SELF_TEST.load(Ordering::Relaxed) {
+        return flag.default_on();
+    }
     OPTIONS.flag(flag)
 }
 fn set_option(flag: Flag, on: bool) -> bool {
@@ -544,8 +573,11 @@ fn set_option(flag: Flag, on: bool) -> bool {
 }
 /// 译/普通五笔, shared with packaged hosts through the session cell (see windows/plain_cell.rs).
 fn plain_mode() -> bool {
+    if SELF_TEST.load(Ordering::Relaxed) {
+        return false;
+    }
     crate::plain_cell::read(option(Flag::PlainMode), |plain| {
-        set_option(Flag::PlainMode, plain);
+        set_option(Flag::PlainMode, plain)
     })
 }
 fn set_plain_mode(on: bool) -> bool {
@@ -563,6 +595,17 @@ fn history_key_text() -> String {
 /// Current options, read from the registry each time so changes from TSF or the settings window
 /// apply at once.
 fn compose_options() -> ComposeOptions {
+    if SELF_TEST.load(Ordering::Relaxed) {
+        return ComposeOptions {
+            page_size: yiime_core::PAGE_SIZE,
+            traditional: Flag::Traditional.default_on(),
+            learn: Flag::Learn.default_on(),
+            fuzzy: Flag::FuzzyPinyin.default_on(),
+            pinyin_first: Flag::PinyinFirst.default_on(),
+            common_only: Flag::CommonOnly.default_on(),
+            shuangpin: None,
+        };
+    }
     ComposeOptions {
         page_size: OPTIONS.page_size(),
         traditional: option(Flag::Traditional),
@@ -580,8 +623,8 @@ fn history_path() -> Option<PathBuf> {
 fn history() -> Option<History<'static>> {
     history_path().map(|path| History::new(path, &Dpapi))
 }
-fn load_history() -> Vec<HistoryEntry> {
-    history().map(|history| history.load()).unwrap_or_default()
+fn load_history() -> Option<Vec<HistoryEntry>> {
+    history().and_then(|history| history.try_load())
 }
 fn clear_history() -> bool {
     let cleared = history().is_none_or(|history| history.clear());
@@ -601,7 +644,10 @@ fn local_time() -> String {
 /// Records a committed translation (not when history is off); a repeated sentence keeps only
 /// its newest entry.
 fn remember_translation(chinese: &str, english: &str) {
-    if !option(Flag::HistoryEnabled) || chinese.trim().is_empty() {
+    if SELF_TEST.load(Ordering::Relaxed)
+        || !option(Flag::HistoryEnabled)
+        || chinese.trim().is_empty()
+    {
         return;
     }
     if let Some(history) = history() {
@@ -639,22 +685,36 @@ unsafe fn show_history(hwnd: HWND, state: &State, entries: &[HistoryEntry], inde
 }
 /// History shortcut: load the newest entry as the draft.
 unsafe fn recall_latest(hwnd: HWND, state: &State) {
-    let shown =
-        option(Flag::HistoryEnabled) && unsafe { show_history(hwnd, state, &load_history(), 0) };
+    if !option(Flag::HistoryEnabled) {
+        state.recall_session.set(false);
+        unsafe {
+            set_status(
+                hwnd,
+                state,
+                Some(("输入记忆已关闭（可在设置里打开）".to_owned(), false)),
+            );
+        }
+        return;
+    }
+    let Some(entries) = load_history() else {
+        state.recall_session.set(false);
+        unsafe {
+            set_status(
+                hwnd,
+                state,
+                Some(("历史暂时无法读取，原文件已保留".to_owned(), true)),
+            );
+        }
+        return;
+    };
+    let shown = unsafe { show_history(hwnd, state, &entries, 0) };
     state.recall_session.set(shown);
     if !shown {
         unsafe {
             set_status(
                 hwnd,
                 state,
-                Some((
-                    if option(Flag::HistoryEnabled) {
-                        "还没有输入记忆（翻译上屏后会自动记住）".to_owned()
-                    } else {
-                        "输入记忆已关闭（可在设置里打开）".to_owned()
-                    },
-                    false,
-                )),
+                Some(("还没有输入记忆（翻译上屏后会自动记住）".to_owned(), false)),
             );
         }
     }
@@ -698,7 +758,7 @@ fn user_words_path() -> Option<PathBuf> {
 }
 /// Records a pick (unless learning is off).
 fn remember_pick(state: &State, code: &str, word: &str) {
-    if option(Flag::Learn) && !state.private_field.get() {
+    if !SELF_TEST.load(Ordering::Relaxed) && option(Flag::Learn) && !state.private_field.get() {
         state.learned.borrow_mut().record(code, word);
     }
 }
@@ -808,16 +868,20 @@ fn migrate_settings() {
         }
     }
     unsafe {
-        let mut existing = null_mut();
-        if RegOpenKeyExW(
+        let marker = wide(yiime_core::LEGACY_MIGRATION_MARKER);
+        let mut migrated = 0u32;
+        let mut marker_size = 4u32;
+        if RegGetValueW(
             HKEY_CURRENT_USER,
             wide(STATE_KEY).as_ptr(),
-            0,
-            KEY_READ,
-            &mut existing,
+            marker.as_ptr(),
+            RRF_RT_REG_DWORD,
+            null_mut(),
+            &mut migrated as *mut u32 as _,
+            &mut marker_size,
         ) == 0
+            && migrated == 1
         {
-            RegCloseKey(existing);
             return;
         }
         let mut old = null_mut();
@@ -838,13 +902,87 @@ fn migrate_settings() {
             0,
             null(),
             0,
-            KEY_ALL_ACCESS,
+            KEY_READ | KEY_WRITE,
             null(),
             &mut new,
             null_mut(),
         ) == 0
         {
-            RegCopyTreeW(old, null(), new);
+            let mut index = 0u32;
+            let mut all_ok = true;
+            loop {
+                let mut name_buf = vec![0u16; 256];
+                let mut name_len = name_buf.len() as u32;
+                let mut value_type = 0u32;
+                let mut data_buf = vec![0u8; 1024];
+                let mut data_len = data_buf.len() as u32;
+                let mut status = RegEnumValueW(
+                    old,
+                    index,
+                    name_buf.as_mut_ptr(),
+                    &mut name_len,
+                    null_mut(),
+                    &mut value_type,
+                    data_buf.as_mut_ptr(),
+                    &mut data_len,
+                );
+                if status == ERROR_MORE_DATA {
+                    name_buf.resize(name_len as usize + 1, 0);
+                    name_len = name_buf.len() as u32;
+                    data_buf.resize(data_len as usize, 0);
+                    status = RegEnumValueW(
+                        old,
+                        index,
+                        name_buf.as_mut_ptr(),
+                        &mut name_len,
+                        null_mut(),
+                        &mut value_type,
+                        data_buf.as_mut_ptr(),
+                        &mut data_len,
+                    );
+                }
+                if status == ERROR_NO_MORE_ITEMS {
+                    break;
+                }
+                if status != 0 {
+                    all_ok = false;
+                    break;
+                }
+                name_buf.truncate(name_len as usize);
+                name_buf.push(0);
+                let exists = RegQueryValueExW(
+                    new,
+                    name_buf.as_ptr(),
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                    null_mut(),
+                );
+                if exists == ERROR_FILE_NOT_FOUND
+                    && RegSetValueExW(
+                        new,
+                        name_buf.as_ptr(),
+                        0,
+                        value_type,
+                        data_buf.as_ptr(),
+                        data_len,
+                    ) != 0
+                {
+                    all_ok = false;
+                }
+                index += 1;
+            }
+            if all_ok {
+                let done = 1u32;
+                let _ = RegSetValueExW(
+                    new,
+                    marker.as_ptr(),
+                    0,
+                    REG_DWORD,
+                    &done as *const u32 as _,
+                    4,
+                );
+            }
             RegCloseKey(new);
         }
         RegCloseKey(old);
@@ -923,9 +1061,12 @@ fn current_settings(state: &State) -> ApiSettings {
     }
     state.settings.borrow().clone()
 }
-fn save_settings(settings: &ApiSettings) -> std::io::Result<()> {
+fn save_settings_merged(
+    settings: &ApiSettings,
+    base: Option<&ApiSettings>,
+) -> std::io::Result<ApiSettings> {
     let dir = settings_dir().ok_or_else(|| std::io::Error::other("找不到 APPDATA"))?;
-    settings.save(&dir, &Dpapi)
+    settings.save_merged(base, &dir, &Dpapi)
 }
 unsafe fn get_text(hwnd: HWND) -> String {
     let size = unsafe { GetWindowTextLengthW(hwnd) } as usize;
@@ -1270,8 +1411,13 @@ fn watch_receiver(hwnd: HWND, state: &State, receiver: HWND) {
         .borrow_mut()
         .session_started(receiver as usize, owner)
         && let Some(owner) = owner
+        && !watch_tsf_owner(receiver, owner.pid, hwnd)
     {
-        watch_tsf_owner(receiver, owner.pid, hwnd);
+        service_log(&format!("exit watch failed to open host pid={}", owner.pid));
+        state
+            .watched_receivers
+            .borrow_mut()
+            .watch_failed(receiver as usize, owner.pid);
     }
 }
 /// Another application starts a session: end the current one (telling its DLL), drop its draft
@@ -1282,9 +1428,10 @@ unsafe fn switch_receiver(hwnd: HWND, state: &State, receiver: HWND) {
     unsafe {
         if yiime_core::left_field(state.pending.get()) == yiime_core::LeftField::CommitSource {
             let old = state.tsf_receiver.get();
-            let draft = single_line(&get_text(state.edit));
-            if !old.is_null() && !draft.is_empty() {
-                commit_left_draft(hwnd, state, old, draft);
+            let raw = get_text(state.edit);
+            let wire = single_line(&raw);
+            if !old.is_null() && !wire.is_empty() {
+                commit_left_draft(hwnd, state, old, raw, wire);
             }
             state.pending.set(false);
             state.generation.set(state.generation.get() + 1);
@@ -1306,17 +1453,18 @@ unsafe fn switch_receiver(hwnd: HWND, state: &State, receiver: HWND) {
 /// (`old`), with its own request id so the DLL confirms it. Until it is confirmed the draft stays
 /// stashed under `old`: a rejected or unconfirmed write comes back in that application's box
 /// (see [`restore_left_draft`]) instead of being lost.
-unsafe fn commit_left_draft(hwnd: HWND, state: &State, old: HWND, draft: String) {
+unsafe fn commit_left_draft(hwnd: HWND, state: &State, old: HWND, raw: String, wire: String) {
     let id = state.next_request.get().wrapping_add(1).max(1);
     state.next_request.set(id);
     let reply =
-        yiime_core::CommitReply::from_wire(unsafe { ipc::send_commit(old, hwnd, &draft, id) });
+        yiime_core::CommitReply::from_wire(unsafe { ipc::send_commit(old, hwnd, &wire, id) });
     service_log(&format!(
         "session moved: translation source back to the previous application ({reply:?})"
     ));
     if reply == yiime_core::CommitReply::Landed {
         return;
     }
+    let awaiting_receipt = reply == yiime_core::CommitReply::Waiting;
     state.receipts.borrow_mut().push(AwaitingCommit {
         identity: yiime_core::CommitIdentity {
             receiver: old as usize,
@@ -1326,40 +1474,27 @@ unsafe fn commit_left_draft(hwnd: HWND, state: &State, old: HWND, draft: String)
         history: None,
         started: std::time::Instant::now(),
         notified: false,
-        text: draft.clone(),
-        stash: Some(draft),
+        awaiting_receipt,
+        text: wire,
+        stash: Some(raw),
         failed: reply == yiime_core::CommitReply::Rejected,
+        same_app: false,
+        host_pid: receiver_owner(old).map(|o| o.pid),
     });
-    unsafe {
-        SetTimer(hwnd, COMMIT_TIMER, 1000, None);
+    if awaiting_receipt {
+        unsafe {
+            SetTimer(hwnd, COMMIT_TIMER, 1000, None);
+        }
     }
 }
-/// The box of an application left mid-translation is open again with an empty draft: bring
-/// back the Chinese draft whose write there failed or never confirmed.
-unsafe fn restore_left_draft(hwnd: HWND, state: &State) {
-    let receiver = state.tsf_receiver.get() as usize;
-    if receiver == 0
-        || unsafe { IsWindowVisible(hwnd) } == 0
-        || state.pending.get()
-        || state.recall_session.get()
-    {
-        return;
-    }
-    let draft_empty = unsafe { GetWindowTextLengthW(state.edit) } == 0;
-    let found = state.receipts.borrow().iter().position(|p| {
-        p.identity.receiver == receiver
-            && p.stash.is_some()
-            && yiime_core::restore_left_draft(p.failed, p.notified, draft_empty).is_some()
-    });
-    let Some(i) = found else {
-        return;
-    };
-    let (how, draft) = {
-        let mut receipts = state.receipts.borrow_mut();
-        let p = &mut receipts[i];
-        let how = yiime_core::restore_left_draft(p.failed, p.notified, draft_empty);
-        (how, p.stash.clone().unwrap_or_default())
-    };
+unsafe fn apply_restored_draft(
+    hwnd: HWND,
+    state: &State,
+    index: usize,
+    how: Option<yiime_core::Restore>,
+    draft: String,
+    same_app: bool,
+) {
     unsafe {
         set_text(state.edit, &draft);
         let end = GetWindowTextLengthW(state.edit) as usize;
@@ -1372,18 +1507,100 @@ unsafe fn restore_left_draft(hwnd: HWND, state: &State) {
             // Becomes an ordinary unconfirmed commit of this draft: Enter retries it under the
             // same id, Esc confirms it landed.
             let mut receipts = state.receipts.borrow_mut();
-            let p = &mut receipts[i];
+            let p = &mut receipts[index];
             p.stash = None;
             p.identity.revision = revision;
             UNCONFIRMED_STATUS.to_owned()
         }
         _ => {
-            state.receipts.borrow_mut().remove(i);
-            "切换应用时这段文字没能上屏，草稿已恢复".to_owned()
+            state.receipts.borrow_mut().remove(index);
+            if same_app {
+                "已恢复切换输入框前的草稿".to_owned()
+            } else {
+                "切换应用时这段文字没能上屏，草稿已恢复".to_owned()
+            }
         }
     };
     service_log("draft of the left application restored");
     unsafe { set_status(hwnd, state, Some((status, true))) };
+}
+/// Auto-restores a stashed draft only for cross-app returns with an empty draft/composition and
+/// not started by typing a key. For same-app parked drafts, shows a Ctrl+R hint instead.
+unsafe fn restore_left_draft(hwnd: HWND, state: &State) {
+    let receiver = state.tsf_receiver.get() as usize;
+    if receiver == 0
+        || unsafe { IsWindowVisible(hwnd) } == 0
+        || state.pending.get()
+        || state.recall_session.get()
+    {
+        return;
+    }
+    let draft_empty = unsafe { GetWindowTextLengthW(state.edit) } == 0;
+    let composition_empty = state.composition.borrow().code.is_empty();
+    let key_started = state.key_started.get();
+    let found = state.receipts.borrow().iter().rposition(|p| {
+        p.identity.receiver == receiver
+            && p.stash.is_some()
+            && yiime_core::can_auto_restore(p.same_app, draft_empty, composition_empty, key_started)
+            && yiime_core::restore_left_draft(p.failed, p.notified, draft_empty).is_some()
+    });
+    if let Some(i) = found {
+        let (how, draft, same_app) = {
+            let receipts = state.receipts.borrow();
+            let p = &receipts[i];
+            let how = yiime_core::restore_left_draft(p.failed, p.notified, draft_empty);
+            (how, p.stash.clone().unwrap_or_default(), p.same_app)
+        };
+        unsafe { apply_restored_draft(hwnd, state, i, how, draft, same_app) };
+        return;
+    }
+    if draft_empty
+        && composition_empty
+        && !key_started
+        && state.status.borrow().is_none()
+        && state.receipts.borrow().iter().any(|p| {
+            p.identity.receiver == receiver
+                && p.same_app
+                && p.stash.is_some()
+                && yiime_core::restore_left_draft(p.failed, p.notified, draft_empty).is_some()
+        })
+    {
+        unsafe {
+            set_status(
+                hwnd,
+                state,
+                Some(("切换输入框前有未上屏草稿，按 Ctrl+R 恢复".into(), false)),
+            );
+        }
+    }
+}
+/// Manual Ctrl+R restore for a stashed draft (including same-app parked fields).
+unsafe fn restore_left_draft_manual(hwnd: HWND, state: &State) {
+    let receiver = state.tsf_receiver.get() as usize;
+    if receiver == 0
+        || unsafe { IsWindowVisible(hwnd) } == 0
+        || state.pending.get()
+        || state.recall_session.get()
+        || !state.composition.borrow().code.is_empty()
+        || unsafe { GetWindowTextLengthW(state.edit) } != 0
+    {
+        return;
+    }
+    let found = state.receipts.borrow().iter().rposition(|p| {
+        p.identity.receiver == receiver
+            && p.stash.is_some()
+            && yiime_core::restore_left_draft(p.failed, p.notified, true).is_some()
+    });
+    let Some(i) = found else {
+        return;
+    };
+    let (how, draft, same_app) = {
+        let receipts = state.receipts.borrow();
+        let p = &receipts[i];
+        let how = yiime_core::restore_left_draft(p.failed, p.notified, true);
+        (how, p.stash.clone().unwrap_or_default(), p.same_app)
+    };
+    unsafe { apply_restored_draft(hwnd, state, i, how, draft, same_app) };
 }
 /// Tells the TSF DLL this input ended without inserting text.
 unsafe fn finish_tsf(hwnd: HWND, state: &State) -> bool {
@@ -1602,6 +1819,7 @@ unsafe fn send_to_target(hwnd: HWND, state: &State, text: &str, retry: Option<u3
             {
                 p.started = std::time::Instant::now();
                 p.notified = false;
+                p.awaiting_receipt = true;
             }
             unsafe {
                 set_status(hwnd, state, None);
@@ -1640,9 +1858,12 @@ unsafe fn send_to_target(hwnd: HWND, state: &State, text: &str, retry: Option<u3
             history,
             started: std::time::Instant::now(),
             notified: false,
+            awaiting_receipt: true,
             text: line.clone(),
             stash: None,
             failed: false,
+            same_app: false,
+            host_pid: None,
         });
         unsafe {
             SetTimer(hwnd, COMMIT_TIMER, 1000, None);
@@ -1692,15 +1913,26 @@ unsafe fn finish_receipt(hwnd: HWND, state: &State, receiver: usize, id: u32, la
             // Chinese draft committed into an application the user left.
             if landed {
                 pending.remove(i);
+                if !pending.iter().any(|p| p.awaiting_receipt) {
+                    unsafe { KillTimer(hwnd, COMMIT_TIMER) };
+                }
             } else {
                 service_log("previous application rejected the draft; kept for its next session");
                 pending[i].failed = true;
+                pending[i].awaiting_receipt = false;
+                if !pending.iter().any(|p| p.awaiting_receipt) {
+                    unsafe { KillTimer(hwnd, COMMIT_TIMER) };
+                }
                 drop(pending);
                 unsafe { restore_left_draft(hwnd, state) };
             }
             return;
         }
-        pending.remove(i)
+        let removed = pending.remove(i);
+        if !pending.iter().any(|p| p.awaiting_receipt) {
+            unsafe { KillTimer(hwnd, COMMIT_TIMER) };
+        }
+        removed
     };
     if landed
         && let Some((source, english)) = receipt.history
@@ -1744,7 +1976,7 @@ fn adopt_full_input(state: &State) {
 /// import from any settings window, or an edit in Notepad). Cheap when nothing changed (one
 /// metadata call); runs when a session or a code starts.
 fn refresh_user_words(state: &State) {
-    let Some(contents) = state.user_words.borrow_mut().check() else {
+    let Some(contents) = state.user_words.borrow_mut().check_path(user_words_path()) else {
         return;
     };
     state.input.borrow().set_user_words(&contents);
@@ -1803,6 +2035,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         WM_COPYDATA
             | WM_TSF_ACTIVATE
             | WM_TSF_EXIT
+            | WM_TSF_WATCH_FAILED
             | WM_TSF_FOCUS_MOVED
             | WM_TSF_ENGLISH
             | WM_TSF_COMMITTED
@@ -1815,6 +2048,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
     };
     let state = unsafe { state_of(hwnd) };
     if let Some(state) = state
+        && !state.tsf_service
         && msg == state.taskbar_created
         && msg != 0
     {
@@ -1928,6 +2162,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 && l == 1
             {
                 let anchor = state.pending_anchor.take();
+                state.key_started.set(false);
                 unsafe {
                     activate(hwnd, state, w as HWND, anchor, String::new());
                     recall_latest(hwnd, state);
@@ -1940,6 +2175,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     || (0x61..=0x7a).contains(&(l as usize)))
             {
                 let anchor = state.pending_anchor.take();
+                state.key_started.set(l != 0);
                 let code = if l == 0 {
                     String::new()
                 } else {
@@ -1947,8 +2183,9 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 };
                 unsafe {
                     activate(hwnd, state, w as HWND, anchor, code);
-                    // Not for the history shortcut above: a recalled entry would replace it.
-                    restore_left_draft(hwnd, state);
+                    if l == 0 {
+                        restore_left_draft(hwnd, state);
+                    }
                     notify_tsf_ready(state.tsf_receiver.get(), hwnd);
                 }
             }
@@ -2033,49 +2270,133 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         },
         WM_FULL_INPUT => {
             if let Some(state) = state {
+                state.dict_retries.set(0);
+                unsafe { KillTimer(hwnd, DICT_RETRY_TIMER) };
                 adopt_full_input(state);
+            }
+            0
+        }
+        WM_FULL_INPUT_ERROR => {
+            if let Some(state) = state {
+                if w == 1 {
+                    service_log("full dictionary missing on disk; keeping bundled dictionary");
+                } else {
+                    let retry = state.dict_retries.get();
+                    if retry < MAX_DICT_RETRIES {
+                        let next = retry + 1;
+                        state.dict_retries.set(next);
+                        let delay_ms = 2000u32 << retry;
+                        service_log(&format!(
+                            "full dictionary load failed transiently; scheduling retry {next}/{MAX_DICT_RETRIES} in {delay_ms} ms"
+                        ));
+                        unsafe { SetTimer(hwnd, DICT_RETRY_TIMER, delay_ms, None) };
+                    } else {
+                        service_log(
+                            "full dictionary load failed after retries; keeping bundled dictionary",
+                        );
+                    }
+                }
+            }
+            0
+        }
+        WM_TIMER if w == DICT_RETRY_TIMER => {
+            unsafe { KillTimer(hwnd, DICT_RETRY_TIMER) };
+            if let Some(state) = state
+                && state.full_input.get().is_none()
+                && let Some(path) = state.dict_words_path.borrow().clone()
+            {
+                let (_, user_words) = UserWordsReloader::load(user_words_path());
+                dictionary::load_full_in_background(
+                    path,
+                    user_words,
+                    state.tsf_service,
+                    state.full_input.clone(),
+                    hwnd as usize,
+                    WM_FULL_INPUT,
+                    WM_FULL_INPUT_ERROR,
+                );
+            }
+            0
+        }
+        WM_IMPORT_DONE => {
+            if let Some(state) = state {
+                state.import_busy.set(false);
+                let settings_hwnd = state.settings_window.get();
+                if !settings_hwnd.is_null() {
+                    unsafe {
+                        let btn = GetDlgItem(settings_hwnd, SETTINGS_IMPORT);
+                        if !btn.is_null() {
+                            EnableWindow(btn, 1);
+                        }
+                    }
+                }
+                while let Ok(result) = state.import_rx.try_recv() {
+                    refresh_user_words(state);
+                    let text = match result {
+                        Ok((added, total)) => format!(
+                            "已导入 {added} 个新词（文件中共 {total} 个），立即生效（从下一次输入起）。"
+                        ),
+                        Err(error) => format!("导入失败：{error}"),
+                    };
+                    let parent = if !settings_hwnd.is_null() {
+                        settings_hwnd
+                    } else {
+                        hwnd
+                    };
+                    unsafe { message(parent, &text) };
+                }
+            }
+            0
+        }
+        WM_TSF_WATCH_FAILED => {
+            if let Some(state) = state
+                && w != 0
+                && l != 0
+            {
+                service_log(&format!("exit watch failed for host pid={}", l as u32));
+                state
+                    .watched_receivers
+                    .borrow_mut()
+                    .watch_failed(w, l as u32);
             }
             0
         }
         // The application owning receiver `w` deactivated the IME (from its DLL, lParam 0) or
         // exited (from the exit watch, lParam = its process id): end its session. An exit notice
-        // about an earlier owner of a reused handle is ignored. The service itself stays resident
-        // for other applications (until IDLE_TIMER).
+        // about an earlier owner of a reused handle is ignored BEFORE touching stashes or session.
         WM_TSF_EXIT => {
-            let current_host = |state: &State| {
-                l == 0
+            if let Some(state) = state
+                && w != 0
+            {
+                let exited = l == 0
                     || state
                         .watched_receivers
                         .borrow_mut()
-                        .host_exited(w, l as u32)
-            };
-            if let Some(state) = state
-                && w != 0
-                && l != 0
-            {
-                // The host is gone: nothing can be restored there any more.
-                state
-                    .receipts
-                    .borrow_mut()
-                    .retain(|p| p.stash.is_none() || p.identity.receiver != w);
-            }
-            if let Some(state) = state
-                && w != 0
-                && current_host(state)
-                && w as HWND == state.tsf_receiver.get()
-            {
-                service_log(if l == 0 {
-                    "session end: IME deactivated in the host"
-                } else {
-                    "session end: host exited"
-                });
-                state.finished.set(true);
-                state.tsf_receiver.set(null_mut());
-                unsafe {
-                    clear_box(hwnd, state);
-                    hide_box(hwnd, state);
-                    if state.private {
-                        DestroyWindow(hwnd);
+                        .host_exited(w, l as u32);
+                if exited {
+                    if l != 0 {
+                        let pid = l as u32;
+                        state.receipts.borrow_mut().retain(|p| {
+                            p.stash.is_none()
+                                || p.identity.receiver != w
+                                || (p.host_pid.is_some() && p.host_pid != Some(pid))
+                        });
+                    }
+                    if w as HWND == state.tsf_receiver.get() {
+                        service_log(if l == 0 {
+                            "session end: IME deactivated in the host"
+                        } else {
+                            "session end: host exited"
+                        });
+                        state.finished.set(true);
+                        state.tsf_receiver.set(null_mut());
+                        unsafe {
+                            clear_box(hwnd, state);
+                            hide_box(hwnd, state);
+                            if state.private {
+                                DestroyWindow(hwnd);
+                            }
+                        }
                     }
                 }
             }
@@ -2146,9 +2467,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     let mut pending = state.receipts.borrow_mut();
                     let mut warn = false;
                     for p in pending.iter_mut() {
-                        if !p.notified
-                            && p.started.elapsed().as_secs() >= yiime_core::RECEIPT_WARN_SECS
-                        {
+                        let elapsed = p.started.elapsed().as_secs();
+                        if !p.notified && elapsed >= yiime_core::RECEIPT_WARN_SECS {
                             p.notified = true;
                             warn |= p.stash.is_none()
                                 && p.identity.owns_draft(
@@ -2156,11 +2476,16 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                                     state.generation.get(),
                                 );
                         }
+                        if p.awaiting_receipt && elapsed >= yiime_core::RECEIPT_GIVEUP_SECS {
+                            p.awaiting_receipt = false;
+                        }
                     }
-                    // A rejected draft of a left application waits for that application (or
-                    // its exit); everything else is forgotten after 30 minutes.
-                    pending.retain(|p| p.failed || p.started.elapsed().as_secs() < 1800);
-                    if pending.is_empty() {
+                    // Stashed drafts survive receipt timeout; only non-stashed timed-out entries
+                    // are dropped once receipt waiting ends.
+                    pending.retain(|p| {
+                        yiime_core::retain_receipt(p.awaiting_receipt, p.stash.is_some())
+                    });
+                    if !pending.iter().any(|p| p.awaiting_receipt) {
                         unsafe {
                             KillTimer(hwnd, COMMIT_TIMER);
                         }
@@ -2188,7 +2513,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 // A parked field of an application this box no longer serves: nothing to commit,
                 // but release the id, or that application's next commit would go to the old field.
                 service_log("session end: parked field of another application released");
-                unsafe { send_tsf_held(w as HWND, hwnd, l as u64, "") };
+                unsafe { send_tsf_held(w as HWND, hwnd, l as u64, 0, "") };
             } else if let Some(state) = state
                 && state.tsf_service
                 && w != 0
@@ -2201,22 +2526,54 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     // end the next session, so the DLL is not told with one.
                     let translating = yiime_core::left_field(state.pending.get())
                         == yiime_core::LeftField::CommitSource;
-                    let draft = if translating {
-                        single_line(&unsafe { get_text(state.edit) })
+                    let raw = if translating {
+                        unsafe { get_text(state.edit) }
                     } else {
                         String::new()
                     };
+                    let wire = single_line(&raw);
                     service_log(if translating {
                         "session end: translation source back to the previous field"
                     } else {
                         "session end: host focus moved to another field"
                     });
+                    let receiver = state.tsf_receiver.get();
+                    let id = if translating && !wire.is_empty() {
+                        let id = state.next_request.get().wrapping_add(1).max(1);
+                        state.next_request.set(id);
+                        id
+                    } else {
+                        0
+                    };
                     // Always: an empty packet releases the parked field, so a later commit in the
                     // new session is not inserted into the old one.
-                    let accepted =
-                        unsafe { send_tsf_held(state.tsf_receiver.get(), hwnd, l as u64, &draft) };
-                    if translating && !accepted {
-                        service_log("previous field did not accept the text");
+                    let reply = yiime_core::CommitReply::from_wire(unsafe {
+                        send_tsf_held(receiver, hwnd, l as u64, id, &wire)
+                    });
+                    if translating && !wire.is_empty() && reply != yiime_core::CommitReply::Landed {
+                        service_log(&format!("previous field parked draft ({reply:?})"));
+                        let awaiting_receipt = reply == yiime_core::CommitReply::Waiting;
+                        state.receipts.borrow_mut().push(AwaitingCommit {
+                            identity: yiime_core::CommitIdentity {
+                                receiver: receiver as usize,
+                                request: id,
+                                revision: 0,
+                            },
+                            history: None,
+                            started: std::time::Instant::now(),
+                            notified: false,
+                            awaiting_receipt,
+                            text: wire,
+                            stash: Some(raw),
+                            failed: reply == yiime_core::CommitReply::Rejected,
+                            same_app: true,
+                            host_pid: receiver_owner(receiver).map(|o| o.pid),
+                        });
+                        if awaiting_receipt {
+                            unsafe {
+                                SetTimer(hwnd, COMMIT_TIMER, 1000, None);
+                            }
+                        }
                     }
                     state.pending.set(false);
                     state.finished.set(true);
@@ -2238,6 +2595,7 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             if let Some(state) = state
                 && unsafe { IsWindowVisible(hwnd) } == 0
                 && state.settings_window.get().is_null()
+                && !history::is_history_open()
                 // A draft kept for an application left mid-translation would be lost.
                 && !state.receipts.borrow().iter().any(|p| p.stash.is_some())
             {
@@ -2299,9 +2657,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
         }
         WM_DESTROY => {
             unsafe {
-                let data = tray_data(hwnd);
-                Shell_NotifyIconW(NIM_DELETE, &data);
                 let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut State;
+                if ptr.is_null() || !(*ptr).tsf_service {
+                    let data = tray_data(hwnd);
+                    Shell_NotifyIconW(NIM_DELETE, &data);
+                }
                 if !ptr.is_null() {
                     if !(*ptr).tsf_receiver.get().is_null() && !(*ptr).finished.get() {
                         send_tsf_text((*ptr).tsf_receiver.get(), hwnd, "");
@@ -2348,7 +2708,9 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
     // first under that code.
     // Reloaded in place when the file changes (an import, or an edit in Notepad), so the resident
     // service shows new words without a restart.
-    let (user_words_reloader, user_words) = UserWordsReloader::load(user_words_path());
+    let self_test = SELF_TEST.load(Ordering::Relaxed);
+    let (user_words_reloader, user_words) =
+        UserWordsReloader::load(if self_test { None } else { user_words_path() });
     let input = match &user_words {
         Some(words) => input.with_user_words(words),
         None => input,
@@ -2390,6 +2752,7 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
         SetWindowLongPtrW(edit, GWLP_USERDATA, previous);
         let full_ready = full_input.clone();
         let (translation_tx, translation_rx) = std::sync::mpsc::channel();
+        let (import_tx, import_rx) = std::sync::mpsc::channel();
         let state = Box::new(State {
             input: RefCell::new(input),
             full_input,
@@ -2406,6 +2769,7 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
             ),
             settings: RefCell::new(load_settings()),
             settings_window: Cell::new(null_mut()),
+            dialog_base: RefCell::new(None),
             dialog_keys_unreadable: Cell::new(false),
             settings_font: Cell::new(null_mut()),
             settings_dpi: Cell::new(0),
@@ -2432,18 +2796,27 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
             private_field: Cell::new(false),
             swallow_char: Cell::new(false),
             last_plain: Cell::new(plain_mode()),
-            learned: RefCell::new(Learned::load(learned_path(), Box::new(Dpapi))),
+            learned: RefCell::new(if self_test {
+                Learned::default()
+            } else {
+                Learned::load(learned_path(), Box::new(Dpapi))
+            }),
             quotes: Cell::new(Quotes::default()),
             english: Cell::new(false),
             shift_tap: Cell::new(yiime_core::ShiftTap::default()),
             numpad: Cell::new(false),
+            key_started: Cell::new(false),
+            import_tx,
+            import_rx,
+            import_busy: Cell::new(false),
+            dict_retries: Cell::new(0),
+            dict_words_path: RefCell::new(words_path.clone()),
             recall_session: Cell::new(false),
             history_pos: Cell::new(None),
             taskbar_created: RegisterWindowMessageW(wide("TaskbarCreated").as_ptr()),
         });
         let standalone = tsf_receiver.is_null();
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
-        let self_test = SELF_TEST.load(Ordering::Relaxed);
         if let Some(path) = words_path.filter(|_| !self_test) {
             dictionary::load_full_in_background(
                 path,
@@ -2452,20 +2825,23 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
                 full_ready,
                 hwnd as usize,
                 WM_FULL_INPUT,
+                WM_FULL_INPUT_ERROR,
             );
         }
         if self_test {
             return 0;
         }
-        add_tray(
-            hwnd,
-            // Show the balloon only on a first launch without arguments (not for
-            // --settings/--history).
-            (standalone && std::env::args().count() == 1).then_some(
-                "用 Win+空格 切换到“YiIME 译（五笔）”后直接打字即可。单击或右键托盘图标可打开菜单。",
-            ),
-        );
-        SetTimer(hwnd, TRAY_TIMER, 2000, None);
+        if standalone {
+            add_tray(
+                hwnd,
+                // Show the balloon only on a first launch without arguments (not for
+                // --settings/--history).
+                (std::env::args().count() == 1).then_some(
+                    "用 Win+空格 切换到“YiIME 译（五笔）”后直接打字即可。单击或右键托盘图标可打开菜单。",
+                ),
+            );
+            SetTimer(hwnd, TRAY_TIMER, 2000, None);
+        }
     }
     0
 }
@@ -2556,8 +2932,12 @@ pub fn run() {
         let instance = GetModuleHandleW(null());
         let class = wide(yiime_core::APP_WINDOW_CLASS);
         let smoke_test = SELF_TEST.load(Ordering::Relaxed);
-        if !tsf_mode && !smoke_test {
+        let tray_mutex = if !tsf_mode && !smoke_test {
             ensure_tip_in_language_list();
+            let mutex = CreateMutexW(null(), 0, wide(r"Local\YiIME-TrayStart-1").as_ptr());
+            if !mutex.is_null() {
+                WaitForSingleObject(mutex, 5000);
+            }
             // Keep one tray instance: a second launch (e.g. the Start-menu Settings shortcut)
             // just tells the existing one to open settings.
             let existing = FindWindowW(class.as_ptr(), wide(TRAY_TITLE).as_ptr());
@@ -2571,9 +2951,16 @@ pub fn run() {
                     WM_OPEN_SETTINGS
                 };
                 PostMessageW(existing, request, 0, 0);
+                if !mutex.is_null() {
+                    ReleaseMutex(mutex);
+                    CloseHandle(mutex);
+                }
                 return;
             }
-        }
+            mutex
+        } else {
+            null_mut()
+        };
         let wc = WNDCLASSW {
             style: CS_DROPSHADOW,
             hIcon: app_icon(GetSystemMetrics(SM_CXICON)),
@@ -2631,6 +3018,10 @@ pub fn run() {
             instance,
             null(),
         );
+        if !tray_mutex.is_null() {
+            ReleaseMutex(tray_mutex);
+            CloseHandle(tray_mutex);
+        }
         if smoke_test {
             let code = self_test(hwnd);
             DestroyWindow(hwnd);
@@ -2668,6 +3059,7 @@ pub fn run() {
                 .take(MAX_CODE_LEN)
                 .collect();
             let anchor = argument("--caret").and_then(parse_rect);
+            state.key_started.set(!initial.is_empty());
             activate(hwnd, state, state.target.get(), anchor, initial);
             if args.iter().any(|arg| arg == "--recall") {
                 recall_latest(hwnd, state);

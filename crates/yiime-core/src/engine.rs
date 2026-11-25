@@ -86,14 +86,17 @@ impl Composer {
             Some(_) if code.replace('\'', "").len() % 2 == 1 => code.chars().last(),
             _ => None,
         };
+        let complete_keys = match options.shuangpin {
+            Some(_) => &code[..code.len() - pending.map_or(0, char::len_utf8)],
+            None => code.as_str(),
+        };
         let lookup = match options.shuangpin {
             _ if code.is_empty() => None,
             Some(scheme) => {
-                let keys = &code[..code.len() - pending.map_or(0, char::len_utf8)];
-                if keys.replace('\'', "").is_empty() {
+                if complete_keys.replace('\'', "").is_empty() {
                     None
                 } else {
-                    scheme.expand(keys)
+                    scheme.expand(complete_keys)
                 }
             }
             None => Some(code.clone()),
@@ -117,7 +120,7 @@ impl Composer {
                 if candidate.rest.is_empty() {
                     return true;
                 }
-                match scheme.rest_keys(&code, &candidate.rest) {
+                match scheme.rest_keys(complete_keys, &candidate.rest) {
                     Some(keys) => {
                         candidate.rest = keys;
                         true
@@ -380,4 +383,40 @@ pub fn classify_letter(ch: char, caps_lock: bool, composing: bool) -> Option<Let
     } else {
         LetterAction::Compose(ch.to_ascii_lowercase())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shuangpin_odd_key_partial_candidate_keeps_complete_rest_plus_pending() {
+        let pinyin = "...\n中国\tzhong guo\t100\n人\tren\t90\n";
+        let input = crate::MixedInput::from_rime("...\n", pinyin);
+        let options = ComposeOptions {
+            page_size: 5,
+            traditional: false,
+            learn: false,
+            fuzzy: false,
+            pinyin_first: true,
+            common_only: false,
+            shuangpin: Some(crate::Shuangpin::Xiaohe),
+        };
+        let learned = Learned::default();
+        let mut composer = Composer::default();
+        // Xiaohe: vs=zhong, go=guo, rf=ren, u=trailing odd initial.
+        composer.set_code(&input, "vsgorfu".into(), &options, &learned);
+        let idx = composer
+            .candidates
+            .iter()
+            .position(|c| c.text == "中国")
+            .expect("partial 中国 candidate present");
+        assert_eq!(composer.candidates[idx].rest, "rfu");
+
+        let pick = composer.candidate_at(idx).unwrap();
+        assert_eq!(pick.text, "中国");
+        assert_eq!(pick.rest, "rfu");
+        composer.set_code(&input, pick.rest, &options, &learned);
+        assert_eq!(composer.code, "rfu");
+    }
 }

@@ -7,6 +7,9 @@ pub(super) unsafe fn set_code(hwnd: HWND, state: &State, code: String) {
         state.generation.set(state.generation.get().wrapping_add(1));
         *state.status.borrow_mut() = None;
     }
+    if code.is_empty() {
+        adopt_full_input(state);
+    }
     state.composition.borrow_mut().set_code(
         &state.input.borrow(),
         code,
@@ -430,32 +433,6 @@ pub(super) unsafe extern "system" fn edit_proc(
             }
             return 0;
         }
-        // Ctrl+Shift+digit: forget the learned pick of that candidate under the current code
-        // (Microsoft Pinyin convention).
-        WM_KEYDOWN
-            if (0x31..=0x39).contains(&w)
-                && unsafe { GetKeyState(VK_CONTROL as i32) } < 0
-                && unsafe { GetKeyState(VK_SHIFT as i32) } < 0
-                && unsafe { GetKeyState(VK_MENU as i32) } >= 0
-                && !state.composition.borrow().code.is_empty() =>
-        {
-            state.swallow_char.set(true);
-            let pick = state.composition.borrow().candidate_at(w - 0x31);
-            if let Some(pick) = pick {
-                let forgot = state.learned.borrow_mut().forget(&pick.code, &pick.text);
-                let code = state.composition.borrow().code.clone();
-                let text = if forgot {
-                    format!("已删除“{}”的学习记录", pick.text)
-                } else {
-                    format!("“{}”没有学习记录（词库词不删除）", pick.text)
-                };
-                unsafe {
-                    set_code(hwnd, state, code);
-                    set_status(hwnd, state, Some((text, false)));
-                }
-            }
-            return 0;
-        }
         WM_KEYDOWN | WM_SYSKEYDOWN if is_plain_toggle(w as u16) => {
             // The mode can also be toggled inside the box; the code and draft stay and the hint
             // line updates.
@@ -471,6 +448,54 @@ pub(super) unsafe extern "system" fn edit_proc(
             }
             return 0;
         }
+        // Ctrl+R: manually restore a kept draft from a parked field in the same application.
+        WM_KEYDOWN
+            if w == b'R' as usize
+                && unsafe { GetKeyState(VK_CONTROL as i32) } < 0
+                && unsafe { GetKeyState(VK_SHIFT as i32) } >= 0
+                && unsafe { GetKeyState(VK_MENU as i32) } >= 0
+                && state.composition.borrow().code.is_empty()
+                && !state.pending.get()
+                && unsafe { GetWindowTextLengthW(state.edit) } == 0 =>
+        {
+            state.swallow_char.set(true);
+            unsafe {
+                restore_left_draft_manual(hwnd, state);
+            }
+            return 0;
+        }
+        // Ctrl+Shift+digit: forget the learned pick of that candidate under the current code
+        // (Microsoft Pinyin convention).
+        WM_KEYDOWN
+            if (0x31..=0x39).contains(&w)
+                && unsafe { GetKeyState(VK_CONTROL as i32) } < 0
+                && unsafe { GetKeyState(VK_SHIFT as i32) } < 0
+                && unsafe { GetKeyState(VK_MENU as i32) } >= 0
+                && !state.composition.borrow().code.is_empty() =>
+        {
+            state.swallow_char.set(true);
+            let pick = state.composition.borrow().candidate_at(w - 0x31);
+            if let Some(pick) = pick {
+                let forgot = state.learned.borrow_mut().forget(&pick.code, &pick.text);
+                let code = state.composition.borrow().code.clone();
+                let text = match forgot {
+                    yiime_core::ForgetResult::Persisted => {
+                        format!("已删除“{}”的学习记录", pick.text)
+                    }
+                    yiime_core::ForgetResult::MemoryOnly => {
+                        format!("已从本次输入删除“{}”（学习文件暂时无法读取）", pick.text)
+                    }
+                    yiime_core::ForgetResult::NotFound => {
+                        format!("“{}”没有学习记录（词库词不删除）", pick.text)
+                    }
+                };
+                unsafe {
+                    set_code(hwnd, state, code);
+                    set_status(hwnd, state, Some((text, false)));
+                }
+            }
+            return 0;
+        }
         // With no code and an empty draft (or a recalled entry unchanged): ↑/PgUp shows older
         // history, ↓/PgDn newer.
         WM_KEYDOWN
@@ -479,7 +504,16 @@ pub(super) unsafe extern "system" fn edit_proc(
                 && option(Flag::HistoryEnabled) =>
         {
             let draft = unsafe { get_text(state.edit) };
-            let entries = load_history();
+            let Some(entries) = load_history() else {
+                unsafe {
+                    set_status(
+                        hwnd,
+                        state,
+                        Some(("历史暂时无法读取，原文件已保留".into(), true)),
+                    );
+                }
+                return 0;
+            };
             let current = state
                 .history_pos
                 .get()

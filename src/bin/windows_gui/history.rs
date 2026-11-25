@@ -5,6 +5,9 @@ thread_local! {
     static HISTORY_WINDOW: Cell<HWND> = const { Cell::new(null_mut()) };
     static HISTORY_VIEW: RefCell<Vec<HistoryEntry>> = const { RefCell::new(Vec::new()) };
 }
+pub(super) fn is_history_open() -> bool {
+    !HISTORY_WINDOW.with(Cell::get).is_null()
+}
 pub(super) fn refresh_open_history() {
     let window = HISTORY_WINDOW.with(Cell::get);
     if !window.is_null() {
@@ -14,7 +17,9 @@ pub(super) fn refresh_open_history() {
     }
 }
 unsafe fn fill_history(window: HWND) {
-    let entries = load_history();
+    let loaded = load_history();
+    let unreadable = loaded.is_none();
+    let entries = loaded.unwrap_or_default();
     unsafe {
         let list = GetDlgItem(window, HISTORY_LIST);
         SendMessageW(list, LB_RESETCONTENT, 0, 0);
@@ -33,6 +38,8 @@ unsafe fn fill_history(window: HWND) {
             GetDlgItem(window, HISTORY_STATUS),
             &if !option(Flag::HistoryEnabled) {
                 "输入记忆已关闭（设置里可打开）".to_owned()
+            } else if unreadable {
+                "输入记忆暂时无法读取（已保留原文件，请稍后重试）。".to_owned()
             } else if entries.is_empty() {
                 "还没有输入记忆：翻译上屏后会自动记住。".to_owned()
             } else {
@@ -109,7 +116,7 @@ pub(super) unsafe extern "system" fn history_proc(
         if !option(Flag::HistoryEnabled) {
             return None;
         }
-        load_history().into_iter().find(|item| item == &entry)
+        load_history()?.into_iter().find(|item| item == &entry)
     };
     match msg {
         WM_CREATE => unsafe {

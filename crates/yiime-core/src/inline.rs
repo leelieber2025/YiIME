@@ -64,6 +64,462 @@ pub fn is_literal_in_english(ch: char) -> bool {
     !ch.is_control()
 }
 
+#[cfg(feature = "engine")]
+pub mod ui {
+    use crate::MAX_CODE_LEN;
+    use crate::dict::{MixedInput, Source};
+    use crate::engine::{LetterAction, classify_letter, paging_direction_vk};
+    use crate::keys::semicolon_is_code;
+    use crate::shuangpin::Shuangpin;
+    use crate::text::to_traditional;
+    use std::collections::HashSet;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct DisplayCandidate {
+        pub text: String,
+        pub hint: String,
+        pub complete: bool,
+        pub rest: String,
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_candidates(
+        input: &MixedInput,
+        code: &str,
+        size: usize,
+        fuzzy: bool,
+        traditional: bool,
+        common_only: bool,
+        pinyin_first: bool,
+        shuangpin: Option<Shuangpin>,
+    ) -> Vec<DisplayCandidate> {
+        let pinyin_first = pinyin_first || shuangpin.is_some();
+        let pending = match shuangpin {
+            Some(_) if code.replace('\'', "").len() % 2 == 1 => code.chars().last(),
+            _ => None,
+        };
+        let complete_keys = match shuangpin {
+            Some(_) => &code[..code.len() - pending.map_or(0, char::len_utf8)],
+            None => code,
+        };
+        let lookup = match shuangpin {
+            _ if code.is_empty() => None,
+            Some(scheme) => {
+                if complete_keys.replace('\'', "").is_empty() {
+                    None
+                } else {
+                    scheme.expand(complete_keys)
+                }
+            }
+            None => Some(code.to_owned()),
+        };
+        let mut items = match &lookup {
+            None => Vec::new(),
+            Some(lookup) => input.candidates_filtered(
+                lookup,
+                size.max(1) * crate::CANDIDATE_PAGES,
+                size.max(1),
+                fuzzy,
+                pinyin_first,
+                common_only,
+                common_only && !traditional,
+            ),
+        };
+        if let Some(scheme) = shuangpin {
+            items.retain_mut(|candidate| {
+                if candidate.rest.is_empty() {
+                    return true;
+                }
+                match scheme.rest_keys(complete_keys, &candidate.rest) {
+                    Some(keys) => {
+                        candidate.rest = keys;
+                        true
+                    }
+                    None => false,
+                }
+            });
+            if let Some(key) = pending {
+                for candidate in &mut items {
+                    candidate.rest.push(key);
+                    candidate.source = Source::Partial;
+                }
+            }
+        }
+        let mut rows: Vec<DisplayCandidate> = items
+            .into_iter()
+            .map(|mut candidate| {
+                let hint = input.candidate_hint(code, &candidate);
+                if traditional {
+                    candidate.text = to_traditional(&candidate.text);
+                }
+                DisplayCandidate {
+                    text: candidate.text,
+                    hint,
+                    complete: candidate.complete,
+                    rest: candidate.rest,
+                }
+            })
+            .collect();
+        if traditional {
+            let mut seen = HashSet::new();
+            rows.retain(|item| seen.insert((item.text.clone(), item.rest.clone())));
+        }
+        rows
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum HitTarget {
+        Candidate(usize),
+        PrevPage,
+        NextPage,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct CandidateView {
+        pub code: String,
+        pub rows: Vec<DisplayCandidate>,
+        pub size: usize,
+        pub page: usize,
+        pub page_starts: Vec<usize>,
+        pub item_spans: Vec<(i32, i32)>,
+        pub prev_span: (i32, i32),
+        pub next_span: (i32, i32),
+        pub bar_height: i32,
+    }
+
+    impl CandidateView {
+        pub fn empty(size: usize) -> Self {
+            Self {
+                code: String::new(),
+                rows: Vec::new(),
+                size: size.max(1),
+                page: 0,
+                page_starts: vec![0],
+                item_spans: Vec::new(),
+                prev_span: (0, 0),
+                next_span: (0, 0),
+                bar_height: 0,
+            }
+        }
+
+        pub fn with_rows(
+            code: String,
+            rows: Vec<DisplayCandidate>,
+            size: usize,
+            page: usize,
+        ) -> Self {
+            let size = size.max(1);
+            let mut page_starts: Vec<usize> = (0..rows.len()).step_by(size).collect();
+            if page_starts.is_empty() {
+                page_starts.push(0);
+            }
+            let last = page_starts.len().saturating_sub(1);
+            Self {
+                code,
+                rows,
+                size,
+                page: page.min(last),
+                page_starts,
+                item_spans: Vec::new(),
+                prev_span: (0, 0),
+                next_span: (0, 0),
+                bar_height: 0,
+            }
+        }
+
+        pub fn reset(&mut self) {
+            self.code.clear();
+            self.rows.clear();
+            self.page = 0;
+            self.page_starts = vec![0];
+            self.item_spans.clear();
+            self.prev_span = (0, 0);
+            self.next_span = (0, 0);
+            self.bar_height = 0;
+        }
+
+        pub fn set_page_starts(&mut self, starts: &[u32]) -> bool {
+            if starts.is_empty() || starts[0] != 0 {
+                return false;
+            }
+            let limit = self.rows.len();
+            let mut parsed = Vec::with_capacity(starts.len());
+            for (i, &start) in starts.iter().enumerate() {
+                let idx = start as usize;
+                if i > 0 && (idx <= parsed[i - 1] || idx >= limit) {
+                    return false;
+                }
+                parsed.push(idx);
+            }
+            self.page_starts = parsed;
+            self.page = self.page.min(self.page_starts.len().saturating_sub(1));
+            true
+        }
+
+        pub fn page_count(&self) -> usize {
+            self.page_starts.len().max(1)
+        }
+
+        pub fn current_page_start(&self) -> usize {
+            self.page_starts
+                .get(self.page)
+                .copied()
+                .unwrap_or(0)
+                .min(self.rows.len())
+        }
+
+        pub fn page_items(&self) -> &[DisplayCandidate] {
+            let start = self.current_page_start();
+            let end = self
+                .page_starts
+                .get(self.page + 1)
+                .copied()
+                .unwrap_or(self.rows.len())
+                .min(self.rows.len());
+            if start >= end {
+                &[]
+            } else {
+                &self.rows[start..end]
+            }
+        }
+
+        pub fn turn_page(&mut self, forward: bool) -> bool {
+            let last = self.page_count().saturating_sub(1);
+            let next = if forward {
+                self.page.saturating_add(1).min(last)
+            } else {
+                self.page.saturating_sub(1)
+            };
+            if next == self.page {
+                false
+            } else {
+                self.page = next;
+                true
+            }
+        }
+
+        pub fn choice(&self, index: usize) -> Option<(String, String)> {
+            self.page_items()
+                .get(index)
+                .map(|item| (item.text.clone(), item.rest.clone()))
+        }
+
+        pub fn hit_test(&self, x: i32, y: i32) -> Option<HitTarget> {
+            if y < 0 || y >= self.bar_height {
+                return None;
+            }
+            for (idx, &(left, right)) in self.item_spans.iter().enumerate() {
+                if x >= left && x < right {
+                    return Some(HitTarget::Candidate(idx));
+                }
+            }
+            if x >= self.prev_span.0 && x < self.prev_span.1 {
+                return Some(HitTarget::PrevPage);
+            }
+            if x >= self.next_span.0 && x < self.next_span.1 {
+                return Some(HitTarget::NextPage);
+            }
+            None
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum InlineKeyOutcome {
+        Start(String),
+        Update(String),
+        Finish(String),
+        PickPartial { committed: String, rest: String },
+        Page(bool),
+        Swallow,
+        NotHandled,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct LogicalInline<C> {
+        active: Option<(C, String)>,
+    }
+
+    impl<C> Default for LogicalInline<C> {
+        fn default() -> Self {
+            Self { active: None }
+        }
+    }
+
+    impl<C: PartialEq + Clone> LogicalInline<C> {
+        pub fn active(&self) -> bool {
+            self.active.is_some()
+        }
+
+        pub fn same_context(&self, context: &C) -> bool {
+            self.active.as_ref().is_some_and(|(ctx, _)| ctx == context)
+        }
+
+        pub fn code(&self, context: &C) -> Option<&str> {
+            self.active
+                .as_ref()
+                .filter(|(ctx, _)| ctx == context)
+                .map(|(_, code)| code.as_str())
+        }
+
+        pub fn sync_from_composition(&mut self, context: &C, code: &str) {
+            self.active = Some((context.clone(), code.to_owned()));
+        }
+
+        pub fn clear(&mut self) {
+            self.active = None;
+        }
+
+        pub fn wants(
+            &self,
+            context: &C,
+            key: usize,
+            shift: bool,
+            comma_period_paging: bool,
+            shuangpin: Option<Shuangpin>,
+        ) -> bool {
+            if let Some(code) = self.code(context) {
+                let paging = u16::try_from(key).ok().is_some_and(|vk| {
+                    paging_direction_vk(vk, shift, comma_period_paging).is_some()
+                });
+                let shuangpin_semi = key == 0xBA
+                    && !shift
+                    && shuangpin.is_some_and(|scheme| semicolon_is_code(scheme, code));
+                paging
+                    || shuangpin_semi
+                    || matches!(
+                        key,
+                        0x41..=0x5a | 0x08 | 0x1b | 0x0d | 0x20 | 0x31..=0x39
+                    )
+            } else {
+                (0x41..=0x5a).contains(&key)
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn handle_key(
+            &mut self,
+            context: &C,
+            key: usize,
+            shift: bool,
+            caps_lock: bool,
+            comma_period_paging: bool,
+            shuangpin: Option<Shuangpin>,
+            choice_at: impl FnOnce(usize) -> Option<(String, String)>,
+        ) -> InlineKeyOutcome {
+            let Some(mut code) = self.code(context).map(str::to_owned) else {
+                if !(0x41..=0x5a).contains(&key) {
+                    return InlineKeyOutcome::NotHandled;
+                }
+                let ch = (key as u8 as char).to_ascii_lowercase().to_string();
+                self.active = Some((context.clone(), ch.clone()));
+                return InlineKeyOutcome::Start(ch);
+            };
+            match key {
+                0x41..=0x5a => {
+                    let base = (key as u8 as char).to_ascii_lowercase();
+                    let typed = if shift {
+                        base.to_ascii_uppercase()
+                    } else {
+                        base
+                    };
+                    match classify_letter(typed, caps_lock, true) {
+                        Some(LetterAction::Raw { flush_first: true }) => {
+                            let out = format!("{code}{typed}");
+                            self.active = None;
+                            InlineKeyOutcome::Finish(out)
+                        }
+                        Some(LetterAction::Compose(c)) => {
+                            if code.len() >= MAX_CODE_LEN {
+                                return InlineKeyOutcome::Swallow;
+                            }
+                            code.push(c);
+                            self.active = Some((context.clone(), code.clone()));
+                            InlineKeyOutcome::Update(code)
+                        }
+                        _ => InlineKeyOutcome::NotHandled,
+                    }
+                }
+                0xBA if !shift
+                    && shuangpin.is_some_and(|scheme| semicolon_is_code(scheme, &code)) =>
+                {
+                    if code.len() >= MAX_CODE_LEN {
+                        return InlineKeyOutcome::Swallow;
+                    }
+                    code.push(';');
+                    self.active = Some((context.clone(), code.clone()));
+                    InlineKeyOutcome::Update(code)
+                }
+                0x08 => {
+                    code.pop();
+                    if code.is_empty() {
+                        self.active = None;
+                        InlineKeyOutcome::Finish(String::new())
+                    } else {
+                        self.active = Some((context.clone(), code.clone()));
+                        InlineKeyOutcome::Update(code)
+                    }
+                }
+                0x1b => {
+                    self.active = None;
+                    InlineKeyOutcome::Finish(String::new())
+                }
+                0x0d => {
+                    self.active = None;
+                    InlineKeyOutcome::Finish(code)
+                }
+                0x20 => {
+                    if let Some((text, rest)) = choice_at(0) {
+                        self.apply_choice(context, text, rest)
+                    } else {
+                        self.active = None;
+                        InlineKeyOutcome::Finish(code)
+                    }
+                }
+                0x31..=0x39 => {
+                    if let Some((text, rest)) = choice_at(key - 0x31) {
+                        self.apply_choice(context, text, rest)
+                    } else {
+                        InlineKeyOutcome::NotHandled
+                    }
+                }
+                _ => u16::try_from(key)
+                    .ok()
+                    .and_then(|vk| paging_direction_vk(vk, shift, comma_period_paging))
+                    .map_or(InlineKeyOutcome::NotHandled, InlineKeyOutcome::Page),
+            }
+        }
+
+        pub fn pick_choice(
+            &mut self,
+            context: &C,
+            choice: Option<(String, String)>,
+        ) -> Option<InlineKeyOutcome> {
+            self.code(context)?;
+            let (text, rest) = choice?;
+            Some(self.apply_choice(context, text, rest))
+        }
+
+        fn apply_choice(&mut self, context: &C, text: String, rest: String) -> InlineKeyOutcome {
+            if rest.is_empty() {
+                self.active = None;
+                InlineKeyOutcome::Finish(text)
+            } else {
+                self.active = Some((context.clone(), rest.clone()));
+                InlineKeyOutcome::PickPartial {
+                    committed: text,
+                    rest,
+                }
+            }
+        }
+
+        pub fn commit_raw(&mut self, context: &C) -> Option<String> {
+            let code = self.code(context)?.to_owned();
+            self.active = None;
+            Some(code)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,5 +561,181 @@ mod tests {
         assert!(is_literal_in_english(','));
         assert!(!is_literal_in_english('\r'));
         assert!(!is_literal_in_english('\u{8}'));
+    }
+}
+
+#[cfg(all(test, feature = "engine"))]
+mod ui_tests {
+    use super::ui::*;
+    use crate::{MixedInput, Shuangpin};
+
+    #[test]
+    fn build_candidates_handles_shuangpin_odd_key_partial_and_traditional_dedup() {
+        let pinyin = "...\n中国\tzhong guo\t100\n人\tren\t90\n头发\ttou fa\t80\n頭髮\ttou fa\t70\n";
+        let input = MixedInput::from_rime("...\n", pinyin);
+        let rows = build_candidates(
+            &input,
+            "vsgorfu",
+            5,
+            false,
+            false,
+            false,
+            true,
+            Some(Shuangpin::Xiaohe),
+        );
+        let partial = rows.iter().find(|r| r.text == "中国").unwrap();
+        assert_eq!(partial.rest, "rfu");
+
+        let trad = build_candidates(&input, "toufa", 5, false, true, false, true, None);
+        assert_eq!(trad.iter().filter(|r| r.text == "頭髮").count(), 1);
+    }
+
+    #[test]
+    fn logical_inline_handles_rapid_keys_enter_partial_semicolon_shift_and_max_len() {
+        let ctx = 1usize;
+        let mut logic = LogicalInline::default();
+
+        // Rapid async keys: Start('n'), Update('ni'), Update('nih') before first callback completes.
+        assert_eq!(
+            logic.handle_key(&ctx, b'N' as usize, false, false, true, None, |_| None),
+            InlineKeyOutcome::Start("n".into())
+        );
+        assert!(logic.active());
+        assert_eq!(
+            logic.handle_key(&ctx, b'I' as usize, false, false, true, None, |_| None),
+            InlineKeyOutcome::Update("ni".into())
+        );
+        assert_eq!(
+            logic.handle_key(&ctx, b'H' as usize, false, false, true, None, |_| None),
+            InlineKeyOutcome::Update("nih".into())
+        );
+        assert_eq!(logic.code(&ctx), Some("nih"));
+
+        // Enter commits raw code, Space picks candidate 0.
+        assert_eq!(
+            logic.handle_key(&ctx, 0x0d, false, false, true, None, |_| Some((
+                "你".into(),
+                String::new()
+            ))),
+            InlineKeyOutcome::Finish("nih".into())
+        );
+        assert!(!logic.active());
+
+        // Partial candidate pick keeps `rest` active.
+        assert_eq!(
+            logic.handle_key(&ctx, b'X' as usize, false, false, true, None, |_| None),
+            InlineKeyOutcome::Start("x".into())
+        );
+        assert_eq!(
+            logic.handle_key(&ctx, 0x20, false, false, true, None, |_| Some((
+                "西".into(),
+                "an".into()
+            ))),
+            InlineKeyOutcome::PickPartial {
+                committed: "西".into(),
+                rest: "an".into(),
+            }
+        );
+        assert_eq!(logic.code(&ctx), Some("an"));
+
+        // Shift+letter flushes pending code + uppercase letter once.
+        assert_eq!(
+            logic.handle_key(&ctx, b'A' as usize, true, false, true, None, |_| None),
+            InlineKeyOutcome::Finish("anA".into())
+        );
+        assert!(!logic.active());
+
+        // Microsoft Shuangpin `;` is accepted during active composition as final `ing`.
+        assert_eq!(
+            logic.handle_key(
+                &ctx,
+                b'B' as usize,
+                false,
+                false,
+                true,
+                Some(Shuangpin::Microsoft),
+                |_| None
+            ),
+            InlineKeyOutcome::Start("b".into())
+        );
+        assert!(logic.wants(&ctx, 0xBA, false, true, Some(Shuangpin::Microsoft)));
+        assert_eq!(
+            logic.handle_key(
+                &ctx,
+                0xBA,
+                false,
+                false,
+                true,
+                Some(Shuangpin::Microsoft),
+                |_| None
+            ),
+            InlineKeyOutcome::Update("b;".into())
+        );
+
+        // MAX_CODE_LEN (32) swallows 33rd char, backspace pops.
+        for _ in 0..30 {
+            let _ = logic.handle_key(&ctx, b'A' as usize, false, false, true, None, |_| None);
+        }
+        assert_eq!(logic.code(&ctx).unwrap().len(), 32);
+        assert_eq!(
+            logic.handle_key(&ctx, b'A' as usize, false, false, true, None, |_| None),
+            InlineKeyOutcome::Swallow
+        );
+        assert_eq!(logic.code(&ctx).unwrap().len(), 32);
+        assert_eq!(
+            logic.handle_key(&ctx, 0x08, false, false, true, None, |_| None),
+            InlineKeyOutcome::Update(logic.code(&ctx).unwrap()[..31].to_owned())
+        );
+    }
+
+    #[test]
+    fn candidate_view_supports_variable_page_starts_reset_and_hit_testing() {
+        let rows: Vec<_> = (0..12)
+            .map(|n| DisplayCandidate {
+                text: n.to_string(),
+                hint: String::new(),
+                complete: true,
+                rest: String::new(),
+            })
+            .collect();
+        let mut view = CandidateView::with_rows("x".into(), rows, 5, 1);
+        assert_eq!(view.page_starts, vec![0, 5, 10]);
+        assert!(view.set_page_starts(&[0, 3, 8]));
+        assert_eq!(view.page_count(), 3);
+        assert_eq!(view.current_page_start(), 3);
+        assert_eq!(
+            view.page_items()
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["3", "4", "5", "6", "7"]
+        );
+        assert!(view.turn_page(true));
+        assert_eq!(view.current_page_start(), 8);
+        assert_eq!(
+            view.page_items()
+                .iter()
+                .map(|r| r.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["8", "9", "10", "11"]
+        );
+        assert!(!view.set_page_starts(&[1, 3]));
+        assert!(!view.set_page_starts(&[0, 5, 5]));
+        assert!(!view.set_page_starts(&[0, 12]));
+
+        view.bar_height = 28;
+        view.item_spans = vec![(8, 30), (46, 68)];
+        view.prev_span = (80, 98);
+        view.next_span = (98, 116);
+        assert_eq!(view.hit_test(15, 10), Some(HitTarget::Candidate(0)));
+        assert_eq!(view.hit_test(50, 10), Some(HitTarget::Candidate(1)));
+        assert_eq!(view.hit_test(85, 10), Some(HitTarget::PrevPage));
+        assert_eq!(view.hit_test(105, 10), Some(HitTarget::NextPage));
+        assert_eq!(view.hit_test(105, 30), None);
+
+        view.reset();
+        assert!(view.code.is_empty());
+        assert_eq!(view.page, 0);
+        assert!(view.rows.is_empty());
     }
 }

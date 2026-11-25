@@ -193,7 +193,11 @@ fn running_in_editor() -> bool {
 /// Copies the switches from `HKCU\Software\InputTranslation` (0.1.x) to
 /// `HKCU\Software\YiIME` the first time; the EXE does the same, whichever runs first.
 fn migrate_settings_key() {
-    if CURRENT_USER.open(STATE_KEY).is_ok() {
+    if CURRENT_USER
+        .open(STATE_KEY)
+        .and_then(|key| key.get_u32(yiime_core::LEGACY_MIGRATION_MARKER))
+        .is_ok_and(|v| v == 1)
+    {
         return;
     }
     let Ok(old) = CURRENT_USER.open(LEGACY_STATE_KEY) else {
@@ -202,10 +206,17 @@ fn migrate_settings_key() {
     let Ok(new) = CURRENT_USER.create(STATE_KEY) else {
         return;
     };
-    if let Ok(values) = old.values() {
-        for (name, value) in values {
-            let _ = new.set_value(&name, &value);
+    let Ok(values) = old.values() else {
+        return;
+    };
+    let mut all_ok = true;
+    for (name, value) in values {
+        if new.get_value(&name).is_err() && new.set_value(&name, &value).is_err() {
+            all_ok = false;
         }
+    }
+    if all_ok {
+        let _ = new.set_u32(yiime_core::LEGACY_MIGRATION_MARKER, 1);
     }
 }
 
@@ -2080,7 +2091,7 @@ impl TextService {
             if self.editor_open.get() {
                 self.finish_editor();
             } else if self.held_id.get() != 0 {
-                self.commit_held(self.held_id.get(), String::new());
+                self.commit_held(self.held_id.get(), 0, String::new());
             }
             return 1;
         }
@@ -2232,7 +2243,10 @@ impl TextService {
                 self.finish_editor();
             }
         }
-        if p.target == yiime_core::CommitTarget::Held && self.held_id.get() == p.held_id {
+        if p.target == yiime_core::CommitTarget::Held
+            && p.held_id != 0
+            && self.held_id.get() == p.held_id
+        {
             self.clear_held();
         }
     }
@@ -2286,29 +2300,88 @@ impl TextService {
         let context = unsafe { document.GetTop() }.ok()?;
         (!Self::disabled(&context)).then_some(context)
     }
-    /// Inserts `text` into the parked text field `id` and releases it. Does not touch a session
-    /// that started afterwards. Empty text only releases the field.
-    fn commit_held(&self, id: u64, text: String) -> bool {
+    /// Inserts `text` into the parked text field `id` (protocol 5: 0 rejected, 1 inserted,
+    /// 2 queued) and releases it. Does not touch a session that started afterwards. Empty text
+    /// only releases the field.
+    fn commit_held(&self, id: u64, request: u32, text: String) -> LRESULT {
+        if text.is_empty() {
+            if id == 0 || id != self.held_id.get() {
+                return 0;
+            }
+            self.clear_held();
+            return 1;
+        }
+        let editor = self.editor_window.get();
+        let pending = self
+            .pending_commit
+            .borrow()
+            .as_ref()
+            .map(|p| (p.editor as usize, p.request));
+        match yiime_core::commit_request_state(
+            &self.landed_requests.borrow(),
+            pending,
+            editor as usize,
+            request,
+        ) {
+            Some(yiime_core::CommitReply::Landed) => {
+                if id != 0 && id == self.held_id.get() {
+                    self.clear_held();
+                }
+                log("重试的跨框上屏请求已上屏过（按请求编号），不再插入");
+                self.report_commit(editor, request, true);
+                return 1;
+            }
+            Some(yiime_core::CommitReply::Waiting) => return 2,
+            Some(yiime_core::CommitReply::Rejected) => {
+                // Release the parked field so a later commit in the new field never lands in it.
+                if id != 0 && id == self.held_id.get() {
+                    self.clear_held();
+                }
+                return 0;
+            }
+            None => {}
+        }
         if id == 0 || id != self.held_id.get() {
-            return false;
+            return 0;
         }
         let context = self.held_context.borrow_mut().take();
         self.held_id.set(0);
-        if text.is_empty() {
-            return true;
-        }
         let Some(context) = context else {
-            return false;
+            return 0;
         };
-        self.insert_text(&context, text)
-    }
-    fn insert_text(&self, context: &ITfContext, text: String) -> bool {
-        // qingjian edit/update.rs request_update: TF_ES_READWRITE only (no TF_ES_SYNC);
-        // Win11 Notepad and other immersive hosts can crash on a synchronous lock.
-        // SampleIME KeyHandler.cpp uses TF_ES_ASYNCDONTCARE | TF_ES_READWRITE for the same reason.
+        let digest = yiime_core::commit_digest(&text);
         let outcome = Rc::new(Cell::new(None));
-        self.request_insert(context, text, outcome.clone(), 0, false)
-            && outcome.get() != Some(false)
+        if !self.request_insert(
+            &context,
+            text,
+            outcome.clone(),
+            self.receiver.get() as usize,
+            false,
+        ) {
+            return 0;
+        }
+        match outcome.get() {
+            None => {
+                *self.pending_commit.borrow_mut() = Some(PendingCommit {
+                    digest,
+                    outcome,
+                    target: yiime_core::CommitTarget::Held,
+                    request,
+                    editor,
+                    session: self.session_revision.get(),
+                    held_id: 0,
+                });
+                2
+            }
+            Some(false) => 0,
+            Some(true) => {
+                log("上屏成功：held");
+                self.last_commit
+                    .set(Some((digest, std::time::Instant::now())));
+                self.report_commit(editor, request, true);
+                1
+            }
+        }
     }
     fn request_insert(
         &self,

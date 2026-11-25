@@ -57,7 +57,8 @@ impl<'a> History<'a> {
     pub fn load(&self) -> Vec<HistoryEntry> {
         self.try_load().unwrap_or_default()
     }
-    fn try_load(&self) -> Option<Vec<HistoryEntry>> {
+    /// Newest first; None if the existing file could not be read, decrypted or parsed.
+    pub fn try_load(&self) -> Option<Vec<HistoryEntry>> {
         let bytes = match std::fs::read(&self.path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Vec::new()),
@@ -198,14 +199,16 @@ mod tests {
         assert!(history.clear());
         assert!(!history.promote(&stale));
         std::fs::write(&history.path, [0xff]).unwrap();
+        assert_eq!(history.try_load(), None);
         assert!(!history.remember("新记录", "new", "now".into()));
+        assert!(!history.promote(&stale));
         assert_eq!(std::fs::read(&history.path).unwrap(), [0xff]);
         let malformed = b"t1\t\xe4\xbd\xa0\xe5\xa5\xbd\tHello\nt2\tbroken\n";
         std::fs::write(&history.path, malformed).unwrap();
         assert!(!history.remember("新记录", "new", "now".into()));
         assert_eq!(std::fs::read(&history.path).unwrap(), malformed);
         assert!(history.clear());
-        assert!(history.load().is_empty());
+        assert_eq!(history.try_load(), Some(Vec::new()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

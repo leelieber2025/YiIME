@@ -7,6 +7,7 @@ Ime *yiime_new(void);
 void yiime_preload(void);
 void yiime_free(Ime *ime);
 bool yiime_key(Ime *ime, uint32_t ch);
+bool yiime_insert_text(Ime *ime, const char *text);
 void yiime_shift_tap(Ime *ime);
 void yiime_commit_code(Ime *ime);
 bool yiime_active(const Ime *ime);

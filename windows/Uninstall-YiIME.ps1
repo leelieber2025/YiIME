@@ -1,6 +1,34 @@
-﻿# Run from an elevated 64-bit PowerShell window.
+# Run from an elevated 64-bit PowerShell window.
 param([switch]$RemoveSettings)
 $ErrorActionPreference = 'Stop'
+
+function Test-PathUnderDirectory([string]$CandidatePath, [string]$DirectoryPath) {
+    if ([string]::IsNullOrWhiteSpace($CandidatePath) -or [string]::IsNullOrWhiteSpace($DirectoryPath)) {
+        return $false
+    }
+    $cand = [IO.Path]::GetFullPath($CandidatePath)
+    $dir = [IO.Path]::GetFullPath($DirectoryPath).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+    return $cand.StartsWith($dir, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Invoke-DllUnregistration(
+    [string]$Dll,
+    [string]$Dll32,
+    [scriptblock]$RunRegsvr64,
+    [scriptblock]$RunRegsvr32
+) {
+    if ($Dll32 -and (Test-Path -LiteralPath $Dll32)) {
+        $code32 = & $RunRegsvr32 @('/u', '/s', "`"$Dll32`"")
+        if ($code32 -ne 0) { throw "32 位输入法注销失败：$code32" }
+    }
+    if ($Dll -and (Test-Path -LiteralPath $Dll)) {
+        $code64 = & $RunRegsvr64 @('/u', '/s', "`"$Dll`"")
+        if ($code64 -ne 0) { throw "输入法注销失败：$code64" }
+    }
+}
+
+if ($env:YIIME_PS_TEST -eq '1') { return }
+
 $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw '请以管理员身份运行 PowerShell，再执行此脚本。'
@@ -8,18 +36,22 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 $base = Join-Path $env:ProgramFiles 'YiIME'
 # Install directory, settings key and folder of 0.1.x (before the rename to YiIME); removed too.
 $legacyBase = Join-Path $env:ProgramFiles 'InputTranslation'
+$regsvr32 = Join-Path $env:WINDIR 'System32\regsvr32.exe'
+$regsvr32x86 = Join-Path $env:WINDIR 'SysWOW64\regsvr32.exe'
+function Invoke-Regsvr32([string[]]$RegArgs, [string]$Tool) {
+    $proc = Start-Process -FilePath $Tool -ArgumentList $RegArgs -Wait -PassThru -WindowStyle Hidden
+    return $proc.ExitCode
+}
 $registryPath = 'Registry::HKEY_CLASSES_ROOT\CLSID\{A72091C2-7459-4C47-85F4-4626AE42A6C8}\InprocServer32'
 $dll = if (Test-Path $registryPath) { (Get-Item $registryPath).GetValue('') } else { $null }
 # The 32-bit registration (WOW6432Node), for 32-bit applications.
 $registryPath32 = 'Registry::HKEY_CLASSES_ROOT\WOW6432Node\CLSID\{A72091C2-7459-4C47-85F4-4626AE42A6C8}\InprocServer32'
 $dll32 = if (Test-Path $registryPath32) { (Get-Item $registryPath32).GetValue('') } else { $null }
-if ($dll32 -and (Test-Path $dll32)) {
-    [void](Start-Process -FilePath (Join-Path $env:WINDIR 'SysWOW64\regsvr32.exe') -ArgumentList @('/u', '/s', "`"$dll32`"") -Wait -PassThru -WindowStyle Hidden)
-}
-if ($dll -and (Test-Path $dll)) {
-    $proc = Start-Process -FilePath (Join-Path $env:WINDIR 'System32\regsvr32.exe') -ArgumentList @('/u', '/s', "`"$dll`"") -Wait -PassThru -WindowStyle Hidden
-    if ($proc.ExitCode -ne 0) { throw "输入法注销失败：$($proc.ExitCode)" }
-}
+Invoke-DllUnregistration `
+    -Dll $dll `
+    -Dll32 $dll32 `
+    -RunRegsvr64 { param($RegArgs) Invoke-Regsvr32 $RegArgs $regsvr32 } `
+    -RunRegsvr32 { param($RegArgs) Invoke-Regsvr32 $RegArgs $regsvr32x86 }
 # Remove the IME from the current user's input list and delete the Start menu shortcut.
 $tip = '0804:{A72091C2-7459-4C47-85F4-4626AE42A6C8}{54A39D73-0625-4560-B878-94660908C69D}'
 try {
@@ -42,8 +74,10 @@ foreach ($name in @('YiIME 设置.lnk', '中英输入 设置.lnk')) {
 }
 # Stop our own editor/tray processes (only EXEs in the install directory) so files can be deleted.
 Get-Process -Name 'YiIME', 'InputTranslation-Portable' -ErrorAction SilentlyContinue |
-    Where-Object { $_.Path -and ($_.Path.StartsWith($base, [StringComparison]::OrdinalIgnoreCase) -or
-                                 $_.Path.StartsWith($legacyBase, [StringComparison]::OrdinalIgnoreCase)) } |
+    Where-Object {
+        (Test-PathUnderDirectory $_.Path $base) -or
+        (Test-PathUnderDirectory $_.Path $legacyBase)
+    } |
     Stop-Process -Force -ErrorAction SilentlyContinue
 Remove-Item 'HKLM:\Software\YiIME', 'HKLM:\Software\InputTranslation' -Recurse -Force -ErrorAction SilentlyContinue
 $locked = @()

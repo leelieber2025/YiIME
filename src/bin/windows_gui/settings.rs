@@ -567,6 +567,7 @@ pub(super) unsafe extern "system" fn settings_proc(
             };
             let settings = current_settings(state);
             state.dialog_keys_unreadable.set(settings.keys_unreadable);
+            *state.dialog_base.borrow_mut() = Some(settings.clone());
             let dpi = window_dpi(hwnd);
             let font = settings_dialog_font(dpi);
             let previous = state.settings_font.replace(font);
@@ -775,13 +776,16 @@ pub(super) unsafe extern "system" fn settings_proc(
                 .and_then(|current| Shuangpin::ALL.iter().position(|item| *item == current))
                 .map_or(0, |index| index + 1);
             SendMessageW(scheme, CB_SETCURSEL, current, 0);
-            add_control(
+            let import_btn = add_control(
                 hwnd,
                 "BUTTON",
                 "导入搜狗/QQ 词库…",
                 WS_TABSTOP,
                 SETTINGS_IMPORT,
             );
+            if state.import_busy.get() {
+                EnableWindow(import_btn, 0);
+            }
             let history = add_control(
                 hwnd,
                 "BUTTON",
@@ -952,6 +956,7 @@ pub(super) unsafe extern "system" fn settings_proc(
                         keys_unreadable: state.dialog_keys_unreadable.get(),
                         // save() refuses on its own while settings.json is not an object.
                         settings_broken: false,
+                        unknown_engine: false,
                         engine: usize::try_from(engine_index)
                             .ok()
                             .and_then(|index| Engine::ALL.get(index).copied())
@@ -1029,44 +1034,65 @@ pub(super) unsafe extern "system" fn settings_proc(
                             "快捷键无效：用 + 连接 Ctrl/Shift/Alt 与 Space、字母、数字或 F1～F12，且须含 Ctrl 或 Alt（F 键除外）",
                         );
                     } else if parse_hotkey(&hotkey) == parse_hotkey(&history_key)
-                        || ["Ctrl+Space", "Ctrl+Alt+T", "Ctrl+Shift+F"]
-                            .iter()
-                            .any(|fixed| {
-                                [parse_hotkey(&hotkey), parse_hotkey(&history_key)]
-                                    .contains(&parse_hotkey(fixed))
-                            })
+                        || [parse_hotkey(&hotkey), parse_hotkey(&history_key)]
+                            .into_iter()
+                            .flatten()
+                            .any(yiime_core::conflicts_with_builtin)
                     {
                         message(hwnd, "快捷键与其他输入法动作冲突");
                     } else if let Err(error) = api_check {
                         message(hwnd, error);
-                    } else if !set_plain_mode(plain)
-                        || !OPTIONS.set_plain_toggle_key(&hotkey)
-                        || !set_option(Flag::HistoryEnabled, history_on)
-                        || !OPTIONS.set_page_size(page)
-                        || !OPTIONS.set_shuangpin(
-                            usize::try_from(SendMessageW(
-                                GetDlgItem(hwnd, SETTINGS_SCHEME),
-                                CB_GETCURSEL,
-                                0,
-                                0,
-                            ))
-                            .ok()
-                            .and_then(|index| index.checked_sub(1))
-                            .and_then(|index| Shuangpin::ALL.get(index).copied()),
-                        )
-                        || !OPTIONS.set_history_key(&history_key)
-                        || (!history_on && !clear_history())
-                        || !OPTION_BOXES.iter().all(|(id, _, option_key)| {
-                            let checked =
-                                SendMessageW(GetDlgItem(hwnd, *id), BM_GETCHECK, 0, 0) == 1;
-                            set_option(*option_key, checked != (*option_key == Flag::PunctEnglish))
-                        })
-                    {
-                        message(hwnd, "保存模式设置失败");
-                    } else if let Err(error) = save_settings(&settings) {
-                        message(hwnd, &format!("保存设置失败：{error}"));
                     } else {
-                        *state.settings.borrow_mut() = settings;
+                        let saved = match save_settings_merged(
+                            &settings,
+                            state.dialog_base.borrow().as_ref(),
+                        ) {
+                            Ok(saved) => saved,
+                            Err(error) => {
+                                message(hwnd, &format!("保存设置失败：{error}"));
+                                return 0;
+                            }
+                        };
+                        let shuangpin = usize::try_from(SendMessageW(
+                            GetDlgItem(hwnd, SETTINGS_SCHEME),
+                            CB_GETCURSEL,
+                            0,
+                            0,
+                        ))
+                        .ok()
+                        .and_then(|index| index.checked_sub(1))
+                        .and_then(|index| Shuangpin::ALL.get(index).copied());
+                        let options_ok = set_plain_mode(plain)
+                            && OPTIONS.set_plain_toggle_key(&hotkey)
+                            && set_option(Flag::HistoryEnabled, history_on)
+                            && OPTIONS.set_page_size(page)
+                            && OPTIONS.set_shuangpin(shuangpin)
+                            && OPTIONS.set_history_key(&history_key)
+                            && OPTION_BOXES.iter().all(|(id, _, option_key)| {
+                                let checked =
+                                    SendMessageW(GetDlgItem(hwnd, *id), BM_GETCHECK, 0, 0) == 1;
+                                set_option(
+                                    *option_key,
+                                    checked != (*option_key == Flag::PunctEnglish),
+                                )
+                            });
+                        if !options_ok {
+                            *state.settings.borrow_mut() = saved;
+                            state
+                                .settings_stamp
+                                .set(settings_dir().map(|dir| yiime_core::SettingsStamp::of(&dir)));
+                            message(hwnd, "翻译服务设置已保存，但保存模式设置失败");
+                            return 0;
+                        }
+                        if !history_on && !clear_history() {
+                            *state.settings.borrow_mut() = saved;
+                            state
+                                .settings_stamp
+                                .set(settings_dir().map(|dir| yiime_core::SettingsStamp::of(&dir)));
+                            message(hwnd, "设置已保存，但清除输入记忆失败");
+                            return 0;
+                        }
+                        *state.settings.borrow_mut() = saved;
                         state
                             .settings_stamp
                             .set(settings_dir().map(|dir| yiime_core::SettingsStamp::of(&dir)));
@@ -1107,11 +1133,8 @@ pub(super) unsafe extern "system" fn settings_proc(
                     }
                 }
                 SETTINGS_IMPORT => {
-                    import_dictionary(hwnd);
-                    // This process's dictionaries at once; other YiIME processes (the shared
-                    // input box) reload the file when their next session or code starts.
                     if let Some(state) = state_of(owner) {
-                        refresh_user_words(state);
+                        import_dictionary(hwnd, owner, state);
                     }
                 }
                 SETTINGS_USER_WORDS => {
@@ -1138,6 +1161,7 @@ pub(super) unsafe extern "system" fn settings_proc(
         },
         WM_DESTROY => unsafe {
             if let Some(state) = state_of(owner) {
+                *state.dialog_base.borrow_mut() = None;
                 state.settings_window.set(null_mut());
                 let font = state.settings_font.replace(null_mut());
                 if !font.is_null() {
@@ -1158,7 +1182,10 @@ pub(super) unsafe extern "system" fn settings_proc(
 /// Picks an exported Sogou/QQ user dictionary (.txt) or a Sogou cell dictionary (.scel) and
 /// appends its words to user_words.txt; they apply from the next code typed (every YiIME process
 /// reloads the file when it changes).
-unsafe fn import_dictionary(hwnd: HWND) {
+unsafe fn import_dictionary(hwnd: HWND, owner: HWND, state: &State) {
+    if state.import_busy.get() {
+        return;
+    }
     let mut buffer = vec![0u16; 1024];
     let filter = wide("词库文件 (*.txt;*.scel)\0*.txt;*.scel\0所有文件\0*.*\0");
     let title = wide("导入搜狗/QQ 用户词库或搜狗细胞词库");
@@ -1178,19 +1205,26 @@ unsafe fn import_dictionary(hwnd: HWND) {
     let Some(target) = user_words_path() else {
         return;
     };
-    let result = std::fs::read(&path)
-        .map_err(|error| error.to_string())
-        .and_then(|bytes| yiime_core::import_words(&bytes).map_err(str::to_owned))
-        .and_then(|words| {
-            yiime_core::import_into(&target, &words)
-                .map(|added| (added, words.len()))
-                .map_err(|e| e.to_string())
-        });
-    let text = match result {
-        Ok((added, total)) => {
-            format!("已导入 {added} 个新词（文件中共 {total} 个），立即生效（从下一次输入起）。")
+    state.import_busy.set(true);
+    unsafe {
+        let btn = GetDlgItem(hwnd, SETTINGS_IMPORT);
+        if !btn.is_null() {
+            EnableWindow(btn, 0);
         }
-        Err(error) => format!("导入失败：{error}"),
-    };
-    unsafe { message(hwnd, &text) };
+    }
+    let tx = state.import_tx.clone();
+    let owner_w = owner as usize;
+    std::thread::spawn(move || {
+        let result = std::fs::read(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| yiime_core::import_words(&bytes).map_err(str::to_owned))
+            .and_then(|words| {
+                yiime_core::import_into(&target, &words)
+                    .map(|added| (added, words.len()))
+                    .map_err(|e| e.to_string())
+            });
+        if tx.send(result).is_ok() {
+            unsafe { PostMessageW(owner_w as HWND, WM_IMPORT_DONE, 0, 0) };
+        }
+    });
 }

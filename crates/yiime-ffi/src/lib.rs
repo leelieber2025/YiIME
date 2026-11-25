@@ -125,8 +125,12 @@ impl Ime {
             return true;
         }
         if self.composer.is_composing() {
-            if ch == '\'' && yiime_core::selection_index(input(), &self.composer.code, ch).is_none()
-            {
+            let selection = yiime_core::selection_index(input(), &self.composer.code, ch);
+            if let Some(pick) = selection.and_then(|index| self.composer.candidate_at(index)) {
+                self.take_pick(pick);
+                return true;
+            }
+            if ch == '\'' && selection.is_none() {
                 let mut code = self.composer.code.clone();
                 if code.len() < yiime_core::MAX_CODE_LEN {
                     code.push(ch);
@@ -182,6 +186,20 @@ impl Ime {
             _ => false,
         }
     }
+    /// Inserts pre-composed multi-scalar text (e.g. accented dead-key output) when a session
+    /// is active; returns false when idle so the host inserts it directly.
+    pub fn insert_text(&mut self, text: &str) -> bool {
+        if !self.active() {
+            return false;
+        }
+        let clean: String = text.chars().filter(|ch| !ch.is_control()).collect();
+        if clean.is_empty() {
+            return false;
+        }
+        self.flush_all();
+        self.draft.insert(&clean);
+        true
+    }
     /// Shift tap: toggles the inline English segment; entering English puts the pending code into
     /// the draft as letters.
     pub fn shift_tap(&mut self) {
@@ -231,7 +249,7 @@ impl Ime {
 
 /// Free Google by default; with `url`, `model` and `key` set, the LLM is the fallback when Google
 /// fails (the caller passes them for exactly that, so fallback is allowed only then).
-pub fn translate_text(source: &str, url: &str, model: &str, key: &str) -> Result<String, String> {
+pub fn translate_outcome(source: &str, url: &str, model: &str, key: &str) -> yiime_core::Outcome {
     let mut settings = ApiSettings {
         engine: Engine::GoogleFree,
         ..ApiSettings::default()
@@ -242,7 +260,11 @@ pub fn translate_text(source: &str, url: &str, model: &str, key: &str) -> Result
         settings.model = model.to_owned();
         settings.key = key.to_owned();
     }
-    yiime_core::translate(&settings, source).result
+    yiime_core::translate(&settings, source)
+}
+
+pub fn translate_text(source: &str, url: &str, model: &str, key: &str) -> Result<String, String> {
+    translate_outcome(source, url, model, key).result
 }
 
 fn to_c(text: String) -> *mut c_char {
@@ -346,6 +368,21 @@ pub unsafe extern "C" fn yiime_key(ime: *mut Ime, ch: u32) -> bool {
     unsafe { guard_ime(ime, false, |ime| ime.key(ch)) }
 }
 
+/// Inserts pre-composed UTF-8 text (such as multi-scalar dead-key characters) while a session is
+/// active; returns `false` when idle or empty/control-only.
+///
+/// # Safety
+/// `ime` comes from [`yiime_new`] and `text` is null or a valid C string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn yiime_insert_text(ime: *mut Ime, text: *const c_char) -> bool {
+    unsafe {
+        guard_ime(ime, false, |ime| {
+            let text = from_c(text);
+            ime.insert_text(&text)
+        })
+    }
+}
+
 /// # Safety
 /// `ime` comes from [`yiime_new`].
 #[unsafe(no_mangle)]
@@ -406,16 +443,32 @@ pub unsafe extern "C" fn yiime_translate(
     guard(
         || {
             std::panic::catch_unwind(|| {
-                to_c(json!({"ok": false, "error": "翻译处理出错，请重试"}).to_string())
+                to_c(
+                    json!({"ok": false, "error": "翻译处理出错，请重试", "category": "panic"})
+                        .to_string(),
+                )
             })
             .unwrap_or(std::ptr::null_mut())
         },
         || {
             let (source, url, model, key) =
                 unsafe { (from_c(source), from_c(url), from_c(model), from_c(key)) };
-            let value = match translate_text(&source, &url, &model, &key) {
+            let outcome = translate_outcome(&source, &url, &model, &key);
+            let value = match outcome.result {
                 Ok(text) => json!({"ok": true, "text": text}),
-                Err(error) => json!({"ok": false, "error": error}),
+                Err(error) => {
+                    let category: Vec<&str> = outcome
+                        .attempts
+                        .iter()
+                        .filter_map(|a| a.failure.as_deref())
+                        .collect();
+                    let category = if category.is_empty() {
+                        "config".to_owned()
+                    } else {
+                        category.join("; ")
+                    };
+                    json!({"ok": false, "error": error, "category": category})
+                }
             };
             to_c(value.to_string())
         },
@@ -686,5 +739,102 @@ mod tests {
             assert!(!yiime_finish_request(ime, second), "committed once");
             yiime_free(ime);
         }
+    }
+
+    #[test]
+    fn semicolon_and_apostrophe_select_second_and_third_candidates() {
+        let mut ime = Ime::default();
+        // `aaaa` has >= 3 Wubi candidates and pinyin_continues("aaaa") == false.
+        typed(&mut ime, "ggl");
+        let second = ime.composer.candidate_at(1).unwrap().text;
+        assert!(ime.key(';'));
+        assert_eq!(ime.draft(), second);
+        assert!(ime.code().is_empty());
+
+        let mut ime = Ime::default();
+        typed(&mut ime, "ggl");
+        let third = ime.composer.candidate_at(2).unwrap().text;
+        assert!(ime.key('\''));
+        assert_eq!(ime.draft(), third);
+        assert!(ime.code().is_empty());
+
+        // For `xi`, pinyin continues, so `'` acts as syllable separator instead.
+        let mut ime = Ime::default();
+        typed(&mut ime, "xi'");
+        assert_eq!(ime.code(), "xi'");
+    }
+
+    #[test]
+    fn insert_text_handles_idle_draft_composing_and_panic_guard() {
+        unsafe {
+            let ime = yiime_new();
+            let text = CString::new("e\u{0301}").unwrap();
+            assert!(!yiime_insert_text(ime, text.as_ptr()));
+            assert!(!yiime_active(ime));
+
+            // Active draft: inserts multi-scalar text into draft.
+            assert!(yiime_key(ime, 'q' as u32));
+            assert!(yiime_key(ime, ' ' as u32));
+            assert!(yiime_insert_text(ime, text.as_ptr()));
+            // While composing: flushes pending code then inserts text once.
+            assert!(yiime_key(ime, 'q' as u32));
+            assert!(yiime_insert_text(ime, text.as_ptr()));
+            let out = yiime_take_text(ime);
+            assert_eq!(
+                CStr::from_ptr(out).to_str().unwrap(),
+                "我e\u{0301}我e\u{0301}"
+            );
+            yiime_string_free(out);
+
+            // Control-only / empty text returns false.
+            let ctrl = CString::new("\n").unwrap();
+            assert!(yiime_key(ime, 'q' as u32));
+            assert!(!yiime_insert_text(ime, ctrl.as_ptr()));
+            assert!(!yiime_insert_text(ime, std::ptr::null()));
+
+            inject_panic();
+            assert!(!yiime_insert_text(ime, text.as_ptr()));
+            assert!(!yiime_active(ime));
+            yiime_free(ime);
+        }
+    }
+
+    #[test]
+    fn translate_category_excludes_provider_response_body() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let marker = "SENSITIVE_PROVIDER_BODY_MARKER";
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf);
+            let body = format!(r#"{{"error":{{"message":"{marker}"}}}}"#);
+            let resp = format!(
+                "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+        });
+        let settings = ApiSettings {
+            engine: Engine::Llm,
+            url: format!("http://{addr}/v1"),
+            model: "m".into(),
+            key: "k".into(),
+            ..ApiSettings::default()
+        };
+        let outcome = yiime_core::translate(&settings, "测试");
+        assert!(outcome.result.is_err());
+        let category: Vec<&str> = outcome
+            .attempts
+            .iter()
+            .filter_map(|a| a.failure.as_deref())
+            .collect();
+        let category = category.join("; ");
+        assert_eq!(category, "http 400");
+        assert!(!category.contains(marker));
+        handle.join().unwrap();
     }
 }

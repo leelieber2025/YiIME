@@ -55,16 +55,14 @@ fn private_registry() -> bool {
 
 /// The current mode, given this process's registry view; `adopt` stores a mode the registry
 /// should take (a switch made in a packaged host).
-pub fn read(registry: bool, adopt: impl FnOnce(bool)) -> bool {
+pub fn read(registry: bool, adopt: impl FnOnce(bool) -> bool) -> bool {
     let Some(cell) = cell() else {
         return registry;
     };
     let read =
         yiime_core::plain_cell::read(cell.load(Ordering::Acquire), registry, private_registry());
-    if read.adopt {
-        adopt(read.plain);
-    }
-    if let Some(value) = read.store {
+    let adopted = !read.adopt || adopt(read.plain);
+    if let Some(value) = yiime_core::plain_cell::store_after_adopt(read, adopted) {
         cell.store(value, Ordering::Release);
     }
     read.plain

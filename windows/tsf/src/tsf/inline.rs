@@ -15,7 +15,10 @@ use windows_sys::Win32::Graphics::Gdi::{
 use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_DROPSHADOW, CS_HREDRAW, CS_VREDRAW, GetClientRect, GetCursorPos, GetWindowRect,
-    MA_NOACTIVATE, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_PAINT,
+    MA_NOACTIVATE, SW_SHOWNA, WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_PAINT,
+};
+use yiime_core::inline_ui::{
+    CandidateView, DisplayCandidate, HitTarget, InlineKeyOutcome, LogicalInline, build_candidates,
 };
 
 const CANDIDATE_GUID: GUID = GUID::from_u128(0xd39fb88b_09bb_4ca2_a050_174b5ab3b7c0);
@@ -41,19 +44,6 @@ const PILL_PAD_X: i32 = 5;
 const TRAIL_SLOT: i32 = 18;
 static DICTIONARY: DictionaryLock<yiime_core::MixedInput> = DictionaryLock::new();
 static USER_WORDS: Mutex<Option<yiime_core::UserWordsReloader>> = Mutex::new(None);
-
-struct DisplayCandidate {
-    text: String,
-    hint: String,
-    complete: bool,
-}
-
-struct CandidateView {
-    code: String,
-    rows: Vec<DisplayCandidate>,
-    size: usize,
-    page: usize,
-}
 
 fn user_words_path() -> Option<PathBuf> {
     let appdata = PathBuf::from(std::env::var_os("APPDATA")?);
@@ -102,110 +92,27 @@ fn refresh_user_words(input: &yiime_core::MixedInput) {
         }
         *guard = Some(reloader);
     } else if let Some(reloader) = guard.as_mut()
-        && let Some(contents) = reloader.check()
+        && let Some(contents) = reloader.check_path(user_words_path())
     {
         input.set_user_words(&contents);
     }
 }
 
-fn hint_for(
-    input: &yiime_core::MixedInput,
-    typed: &str,
-    candidate: &yiime_core::Candidate,
-) -> String {
-    // Same annotations as Composer::set_code / MixedInput::candidate_hint.
-    input.candidate_hint(typed, candidate)
-}
-
 fn candidates(code: &str) -> Vec<DisplayCandidate> {
-    let input = dictionary();
-    let size = page_size();
-    let fuzzy = option(Flag::FuzzyPinyin);
-    let traditional = option(Flag::Traditional);
-    let common_only = option(Flag::CommonOnly);
-    let scheme = shuangpin_scheme();
-    let pinyin_first = option(Flag::PinyinFirst) || scheme.is_some();
-    let pending = match scheme {
-        Some(_) if code.replace('\'', "").len() % 2 == 1 => code.chars().last(),
-        _ => None,
-    };
-    let lookup = match scheme {
-        _ if code.is_empty() => None,
-        Some(scheme) => {
-            let keys = &code[..code.len() - pending.map_or(0, char::len_utf8)];
-            if keys.replace('\'', "").is_empty() {
-                None
-            } else {
-                scheme.expand(keys)
-            }
-        }
-        None => Some(code.to_owned()),
-    };
-    let mut items = match &lookup {
-        None => Vec::new(),
-        Some(lookup) => input.candidates_filtered(
-            lookup,
-            size * yiime_core::CANDIDATE_PAGES,
-            size,
-            fuzzy,
-            pinyin_first,
-            common_only,
-            common_only && !traditional,
-        ),
-    };
-    if let Some(scheme) = scheme {
-        items.retain_mut(|candidate| {
-            if candidate.rest.is_empty() {
-                return true;
-            }
-            match scheme.rest_keys(code, &candidate.rest) {
-                Some(keys) => {
-                    candidate.rest = keys;
-                    true
-                }
-                None => false,
-            }
-        });
-        if let Some(key) = pending {
-            for candidate in &mut items {
-                candidate.rest.push(key);
-                candidate.source = yiime_core::Source::Partial;
-            }
-        }
-    }
-    items
-        .into_iter()
-        .map(|mut candidate| {
-            let hint = hint_for(input, code, &candidate);
-            if traditional {
-                candidate.text = yiime_core::to_traditional(&candidate.text);
-            }
-            DisplayCandidate {
-                text: candidate.text,
-                hint,
-                complete: candidate.complete,
-            }
-        })
-        .collect()
+    build_candidates(
+        dictionary(),
+        code,
+        page_size(),
+        option(Flag::FuzzyPinyin),
+        option(Flag::Traditional),
+        option(Flag::CommonOnly),
+        option(Flag::PinyinFirst),
+        shuangpin_scheme(),
+    )
 }
 
 fn page_len() -> usize {
     page_size().max(1)
-}
-
-fn page_count(view: &CandidateView) -> usize {
-    view.rows.len().div_ceil(view.size).max(1)
-}
-
-fn page_items(view: &CandidateView) -> &[DisplayCandidate] {
-    let size = view.size;
-    let start = view.page.saturating_mul(size);
-    let end = (start + size).min(view.rows.len());
-    if start >= view.rows.len() {
-        &[]
-    } else {
-        &view.rows[start..end]
-    }
 }
 
 fn window_dpi(hwnd: HWND) -> u32 {
@@ -342,7 +249,7 @@ fn layout_bar(
     let hint_y = (height - small_h) / 2 + scale_px(1, dpi);
     let pill_top = pad_y.max(1);
     let pill_bottom = height - pad_y.max(1);
-    let items_on_page = page_items(view);
+    let items_on_page = view.page_items();
     let mut x = pad_x;
     let mut items = Vec::new();
     for (index, row) in items_on_page.iter().enumerate() {
@@ -378,7 +285,20 @@ fn layout_bar(
     }
 }
 
-fn measure_view(hwnd: HWND, view: &CandidateView) -> (i32, i32) {
+fn store_hit_spans(view: &mut CandidateView, layout: &BarLayout, dpi: u32) {
+    let pill = scale_px(PILL_PAD_X, dpi);
+    let slot = scale_px(TRAIL_SLOT, dpi);
+    view.item_spans = layout
+        .items
+        .iter()
+        .map(|&(x, w)| (x - pill, x + w + pill))
+        .collect();
+    view.prev_span = (layout.prev_x, layout.prev_x + slot);
+    view.next_span = (layout.next_x, layout.next_x + slot);
+    view.bar_height = layout.height;
+}
+
+fn measure_view(hwnd: HWND, view: &mut CandidateView) -> (i32, i32) {
     let dpi = window_dpi(hwnd);
     let hdc = unsafe { GetDC(hwnd) };
     if hdc.is_null() {
@@ -387,6 +307,7 @@ fn measure_view(hwnd: HWND, view: &CandidateView) -> (i32, i32) {
     let font = unsafe { create_ui_font(scale_px(FONT_PX, dpi)) };
     let small = unsafe { create_ui_font(scale_px(SMALL_FONT_PX, dpi)) };
     let layout = layout_bar(hdc, font, small, view, dpi);
+    store_hit_spans(view, &layout, dpi);
     unsafe {
         if !font.is_null() {
             DeleteObject(font as _);
@@ -497,6 +418,7 @@ impl ITfCompositionSink_Impl for CompositionSink_Impl {
         }
         log("组句被应用终止，清本地状态");
         self.ui.state.borrow_mut().take();
+        self.ui.logical.borrow_mut().clear();
         self.ui.end_ui();
         self.ui.destroy_window();
         Ok(())
@@ -520,6 +442,7 @@ struct Composition {
 struct CandidateElement {
     state: Rc<RefCell<Option<Composition>>>,
     shown: Rc<Cell<bool>>,
+    window: Rc<Cell<HWND>>,
     view: Rc<RefCell<CandidateView>>,
 }
 impl ITfUIElement_Impl for CandidateElement_Impl {
@@ -530,7 +453,14 @@ impl ITfUIElement_Impl for CandidateElement_Impl {
         Ok(CANDIDATE_GUID)
     }
     fn Show(&self, show: BOOL) -> Result<()> {
-        self.shown.set(show.as_bool());
+        let visible = show.as_bool();
+        self.shown.set(visible);
+        let window = self.window.get();
+        if !window.is_null() && unsafe { IsWindow(window) } != 0 {
+            unsafe {
+                ShowWindow(window, if visible { SW_SHOWNA } else { SW_HIDE });
+            }
+        }
         Ok(())
     }
     fn IsShown(&self) -> Result<BOOL> {
@@ -554,8 +484,7 @@ impl ITfCandidateListUIElement_Impl for CandidateElement_Impl {
         Ok(self.view.borrow().rows.len() as u32)
     }
     fn GetSelection(&self) -> Result<u32> {
-        let view = self.view.borrow();
-        Ok((view.page * view.size) as u32)
+        Ok(self.view.borrow().current_page_start() as u32)
     }
     fn GetString(&self, index: u32) -> Result<BSTR> {
         self.view
@@ -570,18 +499,24 @@ impl ITfCandidateListUIElement_Impl for CandidateElement_Impl {
             return Err(E_FAIL.into());
         }
         let view = self.view.borrow();
-        let pages = page_count(&view) as u32;
-        let step = view.size as u32;
+        let pages = view.page_starts.len() as u32;
         unsafe {
             *count = pages;
-            let n = size.min(pages);
-            for i in 0..n {
-                *index.add(i as usize) = i * step;
+            let n = size.min(pages) as usize;
+            for (i, &start) in view.page_starts.iter().take(n).enumerate() {
+                *index.add(i) = start as u32;
             }
         }
         Ok(())
     }
-    fn SetPageIndex(&self, _index: *const u32, _count: u32) -> Result<()> {
+    fn SetPageIndex(&self, index: *const u32, count: u32) -> Result<()> {
+        if count == 0 || index.is_null() {
+            return Err(windows::Win32::Foundation::E_INVALIDARG.into());
+        }
+        let slice = unsafe { std::slice::from_raw_parts(index, count as usize) };
+        if !self.view.borrow_mut().set_page_starts(slice) {
+            return Err(windows::Win32::Foundation::E_INVALIDARG.into());
+        }
         Ok(())
     }
     fn GetCurrentPage(&self) -> Result<u32> {
@@ -593,6 +528,7 @@ enum Action {
     Start(String),
     Update(String),
     Finish(String),
+    PickPartial { committed: String, rest: String },
 }
 
 /// Shared pieces the async edit session needs after OnKeyDown returns (qingjian
@@ -600,6 +536,7 @@ enum Action {
 #[derive(Clone)]
 struct CandidateUi {
     state: Rc<RefCell<Option<Composition>>>,
+    logical: Rc<RefCell<LogicalInline<ITfContext>>>,
     window: Rc<Cell<HWND>>,
     shown: Rc<Cell<bool>>,
     manager: Rc<RefCell<Option<ITfUIElementMgr>>>,
@@ -625,6 +562,9 @@ impl ITfEditSession_Impl for ComposeEdit_Impl {
         com_guard("ComposeEdit", || {
             if let Err(error) = self.apply(cookie) {
                 self.outcome.set(SessionOutcome::Failed);
+                if self.ui.state.borrow().is_none() {
+                    self.ui.logical.borrow_mut().clear();
+                }
                 log_hresult("组字更新失败", &error);
                 return Err(error);
             }
@@ -704,6 +644,43 @@ impl ComposeEdit_Impl {
                 }
                 range
             }
+            Action::PickPartial { committed, rest } => {
+                log("组字部分上屏");
+                let (tail, ended) = {
+                    let mut state = self.ui.state.borrow_mut();
+                    let active = state
+                        .as_mut()
+                        .filter(|active| active.context == self.context)
+                        .ok_or(E_FAIL)?;
+                    let range = unsafe { active.composition.GetRange()? };
+                    unsafe {
+                        range.SetText(cookie, 0, &committed.encode_utf16().collect::<Vec<_>>())?
+                    };
+                    let tail = unsafe { range.Clone()? };
+                    unsafe { tail.Collapse(cookie, TF_ANCHOR_END)? };
+                    let composition = state.take().map(|active| active.composition);
+                    (tail, composition)
+                };
+                if let Some(composition) = ended {
+                    unsafe { composition.EndComposition(cookie)? };
+                }
+                let context: ITfContextComposition = self.context.cast()?;
+                let sink: ITfCompositionSink = CompositionSink {
+                    ui: self.ui.clone(),
+                }
+                .into();
+                let composition = unsafe { context.StartComposition(cookie, &tail, &sink)? };
+                let range = unsafe { composition.GetRange()? };
+                unsafe { range.SetText(cookie, 0, &rest.encode_utf16().collect::<Vec<_>>())? };
+                *self.ui.state.borrow_mut() = Some(Composition {
+                    context: self.context.clone(),
+                    composition,
+                    code: rest.clone(),
+                });
+                // Partial pick starts a fresh candidate bar for `rest` on page 0.
+                self.ui.view.borrow_mut().reset();
+                range
+            }
         };
         let caret = unsafe { range.Clone()? };
         unsafe { caret.Collapse(cookie, TF_ANCHOR_END)? };
@@ -732,7 +709,7 @@ impl ComposeEdit_Impl {
             .map(|state| state.code.clone());
         if let Some(code) = code {
             self.ui.advise_layout(&self.context, self.client_id);
-            self.ui.show(&self.context, position, &code);
+            self.ui.show(&self.context, position, &code, self.client_id);
         } else {
             self.ui.end_ui();
         }
@@ -909,15 +886,40 @@ unsafe extern "system" fn candidate_proc(
     }
 }
 
+struct CandidateWindowData {
+    view: Rc<RefCell<CandidateView>>,
+    ui: CandidateUi,
+    client_id: u32,
+}
+
 unsafe fn candidate_proc_impl(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     // qingjian apps/windows/server/src/ui/candidates/click.rs: mouse_activate returns
     // MA_NOACTIVATE so a click does not take the host's focus.
     if message == WM_MOUSEACTIVATE {
         return MA_NOACTIVATE as LRESULT;
     }
+    if message == WM_LBUTTONDOWN {
+        let data = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const CandidateWindowData;
+        if !data.is_null() {
+            let data = unsafe { &*data };
+            let x = (l & 0xffff) as i16 as i32;
+            let y = ((l >> 16) & 0xffff) as i16 as i32;
+            let hit = data.view.borrow().hit_test(x, y);
+            match hit {
+                Some(HitTarget::Candidate(idx)) => data.ui.pick_clicked(idx, data.client_id),
+                Some(HitTarget::PrevPage) => {
+                    data.ui.turn_page(false);
+                }
+                Some(HitTarget::NextPage) => {
+                    data.ui.turn_page(true);
+                }
+                None => {}
+            }
+        }
+        return 0;
+    }
     if message == WM_NCDESTROY {
-        let data =
-            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut Rc<RefCell<CandidateView>>;
+        let data = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut CandidateWindowData;
         if !data.is_null() {
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
             drop(unsafe { Box::from_raw(data) });
@@ -937,12 +939,11 @@ fn paint_candidates(hwnd: HWND) {
     if hdc.is_null() {
         return;
     }
-    let data =
-        unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const Rc<RefCell<CandidateView>>;
+    let data = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const CandidateWindowData;
     let view = if data.is_null() {
         None
     } else {
-        Some(unsafe { (*data).borrow() })
+        Some(unsafe { (*data).view.borrow() })
     };
     let mut client = windows_sys::Win32::Foundation::RECT {
         left: 0,
@@ -964,7 +965,7 @@ fn paint_candidates(hwnd: HWND) {
     let small = unsafe { create_ui_font(scale_px(SMALL_FONT_PX, dpi)) };
     let layout = layout_bar(hdc, font, small, view, dpi);
     let old = unsafe { SelectObject(hdc, font as _) };
-    let items = page_items(view);
+    let items = view.page_items();
     let num_gap = scale_px(NUM_GAP, dpi);
     let hint_gap = scale_px(HINT_GAP, dpi);
     let pill = scale_px(PILL_PAD_X, dpi);
@@ -1025,7 +1026,7 @@ fn paint_candidates(hwnd: HWND) {
         FillRect(hdc, &mid, divider);
         DeleteObject(divider as _);
     }
-    let pages = page_count(view);
+    let pages = view.page_count();
     let prev_color = if view.page > 0 { MUTED } else { DISABLED };
     let next_color = if view.page + 1 < pages {
         MUTED
@@ -1113,6 +1114,7 @@ impl CandidateUi {
         let element: ITfCandidateListUIElement = CandidateElement {
             state: self.state.clone(),
             shown: self.shown.clone(),
+            window: self.window.clone(),
             view: self.view.clone(),
         }
         .into();
@@ -1129,19 +1131,18 @@ impl CandidateUi {
             Err(error) => log_hresult("候选窗 BeginUIElement 失败", &error),
         }
     }
-    fn show(&self, context: &ITfContext, position: Option<(i32, i32, i32)>, code: &str) {
+    fn show(
+        &self,
+        context: &ITfContext,
+        position: Option<(i32, i32, i32)>,
+        code: &str,
+        client_id: u32,
+    ) {
         let rows = candidates(code);
         {
             let mut view = self.view.borrow_mut();
             let page = if view.code == code { view.page } else { 0 };
-            *view = CandidateView {
-                code: code.to_owned(),
-                rows,
-                size: page_len(),
-                page,
-            };
-            let last = page_count(&view).saturating_sub(1);
-            view.page = view.page.min(last);
+            *view = CandidateView::with_rows(code.to_owned(), rows, page_len(), page);
         }
         self.refresh_element();
         if !self.shown.get() {
@@ -1177,15 +1178,25 @@ impl CandidateUi {
             };
             self.window.set(window);
             if !window.is_null() {
-                let leaked = Box::into_raw(Box::new(self.view.clone()));
+                let leaked = Box::into_raw(Box::new(CandidateWindowData {
+                    view: self.view.clone(),
+                    ui: self.clone(),
+                    client_id,
+                }));
                 unsafe { SetWindowLongPtrW(window, GWLP_USERDATA, leaked as _) };
+            }
+        } else {
+            let data =
+                unsafe { GetWindowLongPtrW(window, GWLP_USERDATA) } as *mut CandidateWindowData;
+            if !data.is_null() {
+                unsafe { (*data).client_id = client_id };
             }
         }
         if window.is_null() {
             log("候选窗未显示：CreateWindowEx 失败");
             return;
         }
-        let (width, height) = measure_view(window, &self.view.borrow());
+        let (width, height) = measure_view(window, &mut self.view.borrow_mut());
         unsafe {
             SetWindowPos(
                 window,
@@ -1229,21 +1240,7 @@ impl CandidateUi {
         }
     }
     fn turn_page(&self, forward: bool) -> bool {
-        let changed = {
-            let mut view = self.view.borrow_mut();
-            let last = page_count(&view).saturating_sub(1);
-            let next = if forward {
-                view.page.saturating_add(1).min(last)
-            } else {
-                view.page.saturating_sub(1)
-            };
-            if next == view.page {
-                false
-            } else {
-                view.page = next;
-                true
-            }
-        };
+        let changed = self.view.borrow_mut().turn_page(forward);
         if changed {
             self.relayout();
         }
@@ -1259,7 +1256,7 @@ impl CandidateUi {
         if window.is_null() || unsafe { IsWindow(window) } == 0 {
             return;
         }
-        let (width, height) = measure_view(window, &self.view.borrow());
+        let (width, height) = measure_view(window, &mut self.view.borrow_mut());
         unsafe {
             SetWindowPos(
                 window,
@@ -1277,10 +1274,67 @@ impl CandidateUi {
             place(window, position);
         }
     }
-    fn page_choice(&self, index: usize) -> Option<String> {
-        page_items(&self.view.borrow())
-            .get(index)
-            .map(|item| item.text.clone())
+    fn page_choice(&self, index: usize) -> Option<(String, String)> {
+        self.view.borrow().choice(index)
+    }
+    fn edit(&self, context: &ITfContext, client_id: u32, action: Action) -> bool {
+        let name = match &action {
+            Action::Start(_) => "组字开始",
+            Action::Update(_) => "组字更新",
+            Action::Finish(_) => "组字结束",
+            Action::PickPartial { .. } => "组字部分上屏",
+        };
+        let outcome = Rc::new(Cell::new(SessionOutcome::Pending));
+        let session: ITfEditSession = ComposeEdit {
+            context: context.clone(),
+            action,
+            ui: self.clone(),
+            client_id,
+            outcome: outcome.clone(),
+        }
+        .into();
+        let accepted = request_session(context, client_id, session, name);
+        if accepted && outcome.get() == SessionOutcome::Failed {
+            log("组字会话已跑完但失败，交回按键");
+            false
+        } else {
+            accepted
+        }
+    }
+    fn dispatch_outcome(
+        &self,
+        context: &ITfContext,
+        client_id: u32,
+        outcome: InlineKeyOutcome,
+    ) -> bool {
+        match outcome {
+            InlineKeyOutcome::Start(code) => {
+                let ok = self.edit(context, client_id, Action::Start(code));
+                if !ok {
+                    self.logical.borrow_mut().clear();
+                }
+                ok
+            }
+            InlineKeyOutcome::Update(code) => self.edit(context, client_id, Action::Update(code)),
+            InlineKeyOutcome::Finish(text) => self.edit(context, client_id, Action::Finish(text)),
+            InlineKeyOutcome::PickPartial { committed, rest } => {
+                self.edit(context, client_id, Action::PickPartial { committed, rest })
+            }
+            InlineKeyOutcome::Page(forward) => self.turn_page(forward),
+            InlineKeyOutcome::Swallow => true,
+            InlineKeyOutcome::NotHandled => false,
+        }
+    }
+    fn pick_clicked(&self, index: usize, client_id: u32) {
+        let context = self.state.borrow().as_ref().map(|s| s.context.clone());
+        let Some(context) = context else {
+            return;
+        };
+        let choice = self.page_choice(index);
+        let outcome = self.logical.borrow_mut().pick_choice(&context, choice);
+        if let Some(outcome) = outcome {
+            let _ = self.dispatch_outcome(&context, client_id, outcome);
+        }
     }
     fn advise_layout(&self, context: &ITfContext, client_id: u32) {
         if self.layout.borrow().is_some() {
@@ -1308,6 +1362,9 @@ impl CandidateUi {
         {
             let _ = unsafe { manager.EndUIElement(id) };
         }
+        self.view.borrow_mut().reset();
+        self.last_caret.set(None);
+        self.last_ext_ok.set(false);
         self.hide();
     }
     fn destroy_window(&self) {
@@ -1326,17 +1383,13 @@ impl InlineInput {
         Self {
             ui: CandidateUi {
                 state: Rc::new(RefCell::new(None)),
+                logical: Rc::new(RefCell::new(LogicalInline::default())),
                 window: Rc::new(Cell::new(null_mut())),
                 shown: Rc::new(Cell::new(true)),
                 manager: Rc::new(RefCell::new(None)),
                 element: Rc::new(Cell::new(None)),
                 layout: Rc::new(RefCell::new(None)),
-                view: Rc::new(RefCell::new(CandidateView {
-                    code: String::new(),
-                    rows: Vec::new(),
-                    size: page_len(),
-                    page: 0,
-                })),
+                view: Rc::new(RefCell::new(CandidateView::empty(page_len()))),
                 last_caret: Rc::new(Cell::new(None)),
                 last_ext_ok: Rc::new(Cell::new(false)),
             },
@@ -1346,7 +1399,7 @@ impl InlineInput {
         *self.ui.manager.borrow_mut() = manager.cast().ok();
     }
     pub(super) fn active(&self) -> bool {
-        self.ui.state.borrow().is_some()
+        self.ui.logical.borrow().active() || self.ui.state.borrow().is_some()
     }
     pub(super) fn last_caret(&self) -> Option<(i32, i32, i32)> {
         self.ui.last_caret.get()
@@ -1356,118 +1409,63 @@ impl InlineInput {
         self.ui.last_ext_ok.get()
     }
     pub(super) fn same_context(&self, context: &ITfContext) -> bool {
-        self.ui
-            .state
-            .borrow()
-            .as_ref()
-            .is_some_and(|state| state.context == *context)
+        self.ui.logical.borrow().same_context(context)
+            || self
+                .ui
+                .state
+                .borrow()
+                .as_ref()
+                .is_some_and(|state| state.context == *context)
+    }
+    fn sync_logical_from_state(&self, context: &ITfContext) {
+        if !self.ui.logical.borrow().same_context(context)
+            && let Some(active) = self.ui.state.borrow().as_ref()
+            && active.context == *context
+        {
+            self.ui
+                .logical
+                .borrow_mut()
+                .sync_from_composition(context, &active.code);
+        }
     }
     pub(super) fn wants(&self, context: &ITfContext, key: usize) -> bool {
-        if let Some(state) = self.ui.state.borrow().as_ref() {
-            let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
-            let paging = u16::try_from(key).ok().is_some_and(|vk| {
-                yiime_core::paging_direction_vk(vk, shift, option(Flag::CommaPeriodPaging))
-                    .is_some()
-            });
-            state.context == *context
-                && (paging
-                    || matches!(
-                        key,
-                        0x41..=0x5a | 0x08 | 0x1b | 0x0d | 0x20 | 0x31..=0x39
-                    ))
-        } else {
-            (0x41..=0x5a).contains(&key)
-        }
+        self.sync_logical_from_state(context);
+        let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
+        self.ui.logical.borrow().wants(
+            context,
+            key,
+            shift,
+            option(Flag::CommaPeriodPaging),
+            shuangpin_scheme(),
+        )
     }
     pub(super) fn key(&self, context: &ITfContext, client_id: u32, key: usize) -> bool {
-        let code = self
-            .ui
-            .state
-            .borrow()
-            .as_ref()
-            .map(|state| state.code.clone());
-        let Some(mut code) = code else {
-            return self.edit(
-                context,
-                client_id,
-                Action::Start((key as u8 as char).to_ascii_lowercase().to_string()),
-            );
-        };
-        match key {
-            0x41..=0x5a => {
-                code.push((key as u8 as char).to_ascii_lowercase());
-                self.edit(context, client_id, Action::Update(code))
-            }
-            0x08 => {
-                code.pop();
-                if code.is_empty() {
-                    self.edit(context, client_id, Action::Finish(String::new()))
-                } else {
-                    self.edit(context, client_id, Action::Update(code))
-                }
-            }
-            0x1b => self.edit(context, client_id, Action::Finish(String::new())),
-            0x0d | 0x20 => {
-                let word = self.ui.page_choice(0).unwrap_or(code);
-                self.edit(context, client_id, Action::Finish(word))
-            }
-            0x31..=0x39 => self
-                .ui
-                .page_choice(key - 0x31)
-                .is_some_and(|word| self.edit(context, client_id, Action::Finish(word))),
-            _ => {
-                let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
-                u16::try_from(key)
-                    .ok()
-                    .and_then(|vk| {
-                        yiime_core::paging_direction_vk(vk, shift, option(Flag::CommaPeriodPaging))
-                    })
-                    .is_some_and(|forward| self.ui.turn_page(forward))
-            }
-        }
-    }
-    fn edit(&self, context: &ITfContext, client_id: u32, action: Action) -> bool {
-        let name = match &action {
-            Action::Start(_) => "组字开始",
-            Action::Update(_) => "组字更新",
-            Action::Finish(_) => "组字结束",
-        };
-        let outcome = Rc::new(Cell::new(SessionOutcome::Pending));
-        let session: ITfEditSession = ComposeEdit {
-            context: context.clone(),
-            action,
-            ui: self.ui.clone(),
-            client_id,
-            outcome: outcome.clone(),
-        }
-        .into();
-        // SampleIME KeyHandler.cpp _InvokeKeyHandler: TF_ES_ASYNCDONTCARE | TF_ES_READWRITE,
-        // no TF_ES_SYNC (Word). qingjian edit/update.rs: TF_ES_READWRITE only; Ok means accepted,
-        // the write happens in the callback. A session that already ran and failed is not handled.
-        let accepted = request_session(context, client_id, session, name);
-        if accepted && outcome.get() == SessionOutcome::Failed {
-            log("组字会话已跑完但失败，交回按键");
-            false
-        } else {
-            accepted
-        }
+        self.sync_logical_from_state(context);
+        let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
+        let caps = unsafe { GetKeyState(VK_CAPITAL as i32) } & 1 != 0;
+        let outcome = self.ui.logical.borrow_mut().handle_key(
+            context,
+            key,
+            shift,
+            caps,
+            option(Flag::CommaPeriodPaging),
+            shuangpin_scheme(),
+            |idx| self.ui.page_choice(idx),
+        );
+        self.ui.dispatch_outcome(context, client_id, outcome)
     }
     /// Commits the letters typed so far as they are (not a candidate) and ends the composition:
     /// used when the field turns out to be a password field after the first key.
     pub(super) fn commit_raw(&self, context: &ITfContext, client_id: u32) -> bool {
-        let code = self
-            .ui
-            .state
-            .borrow()
-            .as_ref()
-            .filter(|state| state.context == *context)
-            .map(|state| state.code.clone());
+        self.sync_logical_from_state(context);
+        let code = self.ui.logical.borrow_mut().commit_raw(context);
         match code {
-            Some(code) => self.edit(context, client_id, Action::Finish(code)),
+            Some(code) => self.ui.edit(context, client_id, Action::Finish(code)),
             None => false,
         }
     }
     pub(super) fn cancel(&self, client_id: u32) {
+        self.ui.logical.borrow_mut().clear();
         let Some(state) = self.ui.state.borrow_mut().take() else {
             self.ui.end_ui();
             self.ui.destroy_window();
@@ -1494,21 +1492,19 @@ mod paging_tests {
 
     #[test]
     fn host_reads_the_last_page_using_global_indices() {
-        let view = CandidateView {
-            code: "x".into(),
-            size: 5,
-            page: 2,
-            rows: (0..12)
-                .map(|n| DisplayCandidate {
-                    text: n.to_string(),
-                    hint: String::new(),
-                    complete: true,
-                })
-                .collect(),
-        };
+        let rows: Vec<_> = (0..12)
+            .map(|n| DisplayCandidate {
+                text: n.to_string(),
+                hint: String::new(),
+                complete: true,
+                rest: String::new(),
+            })
+            .collect();
+        let view = CandidateView::with_rows("x".into(), rows, 5, 2);
         let element: ITfCandidateListUIElement = CandidateElement {
             state: Rc::new(RefCell::new(None)),
             shown: Rc::new(Cell::new(false)),
+            window: Rc::new(Cell::new(null_mut())),
             view: Rc::new(RefCell::new(view)),
         }
         .into();
@@ -1518,6 +1514,10 @@ mod paging_tests {
             assert_eq!(element.GetSelection().unwrap(), 10);
             assert_eq!(element.GetString(11).unwrap().to_string(), "11");
             assert!(element.GetString(12).is_err());
+            let starts = [0u32, 3, 8];
+            assert!(element.SetPageIndex(&starts).is_ok());
+            assert_eq!(element.GetCurrentPage().unwrap(), 2);
+            assert_eq!(element.GetSelection().unwrap(), 8);
         }
     }
 }

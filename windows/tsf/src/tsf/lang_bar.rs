@@ -193,7 +193,7 @@ pub(super) fn toggle_option(flag: Flag) -> bool {
 /// private copy, follow a switch made in explorer.exe's language bar or anywhere else.
 pub(super) fn plain_mode() -> bool {
     crate::plain_cell::read(option(Flag::PlainMode), |plain| {
-        OPTIONS.set_flag(Flag::PlainMode, plain);
+        OPTIONS.set_flag(Flag::PlainMode, plain)
     })
 }
 pub(super) fn set_plain_mode(on: bool) -> bool {

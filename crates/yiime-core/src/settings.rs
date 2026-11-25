@@ -154,6 +154,16 @@ pub mod plain_cell {
             },
         }
     }
+
+    /// Cell value to store after calling the caller's HKCU `adopt` callback. If `read.adopt` was
+    /// set and `adopt` failed (`false`), do NOT clear `PENDING` so the next ordinary process retries.
+    pub fn store_after_adopt(read: Read, adopted: bool) -> Option<u32> {
+        if !read.adopt || adopted {
+            read.store
+        } else {
+            None
+        }
+    }
 }
 
 /// Key-value storage (DWORDs and short strings). Implementations handle the platform; reads return
@@ -304,12 +314,19 @@ pub struct ApiSettings {
     /// settings.json exists but is not a JSON object (`[]`, `null`, a number…): nothing in it can
     /// be trusted, so translation stops instead of using the defaults, and the file is kept.
     pub settings_broken: bool,
+    /// `engine` is present in settings.json with an unknown id or non-string value (e.g. a config
+    /// from a newer version): stop instead of falling back to Azure / free Google.
+    pub unknown_engine: bool,
 }
 
 /// settings.json is valid JSON but not an object: translation stops and the file is never
 /// overwritten until the user restores it.
 pub const SETTINGS_BROKEN: &str =
     "设置文件 settings.json 已损坏，已保留原文；请从备份恢复该文件或删除后重新设置";
+/// `engine` in settings.json is present with an unknown id or wrong type: translation stops and
+/// asks the user to pick a service again instead of sending text to an unselected service.
+pub const UNKNOWN_ENGINE: &str =
+    "设置里的翻译服务不可用（可能是新版本配置或格式错误），已保留原文；请在设置里重新选择翻译服务";
 
 /// Encrypted Google Cloud key file (separate from the LLM key).
 pub const GOOGLE_KEY_FILE: &str = "google.dpapi";
@@ -317,6 +334,8 @@ pub const GOOGLE_KEY_FILE: &str = "google.dpapi";
 pub const AZURE_KEY_FILE: &str = "azure.dpapi";
 /// Encrypted DeepL API key file.
 pub const DEEPL_KEY_FILE: &str = "deepl.dpapi";
+/// Registry DWORD marker inside `HKCU\Software\YiIME` showing legacy 0.1.x values were migrated.
+pub const LEGACY_MIGRATION_MARKER: &str = "MigratedFromInputTranslation";
 
 /// Translation engine; `id` is what settings.json stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -351,11 +370,11 @@ impl Engine {
             Self::Llm => "llm",
         }
     }
+    pub fn parse_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|engine| engine.id() == id)
+    }
     pub fn from_id(id: &str) -> Self {
-        Self::ALL
-            .into_iter()
-            .find(|engine| engine.id() == id)
-            .unwrap_or_default()
+        Self::parse_id(id).unwrap_or_default()
     }
     pub fn label(self) -> &'static str {
         match self {
@@ -384,6 +403,7 @@ impl Default for ApiSettings {
             deepl_key: String::new(),
             keys_unreadable: false,
             settings_broken: false,
+            unknown_engine: false,
         }
     }
 }
@@ -396,28 +416,38 @@ fn open_key_bundle(blob: &serde_json::Value, sealer: &dyn Sealer) -> Option<[Str
 impl ApiSettings {
     /// Reads settings.json and the encrypted keys under `dir`; missing fields take defaults.
     pub fn load(dir: &Path, sealer: &dyn Sealer) -> Self {
-        let mut settings = Self::default();
         let value = match std::fs::read(dir.join(SETTINGS_FILE)) {
             Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
                 Ok(value) if value.is_object() => Some(value),
                 // Valid JSON with another root (`[]`, `null`): unlike a missing file (first run)
                 // this is a damaged configuration; defaults would silently pick another service.
                 Ok(_) => {
-                    settings.keys_unreadable = true;
-                    settings.settings_broken = true;
-                    return settings;
+                    return Self {
+                        keys_unreadable: true,
+                        settings_broken: true,
+                        ..Self::default()
+                    };
                 }
                 Err(_) => {
-                    settings.keys_unreadable = true;
-                    return settings;
+                    return Self {
+                        keys_unreadable: true,
+                        ..Self::default()
+                    };
                 }
             },
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(_) => {
-                settings.keys_unreadable = true;
-                return settings;
+                return Self {
+                    keys_unreadable: true,
+                    ..Self::default()
+                };
             }
         };
+        Self::from_json_value(value.as_ref(), dir, sealer)
+    }
+
+    fn from_json_value(value: Option<&serde_json::Value>, dir: &Path, sealer: &dyn Sealer) -> Self {
+        let mut settings = Self::default();
         if let Some(value) = value {
             if let Some(text) = value["url"].as_str() {
                 settings.url = text.to_owned();
@@ -434,8 +464,12 @@ impl ApiSettings {
             if let Some(text) = value["azure_region"].as_str() {
                 settings.azure_region = text.to_owned();
             }
-            if let Some(text) = value["engine"].as_str() {
-                settings.engine = Engine::from_id(text);
+            match value.get("engine") {
+                None => {} // Missing field (older config): default Azure applies.
+                Some(v) => match v.as_str().and_then(Engine::parse_id) {
+                    Some(engine) => settings.engine = engine,
+                    None => settings.unknown_engine = true,
+                },
             }
             if let Some(on) = value["allow_fallback"].as_bool() {
                 settings.allow_fallback = on;
@@ -472,14 +506,22 @@ impl ApiSettings {
         settings
     }
     pub fn save(&self, dir: &Path, sealer: &dyn Sealer) -> std::io::Result<()> {
+        self.save_merged(None, dir, sealer).map(|_| ())
+    }
+
+    /// Saves under the file lock, preserving fields on disk that were not changed relative to
+    /// `base` (the snapshot loaded when the dialog opened), and preserving any unknown JSON keys.
+    pub fn save_merged(
+        &self,
+        base: Option<&Self>,
+        dir: &Path,
+        sealer: &dyn Sealer,
+    ) -> std::io::Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let keys = serde_json::to_vec(&[
-            self.key.as_str(),
-            self.google_key.trim(),
-            self.azure_key.trim(),
-            self.deepl_key.trim(),
-        ])?;
         let file = dir.join(SETTINGS_FILE);
+        if self.unknown_engine {
+            return Err(std::io::Error::other(UNKNOWN_ENGINE));
+        }
         let _lock = crate::storage::lock(&file)?;
         let old: serde_json::Value = match std::fs::read(&file) {
             Ok(bytes) => {
@@ -493,8 +535,69 @@ impl ApiSettings {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
             Err(e) => return Err(e),
         };
+        let merged = if old.is_object() {
+            if let Some(base) = base {
+                let disk = Self::from_json_value(Some(&old), dir, sealer);
+                if disk.unknown_engine && !base.unknown_engine {
+                    return Err(std::io::Error::other(UNKNOWN_ENGINE));
+                }
+                let pick_str = |cur: &String, orig: &String, on_disk: &String| -> String {
+                    if cur == orig {
+                        on_disk.clone()
+                    } else {
+                        cur.clone()
+                    }
+                };
+                Self {
+                    engine: if self.engine == base.engine && !disk.unknown_engine {
+                        disk.engine
+                    } else {
+                        self.engine
+                    },
+                    allow_fallback: if self.allow_fallback == base.allow_fallback {
+                        disk.allow_fallback
+                    } else {
+                        self.allow_fallback
+                    },
+                    url: pick_str(&self.url, &base.url, &disk.url),
+                    model: pick_str(&self.model, &base.model, &disk.model),
+                    key: pick_str(&self.key, &base.key, &disk.key),
+                    style: if self.style == base.style {
+                        disk.style
+                    } else {
+                        self.style
+                    },
+                    custom: pick_str(&self.custom, &base.custom, &disk.custom),
+                    google_key: pick_str(&self.google_key, &base.google_key, &disk.google_key),
+                    azure_key: pick_str(&self.azure_key, &base.azure_key, &disk.azure_key),
+                    azure_region: pick_str(
+                        &self.azure_region,
+                        &base.azure_region,
+                        &disk.azure_region,
+                    ),
+                    deepl_key: pick_str(&self.deepl_key, &base.deepl_key, &disk.deepl_key),
+                    keys_unreadable: disk.keys_unreadable
+                        && self.key == base.key
+                        && self.google_key == base.google_key
+                        && self.azure_key == base.azure_key
+                        && self.deepl_key == base.deepl_key,
+                    settings_broken: false,
+                    unknown_engine: false,
+                }
+            } else {
+                self.clone()
+            }
+        } else {
+            self.clone()
+        };
+        let keys = serde_json::to_vec(&[
+            merged.key.as_str(),
+            merged.google_key.trim(),
+            merged.azure_key.trim(),
+            merged.deepl_key.trim(),
+        ])?;
         if old.get("sealed_keys").is_none() {
-            if self.keys_unreadable {
+            if merged.keys_unreadable {
                 return Err(std::io::Error::other("请重新打开设置后再迁移原密钥"));
             }
             // A failed migration must leave the legacy key files intact.
@@ -514,16 +617,16 @@ impl ApiSettings {
             }
         }
         let encrypted = match old.get("sealed_keys") {
-            Some(blob) if self.keys_unreadable || open_key_bundle(blob, sealer).is_none() => {
+            Some(blob) if merged.keys_unreadable || open_key_bundle(blob, sealer).is_none() => {
                 if [
-                    &self.key,
-                    &self.azure_key,
-                    &self.google_key,
-                    &self.deepl_key,
+                    &merged.key,
+                    &merged.azure_key,
+                    &merged.google_key,
+                    &merged.deepl_key,
                 ]
                 .iter()
                 .any(|k| !k.is_empty())
-                    || old["url"].as_str() != Some(self.url.as_str())
+                    || old["url"].as_str() != Some(merged.url.as_str())
                 {
                     return Err(std::io::Error::other(
                         "原密钥暂时无法解密，已保留原设置；请恢复密钥后再更改密钥或 API 地址",
@@ -537,29 +640,50 @@ impl ApiSettings {
                     .ok_or_else(|| std::io::Error::other("密钥加密失败"))?,
             )?,
         };
-        let snapshot = serde_json::to_vec(&serde_json::json!({
-            "sealed_keys": encrypted,
-            "url": self.url,
-            "model": self.model,
-            "style": self.style.id(),
-            "custom": self.custom,
-            "engine": self.engine.id(),
-            "allow_fallback": self.allow_fallback,
-            "azure_region": self.azure_region.trim(),
-        }))?;
+        let mut object = old.as_object().cloned().unwrap_or_default();
+        object.insert("sealed_keys".into(), encrypted);
+        object.insert("url".into(), serde_json::Value::String(merged.url.clone()));
+        object.insert(
+            "model".into(),
+            serde_json::Value::String(merged.model.clone()),
+        );
+        object.insert(
+            "style".into(),
+            serde_json::Value::String(merged.style.id().to_owned()),
+        );
+        object.insert(
+            "custom".into(),
+            serde_json::Value::String(merged.custom.clone()),
+        );
+        object.insert(
+            "engine".into(),
+            serde_json::Value::String(merged.engine.id().to_owned()),
+        );
+        object.insert(
+            "allow_fallback".into(),
+            serde_json::Value::Bool(merged.allow_fallback),
+        );
+        object.insert(
+            "azure_region".into(),
+            serde_json::Value::String(merged.azure_region.trim().to_owned()),
+        );
+        let snapshot = serde_json::to_vec(&serde_json::Value::Object(object))?;
         if !crate::write_atomically(&dir.join(SETTINGS_FILE), &snapshot) {
             return Err(std::io::Error::other("设置替换失败"));
         }
         for legacy in [KEY_FILE, GOOGLE_KEY_FILE, AZURE_KEY_FILE, DEEPL_KEY_FILE] {
             let _ = std::fs::remove_file(dir.join(legacy));
         }
-        Ok(())
+        Ok(merged)
     }
     /// Checks before sending a request. Free Google needs nothing; Google Cloud needs a key; see
     /// [`Self::validate_llm`] for the LLM.
     pub(crate) fn check_key_access(&self) -> Result<(), &'static str> {
         if self.settings_broken {
             return Err(SETTINGS_BROKEN);
+        }
+        if self.unknown_engine {
+            return Err(UNKNOWN_ENGINE);
         }
         if self.keys_unreadable && self.engine != Engine::GoogleFree {
             return Err("翻译密钥暂时无法读取，已保留原文");
@@ -800,6 +924,52 @@ mod tests {
     }
 
     #[test]
+    fn unknown_or_non_string_engine_is_rejected_while_missing_engine_defaults() {
+        let dir = std::env::temp_dir().join(format!("yiime-engine-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Missing `engine` field (older config): default Azure is ok.
+        std::fs::write(
+            dir.join(SETTINGS_FILE),
+            br#"{"url":"https://example.com/v1"}"#,
+        )
+        .unwrap();
+        let legacy = ApiSettings::load(&dir, &PlainSealer);
+        assert_eq!(legacy.engine, Engine::Azure);
+        assert!(!legacy.unknown_engine);
+        assert!(legacy.check_key_access().is_ok());
+
+        // Present with unknown string or wrong type: must stop and prompt to reselect.
+        for bad in [
+            br#"{"engine":"future_v9"}"#.as_slice(),
+            br#"{"engine":42}"#.as_slice(),
+            br#"{"engine":null}"#.as_slice(),
+            br#"{"engine":[]}"#.as_slice(),
+        ] {
+            std::fs::write(dir.join(SETTINGS_FILE), bad).unwrap();
+            let loaded = ApiSettings::load(&dir, &PlainSealer);
+            assert!(loaded.unknown_engine);
+            assert_eq!(loaded.check_key_access(), Err(UNKNOWN_ENGINE));
+            assert_eq!(loaded.validate(), Err(UNKNOWN_ENGINE));
+            assert!(loaded.save(&dir, &PlainSealer).is_err());
+        }
+
+        // Selecting a valid engine clears unknown_engine and saves cleanly.
+        let fixed = ApiSettings {
+            engine: Engine::DeepL,
+            deepl_key: "k:fx".into(),
+            ..ApiSettings::default()
+        };
+        fixed.save(&dir, &PlainSealer).unwrap();
+        let reloaded = ApiSettings::load(&dir, &PlainSealer);
+        assert!(!reloaded.unknown_engine);
+        assert_eq!(reloaded.engine, Engine::DeepL);
+
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn api_settings_round_trip_and_validation() {
         struct Xor;
         impl Sealer for Xor {
@@ -827,6 +997,7 @@ mod tests {
             deepl_key: "dkey:fx".into(),
             keys_unreadable: false,
             settings_broken: false,
+            unknown_engine: false,
         };
         settings.save(&dir, &Xor).unwrap();
         let json = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
@@ -866,5 +1037,61 @@ mod tests {
         };
         assert!(deepl.validate().is_ok());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn plain_cell_keeps_pending_until_adopt_succeeds() {
+        use super::plain_cell::{encode, read, store_after_adopt};
+        let cell = encode(true, true);
+        let r = read(cell, false, false);
+        assert!(r.adopt);
+        assert_eq!(store_after_adopt(r, false), None);
+        assert_eq!(store_after_adopt(r, true), Some(encode(true, false)));
+    }
+
+    #[test]
+    fn save_merged_preserves_concurrently_changed_fields_and_unknown_keys() {
+        struct Xor;
+        impl Sealer for Xor {
+            fn seal(&self, data: &[u8]) -> Option<Vec<u8>> {
+                Some(data.iter().map(|b| b ^ 0x5a).collect())
+            }
+            fn open(&self, data: &[u8]) -> Option<Vec<u8>> {
+                Some(data.iter().map(|b| b ^ 0x5a).collect())
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("yiime-merge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let base = ApiSettings {
+            engine: Engine::Azure,
+            azure_key: "az-1".into(),
+            model: "gpt-4o-mini".into(),
+            ..ApiSettings::default()
+        };
+        base.save(&dir, &Xor).unwrap();
+        // Simulate newer version or concurrent edit adding an unknown key + changing model.
+        let mut disk = base.clone();
+        disk.model = "gpt-5".into();
+        disk.save(&dir, &Xor).unwrap();
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join(SETTINGS_FILE)).unwrap()).unwrap();
+        raw.as_object_mut()
+            .unwrap()
+            .insert("future_flag".into(), serde_json::json!(42));
+        std::fs::write(dir.join(SETTINGS_FILE), serde_json::to_vec(&raw).unwrap()).unwrap();
+
+        // Dialog based on `base` edits only `azure_region` and saves.
+        let mut edited = base.clone();
+        edited.azure_region = "eastus".into();
+        let saved = edited.save_merged(Some(&base), &dir, &Xor).unwrap();
+        assert_eq!(saved.model, "gpt-5");
+        assert_eq!(saved.azure_region, "eastus");
+        let after = ApiSettings::load(&dir, &Xor);
+        assert_eq!(after.model, "gpt-5");
+        assert_eq!(after.azure_region, "eastus");
+        let raw_after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join(SETTINGS_FILE)).unwrap()).unwrap();
+        assert_eq!(raw_after["future_flag"], serde_json::json!(42));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
