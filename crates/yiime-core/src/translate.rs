@@ -1321,6 +1321,19 @@ mod tests {
     }
 
     #[test]
+    fn broken_settings_file_never_routes_to_google() {
+        let settings = ApiSettings {
+            keys_unreadable: true,
+            settings_broken: true,
+            allow_fallback: true,
+            ..Default::default()
+        };
+        let outcome = translate(&settings, "本地测试");
+        assert_eq!(outcome.result, Err(crate::SETTINGS_BROKEN.to_owned()));
+        assert!(outcome.attempts.is_empty());
+    }
+
+    #[test]
     fn unavailable_azure_keys_never_route_to_google() {
         let settings = ApiSettings {
             engine: Engine::Azure,

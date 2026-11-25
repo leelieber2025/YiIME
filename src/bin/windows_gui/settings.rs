@@ -950,6 +950,8 @@ pub(super) unsafe extern "system" fn settings_proc(
                         SendMessageW(GetDlgItem(hwnd, SETTINGS_ENGINE), CB_GETCURSEL, 0, 0);
                     let settings = ApiSettings {
                         keys_unreadable: state.dialog_keys_unreadable.get(),
+                        // save() refuses on its own while settings.json is not an object.
+                        settings_broken: false,
                         engine: usize::try_from(engine_index)
                             .ok()
                             .and_then(|index| Engine::ALL.get(index).copied())

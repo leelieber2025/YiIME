@@ -307,6 +307,42 @@ struct AwaitingCommit {
     history: Option<(String, String)>,
     started: std::time::Instant,
     notified: bool,
+    /// Text sent; a retry ("未上屏，重试") sends exactly this again under the same request id.
+    text: String,
+    /// Chinese draft committed back into an application the user left mid-translation. Kept
+    /// until that write is confirmed; restored in that application's box if it fails or never
+    /// confirms.
+    stash: Option<String>,
+    /// The DLL reported that the stashed write failed.
+    failed: bool,
+}
+/// Status shown when a commit got no receipt: the two choices the user has.
+const UNCONFIRMED_STATUS: &str =
+    "尚未收到上屏确认，请核对原输入框：已上屏按 Esc 清空草稿；未上屏按 Enter 重试";
+/// Whether the commit of the current draft is still outstanding, and in which phase.
+fn outstanding(state: &State) -> Option<yiime_core::Outstanding> {
+    let receiver = state.tsf_receiver.get() as usize;
+    let revision = state.generation.get();
+    state
+        .receipts
+        .borrow()
+        .iter()
+        .find(|p| p.stash.is_none() && p.identity.owns_draft(receiver, revision))
+        .map(|p| {
+            if p.notified {
+                yiime_core::Outstanding::Unconfirmed
+            } else {
+                yiime_core::Outstanding::Waiting
+            }
+        })
+}
+/// First request id of this process: not 1, so a restarted box does not reuse the ids the DLL
+/// remembers from the previous one (see [`yiime_core::LandedRequests`]).
+fn first_request_id() -> u32 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.subsec_nanos());
+    (std::process::id() << 16) ^ nanos
 }
 struct State {
     input: RefCell<Arc<MixedInput>>,
@@ -1240,14 +1276,15 @@ fn watch_receiver(hwnd: HWND, state: &State, receiver: HWND) {
 }
 /// Another application starts a session: end the current one (telling its DLL), drop its draft
 /// (text never moves between applications) and serve `receiver` from now on. A translation still
-/// in flight commits its Chinese into the application being left; the result is dropped.
+/// in flight commits its Chinese into the application being left (kept until confirmed, see
+/// [`commit_left_draft`]); the result is dropped.
 unsafe fn switch_receiver(hwnd: HWND, state: &State, receiver: HWND) {
     unsafe {
         if yiime_core::left_field(state.pending.get()) == yiime_core::LeftField::CommitSource {
             let old = state.tsf_receiver.get();
             let draft = single_line(&get_text(state.edit));
             if !old.is_null() && !draft.is_empty() {
-                let _ = send_tsf_text(old, hwnd, &draft);
+                commit_left_draft(hwnd, state, old, draft);
             }
             state.pending.set(false);
             state.generation.set(state.generation.get() + 1);
@@ -1265,6 +1302,89 @@ unsafe fn switch_receiver(hwnd: HWND, state: &State, receiver: HWND) {
     service_log("session moved to another application");
     watch_receiver(hwnd, state, receiver);
 }
+/// Commits the Chinese draft of a translation still in flight into the application being left
+/// (`old`), with its own request id so the DLL confirms it. Until it is confirmed the draft stays
+/// stashed under `old`: a rejected or unconfirmed write comes back in that application's box
+/// (see [`restore_left_draft`]) instead of being lost.
+unsafe fn commit_left_draft(hwnd: HWND, state: &State, old: HWND, draft: String) {
+    let id = state.next_request.get().wrapping_add(1).max(1);
+    state.next_request.set(id);
+    let reply =
+        yiime_core::CommitReply::from_wire(unsafe { ipc::send_commit(old, hwnd, &draft, id) });
+    service_log(&format!(
+        "session moved: translation source back to the previous application ({reply:?})"
+    ));
+    if reply == yiime_core::CommitReply::Landed {
+        return;
+    }
+    state.receipts.borrow_mut().push(AwaitingCommit {
+        identity: yiime_core::CommitIdentity {
+            receiver: old as usize,
+            request: id,
+            revision: 0,
+        },
+        history: None,
+        started: std::time::Instant::now(),
+        notified: false,
+        text: draft.clone(),
+        stash: Some(draft),
+        failed: reply == yiime_core::CommitReply::Rejected,
+    });
+    unsafe {
+        SetTimer(hwnd, COMMIT_TIMER, 1000, None);
+    }
+}
+/// The box of an application left mid-translation is open again with an empty draft: bring
+/// back the Chinese draft whose write there failed or never confirmed.
+unsafe fn restore_left_draft(hwnd: HWND, state: &State) {
+    let receiver = state.tsf_receiver.get() as usize;
+    if receiver == 0
+        || unsafe { IsWindowVisible(hwnd) } == 0
+        || state.pending.get()
+        || state.recall_session.get()
+    {
+        return;
+    }
+    let draft_empty = unsafe { GetWindowTextLengthW(state.edit) } == 0;
+    let found = state.receipts.borrow().iter().position(|p| {
+        p.identity.receiver == receiver
+            && p.stash.is_some()
+            && yiime_core::restore_left_draft(p.failed, p.notified, draft_empty).is_some()
+    });
+    let Some(i) = found else {
+        return;
+    };
+    let (how, draft) = {
+        let mut receipts = state.receipts.borrow_mut();
+        let p = &mut receipts[i];
+        let how = yiime_core::restore_left_draft(p.failed, p.notified, draft_empty);
+        (how, p.stash.clone().unwrap_or_default())
+    };
+    unsafe {
+        set_text(state.edit, &draft);
+        let end = GetWindowTextLengthW(state.edit) as usize;
+        SendMessageW(state.edit, EM_SETSEL, end, end as isize);
+    }
+    // Setting the text counts as an edit; the restored draft is the revision from now on.
+    let revision = state.generation.get();
+    let status = match how {
+        Some(yiime_core::Restore::Unconfirmed) => {
+            // Becomes an ordinary unconfirmed commit of this draft: Enter retries it under the
+            // same id, Esc confirms it landed.
+            let mut receipts = state.receipts.borrow_mut();
+            let p = &mut receipts[i];
+            p.stash = None;
+            p.identity.revision = revision;
+            UNCONFIRMED_STATUS.to_owned()
+        }
+        _ => {
+            state.receipts.borrow_mut().remove(i);
+            "切换应用时这段文字没能上屏，草稿已恢复".to_owned()
+        }
+    };
+    service_log("draft of the left application restored");
+    unsafe { set_status(hwnd, state, Some((status, true))) };
+}
 /// Tells the TSF DLL this input ended without inserting text.
 unsafe fn finish_tsf(hwnd: HWND, state: &State) -> bool {
     let receiver = state.tsf_receiver.get();
@@ -1280,6 +1400,26 @@ unsafe fn finish_tsf(hwnd: HWND, state: &State) -> bool {
 /// Esc (not composing): discard the draft and close the box. TSF is told explicitly so the IME
 /// is not left stuck in an edit.
 unsafe fn cancel_session(hwnd: HWND, state: &State) {
+    if outstanding(state) == Some(yiime_core::Outstanding::Unconfirmed) {
+        // "已上屏": the user found the text in the field. Count it as landed.
+        let receiver = state.tsf_receiver.get() as usize;
+        let revision = state.generation.get();
+        let receipt = {
+            let mut receipts = state.receipts.borrow_mut();
+            receipts
+                .iter()
+                .position(|p| p.stash.is_none() && p.identity.owns_draft(receiver, revision))
+                .map(|i| receipts.remove(i))
+        };
+        if let Some(receipt) = receipt {
+            service_log("unconfirmed commit: user says it landed");
+            if let Some((source, english)) = receipt.history
+                && !state.private_field.get()
+            {
+                remember_translation(&source, &english);
+            }
+        }
+    }
     if unsafe { !finish_tsf(hwnd, state) } {
         unsafe {
             set_status(
@@ -1342,6 +1482,18 @@ unsafe fn submit(hwnd: HWND, state: &State, chinese: bool) {
     if state.pending.get() {
         return;
     }
+    // A commit of this draft is outstanding: never translate it again.
+    match yiime_core::resubmit(outstanding(state)) {
+        yiime_core::Resubmit::Fresh => {}
+        yiime_core::Resubmit::Wait => {
+            unsafe { set_status(hwnd, state, Some(("正在等待上屏确认…".into(), false))) };
+            return;
+        }
+        yiime_core::Resubmit::Retry => {
+            unsafe { retry_commit(hwnd, state) };
+            return;
+        }
+    }
     let draft = unsafe { get_text(state.edit) };
     if draft.trim().is_empty() {
         unsafe {
@@ -1393,12 +1545,29 @@ unsafe fn submit(hwnd: HWND, state: &State, chinese: bool) {
 /// Switches back to the application and commits the text (through the DLL's edit session under
 /// TSF, SendInput when portable).
 unsafe fn commit_to_target(hwnd: HWND, state: &State, text: &str) {
-    if state.receipts.borrow().iter().any(|p| {
-        p.identity
-            .owns_draft(state.tsf_receiver.get() as usize, state.generation.get())
-    }) {
+    if outstanding(state).is_some() {
         return;
     }
+    unsafe { send_to_target(hwnd, state, text, None) };
+}
+/// "未上屏，重试": sends the unconfirmed commit of this draft again, same text, same request id
+/// (the DLL confirms an id that already landed instead of inserting it twice).
+unsafe fn retry_commit(hwnd: HWND, state: &State) {
+    let receiver = state.tsf_receiver.get() as usize;
+    let revision = state.generation.get();
+    let retry = state
+        .receipts
+        .borrow()
+        .iter()
+        .find(|p| p.stash.is_none() && p.notified && p.identity.owns_draft(receiver, revision))
+        .map(|p| (p.identity.request, p.text.clone()));
+    if let Some((id, text)) = retry {
+        service_log("unconfirmed commit: user retries it");
+        unsafe { send_to_target(hwnd, state, &text, Some(id)) };
+    }
+}
+/// `retry`: request id of an unconfirmed commit of this draft being sent again.
+unsafe fn send_to_target(hwnd: HWND, state: &State, text: &str, retry: Option<u32>) {
     let target = state.target.get();
     if target.is_null() || unsafe { IsWindow(target) } == 0 {
         unsafe {
@@ -1424,6 +1593,33 @@ unsafe fn commit_to_target(hwnd: HWND, state: &State, text: &str) {
     } else if !state.tsf_receiver.get().is_null() {
         let receiver = state.tsf_receiver.get();
         let revision = state.generation.get();
+        if let Some(id) = retry {
+            if let Some(p) = state
+                .receipts
+                .borrow_mut()
+                .iter_mut()
+                .find(|p| p.stash.is_none() && p.identity.matches_reply(receiver as usize, id))
+            {
+                p.started = std::time::Instant::now();
+                p.notified = false;
+            }
+            unsafe {
+                set_status(hwnd, state, None);
+                SetTimer(hwnd, COMMIT_TIMER, 1000, None);
+            }
+            match yiime_core::CommitReply::from_wire(unsafe {
+                ipc::send_commit(receiver, hwnd, &line, id)
+            }) {
+                yiime_core::CommitReply::Landed => unsafe {
+                    finish_receipt(hwnd, state, receiver as usize, id, true)
+                },
+                yiime_core::CommitReply::Rejected => unsafe {
+                    finish_receipt(hwnd, state, receiver as usize, id, false)
+                },
+                yiime_core::CommitReply::Waiting => {}
+            }
+            return;
+        }
         let id = state.next_request.get().wrapping_add(1).max(1);
         state.next_request.set(id);
         let history = state
@@ -1444,14 +1640,24 @@ unsafe fn commit_to_target(hwnd: HWND, state: &State, text: &str) {
             history,
             started: std::time::Instant::now(),
             notified: false,
+            text: line.clone(),
+            stash: None,
+            failed: false,
         });
         unsafe {
             SetTimer(hwnd, COMMIT_TIMER, 1000, None);
         }
-        match unsafe { ipc::send_commit(receiver, hwnd, &line, id) } {
-            Some(1) => unsafe { finish_receipt(hwnd, state, receiver as usize, id, true) },
-            Some(0) => unsafe { finish_receipt(hwnd, state, receiver as usize, id, false) },
-            _ => {} // Queued or the transport timed out; the DLL posts the definitive result.
+        match yiime_core::CommitReply::from_wire(unsafe {
+            ipc::send_commit(receiver, hwnd, &line, id)
+        }) {
+            yiime_core::CommitReply::Landed => unsafe {
+                finish_receipt(hwnd, state, receiver as usize, id, true)
+            },
+            yiime_core::CommitReply::Rejected => unsafe {
+                finish_receipt(hwnd, state, receiver as usize, id, false)
+            },
+            // Queued or the transport timed out; the DLL posts the definitive result.
+            yiime_core::CommitReply::Waiting => {}
         }
         return;
     } else if unsafe { send_unicode(&line) } {
@@ -1482,6 +1688,18 @@ unsafe fn finish_receipt(hwnd: HWND, state: &State, receiver: usize, id: u32, la
         else {
             return;
         };
+        if pending[i].stash.is_some() {
+            // Chinese draft committed into an application the user left.
+            if landed {
+                pending.remove(i);
+            } else {
+                service_log("previous application rejected the draft; kept for its next session");
+                pending[i].failed = true;
+                drop(pending);
+                unsafe { restore_left_draft(hwnd, state) };
+            }
+            return;
+        }
         pending.remove(i)
     };
     if landed
@@ -1729,6 +1947,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 };
                 unsafe {
                     activate(hwnd, state, w as HWND, anchor, code);
+                    // Not for the history shortcut above: a recalled entry would replace it.
+                    restore_left_draft(hwnd, state);
                     notify_tsf_ready(state.tsf_receiver.get(), hwnd);
                 }
             }
@@ -1831,6 +2051,16 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             };
             if let Some(state) = state
                 && w != 0
+                && l != 0
+            {
+                // The host is gone: nothing can be restored there any more.
+                state
+                    .receipts
+                    .borrow_mut()
+                    .retain(|p| p.stash.is_none() || p.identity.receiver != w);
+            }
+            if let Some(state) = state
+                && w != 0
                 && current_host(state)
                 && w as HWND == state.tsf_receiver.get()
             {
@@ -1916,15 +2146,20 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                     let mut pending = state.receipts.borrow_mut();
                     let mut warn = false;
                     for p in pending.iter_mut() {
-                        if !p.notified && p.started.elapsed().as_secs() >= 10 {
+                        if !p.notified
+                            && p.started.elapsed().as_secs() >= yiime_core::RECEIPT_WARN_SECS
+                        {
                             p.notified = true;
-                            warn |= p.identity.owns_draft(
-                                state.tsf_receiver.get() as usize,
-                                state.generation.get(),
-                            );
+                            warn |= p.stash.is_none()
+                                && p.identity.owns_draft(
+                                    state.tsf_receiver.get() as usize,
+                                    state.generation.get(),
+                                );
                         }
                     }
-                    pending.retain(|p| p.started.elapsed().as_secs() < 1800);
+                    // A rejected draft of a left application waits for that application (or
+                    // its exit); everything else is forgotten after 30 minutes.
+                    pending.retain(|p| p.failed || p.started.elapsed().as_secs() < 1800);
                     if pending.is_empty() {
                         unsafe {
                             KillTimer(hwnd, COMMIT_TIMER);
@@ -1934,17 +2169,11 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
                 };
                 if warn {
                     unsafe {
-                        set_status(
-                            hwnd,
-                            state,
-                            Some((
-                                "尚未收到上屏确认，请先核对原输入框；草稿已保留".into(),
-                                true,
-                            )),
-                        );
+                        set_status(hwnd, state, Some((UNCONFIRMED_STATUS.into(), true)));
                         show_box(hwnd, state);
                     }
                 }
+                unsafe { restore_left_draft(hwnd, state) };
             }
             0
         }
@@ -2009,6 +2238,8 @@ unsafe extern "system" fn window_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM
             if let Some(state) = state
                 && unsafe { IsWindowVisible(hwnd) } == 0
                 && state.settings_window.get().is_null()
+                // A draft kept for an application left mid-translation would be lost.
+                && !state.receipts.borrow().iter().any(|p| p.stash.is_some())
             {
                 unsafe { DestroyWindow(hwnd) };
             }
@@ -2197,7 +2428,7 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
             finished: Cell::new(false),
             pending_history: RefCell::new(None),
             receipts: RefCell::new(Vec::new()),
-            next_request: Cell::new(0),
+            next_request: Cell::new(first_request_id()),
             private_field: Cell::new(false),
             swallow_char: Cell::new(false),
             last_plain: Cell::new(plain_mode()),

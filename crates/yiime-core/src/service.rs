@@ -188,6 +188,107 @@ impl CommitIdentity {
     }
 }
 
+/// The DLL's reply to a commit packet (COPYDATA 6). `None` is no reply (the transport timed out);
+/// on the wire 0 is rejected, 1 inserted, 2 queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitReply {
+    Landed,
+    Rejected,
+    /// Queued, or no reply: only the DLL's receipt (WM_TSF_COMMITTED / _FAILED) tells.
+    Waiting,
+}
+
+impl CommitReply {
+    pub fn from_wire(reply: Option<usize>) -> Self {
+        match reply {
+            Some(1) => Self::Landed,
+            Some(0) => Self::Rejected,
+            _ => Self::Waiting,
+        }
+    }
+}
+
+/// Seconds without a receipt after which the box asks the user to check the field.
+pub const RECEIPT_WARN_SECS: u64 = 10;
+
+/// A commit of the current draft that has not been confirmed yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outstanding {
+    /// Sent less than [`RECEIPT_WARN_SECS`] ago: the receipt is probably on its way.
+    Waiting,
+    /// No receipt after [`RECEIPT_WARN_SECS`]: the user was asked to check the field.
+    Unconfirmed,
+}
+
+/// What Enter (or Shift+Enter) does with the draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resubmit {
+    /// Nothing outstanding: translate or commit as usual.
+    Fresh,
+    /// The last commit of this draft may still land: do nothing (and do not translate again).
+    Wait,
+    /// The user checked the field and the text is not there ("未上屏，重试"): send the same text
+    /// again under the same request id. The DLL inserts it only if that id never landed.
+    Retry,
+}
+
+pub fn resubmit(outstanding: Option<Outstanding>) -> Resubmit {
+    match outstanding {
+        None => Resubmit::Fresh,
+        Some(Outstanding::Waiting) => Resubmit::Wait,
+        Some(Outstanding::Unconfirmed) => Resubmit::Retry,
+    }
+}
+
+/// How a Chinese draft committed back into an application the user left mid-translation comes
+/// back when that application's box opens again with an empty draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Restore {
+    /// The application rejected it: put the draft back as an ordinary draft.
+    Draft,
+    /// No receipt: put the draft back with the 已上屏 / 未上屏，重试 choice (a retry reuses the id).
+    Unconfirmed,
+}
+
+/// `failed`: the DLL reported the write failed; `unconfirmed`: no receipt for
+/// [`RECEIPT_WARN_SECS`]. A write that may still land in the next seconds is not restored yet,
+/// or the same text could end up both in the field and in the draft.
+pub fn restore_left_draft(failed: bool, unconfirmed: bool, draft_empty: bool) -> Option<Restore> {
+    if !draft_empty {
+        None
+    } else if failed {
+        Some(Restore::Draft)
+    } else if unconfirmed {
+        Some(Restore::Unconfirmed)
+    } else {
+        None
+    }
+}
+
+/// Requests (input box window, request id) the DLL inserted lately. The box re-sends a commit
+/// under its original id when its receipt was lost; one that already landed is confirmed again
+/// instead of being inserted twice.
+#[derive(Debug, Default)]
+pub struct LandedRequests {
+    recent: std::collections::VecDeque<(usize, u32)>,
+}
+
+impl LandedRequests {
+    const KEEP: usize = 64;
+    pub fn remember(&mut self, editor: usize, request: u32) {
+        if request == 0 || self.contains(editor, request) {
+            return;
+        }
+        if self.recent.len() == Self::KEEP {
+            self.recent.pop_front();
+        }
+        self.recent.push_back((editor, request));
+    }
+    pub fn contains(&self, editor: usize, request: u32) -> bool {
+        request != 0 && self.recent.contains(&(editor, request))
+    }
+}
+
 /// Version of the DLL ↔ input-box protocol (window messages and COPYDATA packets). It is part of
 /// the receiver window class and the service window title, so a DLL and a service of different
 /// protocol versions never find or accept each other: after an upgrade without a restart, an
@@ -1390,6 +1491,51 @@ mod tests {
             visible: false,
             ..shown
         }));
+    }
+
+    #[test]
+    fn commit_replies_and_resubmits() {
+        assert_eq!(CommitReply::from_wire(Some(1)), CommitReply::Landed);
+        assert_eq!(CommitReply::from_wire(Some(0)), CommitReply::Rejected);
+        assert_eq!(CommitReply::from_wire(Some(2)), CommitReply::Waiting);
+        assert_eq!(CommitReply::from_wire(None), CommitReply::Waiting);
+        assert_eq!(resubmit(None), Resubmit::Fresh);
+        // Enter right after a commit neither translates again nor sends again.
+        assert_eq!(resubmit(Some(Outstanding::Waiting)), Resubmit::Wait);
+        // After the warning, Enter is "未上屏，重试" (same id, so the DLL can tell a duplicate).
+        assert_eq!(resubmit(Some(Outstanding::Unconfirmed)), Resubmit::Retry);
+    }
+
+    #[test]
+    fn left_drafts_come_back_only_when_they_cannot_land_on_their_own() {
+        assert_eq!(restore_left_draft(true, false, true), Some(Restore::Draft));
+        assert_eq!(restore_left_draft(true, true, true), Some(Restore::Draft));
+        assert_eq!(
+            restore_left_draft(false, true, true),
+            Some(Restore::Unconfirmed)
+        );
+        assert_eq!(restore_left_draft(false, false, true), None);
+        // Never over a draft the user already has.
+        assert_eq!(restore_left_draft(true, false, false), None);
+    }
+
+    #[test]
+    fn landed_requests_dedupe_a_retry_by_id() {
+        let mut landed = LandedRequests::default();
+        landed.remember(7, 41);
+        assert!(landed.contains(7, 41));
+        assert!(!landed.contains(8, 41), "another input box");
+        assert!(!landed.contains(7, 42));
+        landed.remember(7, 0);
+        assert!(
+            !landed.contains(7, 0),
+            "id 0 carries no receipt and is never deduped"
+        );
+        for id in 100..100 + 64 {
+            landed.remember(7, id);
+        }
+        assert!(!landed.contains(7, 41), "bounded");
+        assert!(landed.contains(7, 163));
     }
 
     #[test]

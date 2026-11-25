@@ -1017,6 +1017,9 @@ struct TextService {
     /// Digest and time of the last text inserted for the box (see yiime_core::duplicate_commit).
     session_revision: Cell<u64>,
     pending_commit: RefCell<Option<PendingCommit>>,
+    /// Box requests inserted lately: a retry of one of them (its receipt was lost) is confirmed
+    /// again instead of being inserted twice.
+    landed_requests: RefCell<yiime_core::LandedRequests>,
     last_commit: Cell<Option<(u32, std::time::Instant)>>,
     /// Last good caret rectangle (shared with the asynchronous CaretQuery).
     caret: Rc<Cell<yiime_core::SegmentAnchor>>,
@@ -1077,6 +1080,7 @@ impl TextService {
             pass_logged: Cell::new(None),
             session_revision: Cell::new(0),
             pending_commit: RefCell::new(None),
+            landed_requests: RefCell::new(yiime_core::LandedRequests::default()),
             last_commit: Cell::new(None),
             caret: Rc::new(Cell::new(yiime_core::SegmentAnchor::default())),
             last_caret: Rc::new(Cell::new(None)),
@@ -2080,8 +2084,23 @@ impl TextService {
             }
             return 1;
         }
-        if self.pending_commit.borrow().is_some() {
-            return 0;
+        let editor = self.editor_window.get();
+        if let Some(pending) = self.pending_commit.borrow().as_ref() {
+            // The box re-sent a commit that is still queued here: its receipt follows.
+            return if request != 0 && pending.request == request && pending.editor == editor {
+                2
+            } else {
+                0
+            };
+        }
+        if self
+            .landed_requests
+            .borrow()
+            .contains(editor as usize, request)
+        {
+            log("重试的上屏请求已上屏过（按请求编号），不再插入");
+            self.report_commit(editor, request, true);
+            return 1;
         }
         let session = self
             .editor_open
@@ -2218,6 +2237,11 @@ impl TextService {
         }
     }
     fn report_commit(&self, editor: HWND, id: u32, landed: bool) {
+        if landed {
+            self.landed_requests
+                .borrow_mut()
+                .remember(editor as usize, id);
+        }
         if id != 0 && !editor.is_null() {
             unsafe {
                 PostMessageW(

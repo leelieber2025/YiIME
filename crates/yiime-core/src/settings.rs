@@ -301,7 +301,15 @@ pub struct ApiSettings {
     pub deepl_key: String,
     /// Loading the encrypted bundle failed. Preserve its ciphertext on unrelated saves.
     pub keys_unreadable: bool,
+    /// settings.json exists but is not a JSON object (`[]`, `null`, a number…): nothing in it can
+    /// be trusted, so translation stops instead of using the defaults, and the file is kept.
+    pub settings_broken: bool,
 }
+
+/// settings.json is valid JSON but not an object: translation stops and the file is never
+/// overwritten until the user restores it.
+pub const SETTINGS_BROKEN: &str =
+    "设置文件 settings.json 已损坏，已保留原文；请从备份恢复该文件或删除后重新设置";
 
 /// Encrypted Google Cloud key file (separate from the LLM key).
 pub const GOOGLE_KEY_FILE: &str = "google.dpapi";
@@ -375,6 +383,7 @@ impl Default for ApiSettings {
             azure_region: String::new(),
             deepl_key: String::new(),
             keys_unreadable: false,
+            settings_broken: false,
         }
     }
 }
@@ -390,7 +399,14 @@ impl ApiSettings {
         let mut settings = Self::default();
         let value = match std::fs::read(dir.join(SETTINGS_FILE)) {
             Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                Ok(value) => Some(value),
+                Ok(value) if value.is_object() => Some(value),
+                // Valid JSON with another root (`[]`, `null`): unlike a missing file (first run)
+                // this is a damaged configuration; defaults would silently pick another service.
+                Ok(_) => {
+                    settings.keys_unreadable = true;
+                    settings.settings_broken = true;
+                    return settings;
+                }
                 Err(_) => {
                     settings.keys_unreadable = true;
                     return settings;
@@ -466,7 +482,14 @@ impl ApiSettings {
         let file = dir.join(SETTINGS_FILE);
         let _lock = crate::storage::lock(&file)?;
         let old: serde_json::Value = match std::fs::read(&file) {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Ok(bytes) => {
+                let old: serde_json::Value = serde_json::from_slice(&bytes)?;
+                // An existing file must be an object; anything else is kept for the user to restore.
+                if self.settings_broken || !old.is_object() {
+                    return Err(std::io::Error::other(SETTINGS_BROKEN));
+                }
+                old
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Value::Null,
             Err(e) => return Err(e),
         };
@@ -535,6 +558,9 @@ impl ApiSettings {
     /// Checks before sending a request. Free Google needs nothing; Google Cloud needs a key; see
     /// [`Self::validate_llm`] for the LLM.
     pub(crate) fn check_key_access(&self) -> Result<(), &'static str> {
+        if self.settings_broken {
+            return Err(SETTINGS_BROKEN);
+        }
         if self.keys_unreadable && self.engine != Engine::GoogleFree {
             return Err("翻译密钥暂时无法读取，已保留原文");
         }
@@ -739,6 +765,41 @@ mod tests {
     }
 
     #[test]
+    fn settings_json_with_a_non_object_root_stops_translation_and_is_kept() {
+        for (n, broken) in [&b"[]"[..], b"null", b"42", b"\"azure\""]
+            .into_iter()
+            .enumerate()
+        {
+            let dir =
+                std::env::temp_dir().join(format!("yiime-non-object-{}-{n}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(SETTINGS_FILE), broken).unwrap();
+            let loaded = ApiSettings::load(&dir, &PlainSealer);
+            assert!(loaded.settings_broken);
+            assert_eq!(loaded.check_key_access(), Err(SETTINGS_BROKEN));
+            assert_eq!(loaded.validate(), Err(SETTINGS_BROKEN));
+            // Even a dialog that cleared the flag cannot overwrite the damaged file.
+            let draft = ApiSettings {
+                engine: Engine::GoogleFree,
+                ..ApiSettings::default()
+            };
+            assert!(loaded.save(&dir, &PlainSealer).is_err());
+            assert!(draft.save(&dir, &PlainSealer).is_err());
+            assert_eq!(std::fs::read(dir.join(SETTINGS_FILE)).unwrap(), broken);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        // First run: no file is not an error.
+        let dir = std::env::temp_dir().join(format!("yiime-first-run-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let fresh = ApiSettings::load(&dir, &PlainSealer);
+        assert!(!fresh.settings_broken && !fresh.keys_unreadable);
+        assert!(fresh.check_key_access().is_ok());
+        fresh.save(&dir, &PlainSealer).unwrap();
+        assert!(!ApiSettings::load(&dir, &PlainSealer).settings_broken);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn api_settings_round_trip_and_validation() {
         struct Xor;
         impl Sealer for Xor {
@@ -765,6 +826,7 @@ mod tests {
             azure_region: "eastus".into(),
             deepl_key: "dkey:fx".into(),
             keys_unreadable: false,
+            settings_broken: false,
         };
         settings.save(&dir, &Xor).unwrap();
         let json = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
