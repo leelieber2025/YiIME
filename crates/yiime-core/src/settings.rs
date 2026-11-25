@@ -406,15 +406,17 @@ impl ApiSettings {
                 settings.allow_fallback = on;
             }
             if let Some(blob) = value.get("sealed_keys") {
-                if let Ok(bytes) = serde_json::from_value::<Vec<u8>>(blob.clone())
-                    && let Some(clear) = sealer.open(&bytes)
-                    && let Ok([key, google, azure, deepl]) =
-                        serde_json::from_slice::<[String; 4]>(&clear)
-                {
-                    settings.key = key;
-                    settings.google_key = google;
-                    settings.azure_key = azure;
-                    settings.deepl_key = deepl;
+                if let Ok(bytes) = serde_json::from_value::<Vec<u8>>(blob.clone()) {
+                    if let Some(clear) = sealer.open(&bytes) {
+                        if let Ok([key, google, azure, deepl]) =
+                            serde_json::from_slice::<[String; 4]>(&clear)
+                        {
+                            settings.key = key;
+                            settings.google_key = google;
+                            settings.azure_key = azure;
+                            settings.deepl_key = deepl;
+                        }
+                    }
                 }
                 return settings;
             }

@@ -261,8 +261,6 @@ const EDIT_H: i32 = 22;
 const LINE_H: i32 = 22;
 const GAP: i32 = 16;
 const MIN_W: i32 = 280;
-/// Widest candidate bar (fits 9 candidates with Wubi hints).
-
 /// Drafts wrap beyond this width and then grow only in height.
 const DRAFT_MAX_W: i32 = 480;
 /// Draft lines shown before it scrolls inside the box.

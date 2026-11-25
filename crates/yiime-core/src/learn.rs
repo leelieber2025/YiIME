@@ -113,24 +113,24 @@ impl Learned {
             learned.parse(&String::from_utf8_lossy(&plain));
         }
         let legacy = path.with_file_name(LEGACY_LEARNED_FILE);
-        if !learned.migrated_legacy
-            && let Ok(text) = std::fs::read_to_string(&legacy)
-        {
-            // Old picks have no time; count them as made when the log was last written.
-            let when = std::fs::metadata(&legacy)
-                .and_then(|meta| meta.modified())
-                .ok()
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .map_or_else(now_secs, |time| time.as_secs());
-            for line in text.lines() {
-                if let Some((code, word)) = line.split_once('\t') {
-                    learned.bump(code, word, when);
+        if !learned.migrated_legacy {
+            if let Ok(text) = std::fs::read_to_string(&legacy) {
+                // Old picks have no time; count them as made when the log was last written.
+                let when = std::fs::metadata(&legacy)
+                    .and_then(|meta| meta.modified())
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map_or_else(now_secs, |time| time.as_secs());
+                for line in text.lines() {
+                    if let Some((code, word)) = line.split_once('\t') {
+                        learned.bump(code, word, when);
+                    }
                 }
-            }
-            learned.migrated_legacy = true;
-            learned.dirty = true;
-            if learned.save() {
-                let _ = std::fs::remove_file(&legacy);
+                learned.migrated_legacy = true;
+                learned.dirty = true;
+                if learned.save() {
+                    let _ = std::fs::remove_file(&legacy);
+                }
             }
         }
         learned

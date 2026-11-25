@@ -984,6 +984,13 @@ fn typed_letter(key: u8) -> char {
 const LANGBAR_SINK_COOKIE: u32 = 0x4954_4c42;
 /// Mode button added to the language bar, with its OPENCLOSE compartment advise cookies.
 type ModeButton = Option<(ITfLangBarItemButton, Vec<(ITfSource, u32)>, LangBarSink)>;
+/// A commit waiting for the box to confirm it landed (digest, outcome, field, target).
+type PendingCommit = (
+    u32,
+    Rc<Cell<Option<bool>>>,
+    ITfContext,
+    yiime_core::CommitTarget,
+);
 
 #[implement(
     ITfTextInputProcessor,
@@ -1005,14 +1012,7 @@ struct TextService {
     /// Last reason logged for letters passed to the application (logged again only on change).
     pass_logged: Cell<Option<yiime_core::PassReason>>,
     /// Digest and time of the last text inserted for the box (see yiime_core::duplicate_commit).
-    pending_commit: RefCell<
-        Option<(
-            u32,
-            Rc<Cell<Option<bool>>>,
-            ITfContext,
-            yiime_core::CommitTarget,
-        )>,
-    >,
+    pending_commit: RefCell<Option<PendingCommit>>,
     last_commit: Cell<Option<(u32, std::time::Instant)>>,
     /// Last good caret rectangle (shared with the asynchronous CaretQuery).
     caret: Rc<Cell<yiime_core::SegmentAnchor>>,
@@ -2290,9 +2290,8 @@ impl TextService {
             outcome: outcome.clone(),
         }
         .into();
-        let accepted = match unsafe {
-            context.RequestEditSession(self.client_id.get(), &session, TF_ES_READWRITE)
-        } {
+        match unsafe { context.RequestEditSession(self.client_id.get(), &session, TF_ES_READWRITE) }
+        {
             Ok(status) => match status.ok() {
                 Ok(()) => {
                     log("上屏编辑会话已受理");
@@ -2307,8 +2306,7 @@ impl TextService {
                 log_hresult("上屏编辑会话未被受理", &error);
                 false
             }
-        };
-        accepted
+        }
     }
     /// Accept COPYDATA only from the bound YiIME.exe, or bind it on the first packet of a
     /// session started with ShellExecuteW (which does not return a process id).
