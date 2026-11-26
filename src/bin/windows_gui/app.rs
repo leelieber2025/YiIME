@@ -70,10 +70,10 @@ use windows_sys::Win32::UI::Shell::{
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use yiime_core::{
     ApiSettings, ComposeOptions, Composer, Engine, Flag, HISTORY_CAP, HISTORY_FILE, History,
-    HistoryEntry, HostOwner, Hotkey, LEARNED_FILE, Learned, LetterRules, MAX_CODE_LEN, MixedInput,
-    OptionStore, Options, Quotes, Sealer, Shuangpin, TranslationStyle, USER_WORDS_FILE,
-    UserWordsReloader, WatchedHosts, history_label, parse_hotkey, parse_page_size, selection_index,
-    single_line,
+    HistoryEntry, HostOwner, Hotkey, LEARNED_FILE, LLM_PROFILE_COUNT, Learned, LetterRules,
+    LlmProfile, MAX_CODE_LEN, MixedInput, OptionStore, Options, Quotes, Sealer, Shuangpin,
+    TranslationStyle, USER_WORDS_FILE, UserWordsReloader, WatchedHosts, history_label,
+    parse_hotkey, parse_page_size, selection_index, single_line,
 };
 
 const DRAFT: i32 = 103;
@@ -116,9 +116,6 @@ const LBL_GOOGLE_KEY: i32 = 241;
 const LBL_AZURE_KEY: i32 = 242;
 const LBL_AZURE_REGION: i32 = 243;
 const LBL_DEEPL: i32 = 244;
-const LBL_URL: i32 = 245;
-const LBL_MODEL: i32 = 246;
-const LBL_KEY: i32 = 247;
 const LBL_STYLE: i32 = 248;
 const LBL_CUSTOM: i32 = 249;
 const LBL_HOTKEY: i32 = 250;
@@ -265,6 +262,17 @@ const SETTINGS_DEEPL_KEY: i32 = 228;
 const SETTINGS_FALLBACK: i32 = 231;
 const SETTINGS_SCHEME: i32 = 232;
 const SETTINGS_IMPORT: i32 = 233;
+/// Ordered LLM profiles in the settings window (slot 0 reuses SETTINGS_URL / MODEL / KEY).
+const SETTINGS_LLM_URL: [i32; 3] = [SETTINGS_URL, 255, 263];
+const SETTINGS_LLM_MODEL: [i32; 3] = [SETTINGS_MODEL, 256, 264];
+const SETTINGS_LLM_KEY: [i32; 3] = [SETTINGS_KEY, 257, 265];
+const SETTINGS_LLM_THINK: [i32; 3] = [235, 258, 266];
+const SETTINGS_LLM_UP: [i32; 3] = [236, 270, 272];
+const SETTINGS_LLM_DOWN: [i32; 3] = [237, 271, 273];
+const LBL_LLM_PROFILE: [i32; 3] = [260, 262, 269];
+const LBL_LLM_URL: [i32; 3] = [245, 274, 277];
+const LBL_LLM_MODEL: [i32; 3] = [246, 275, 278];
+const LBL_LLM_KEY: [i32; 3] = [247, 276, 279];
 /// Message-font size used if `SPI_GETNONCLIENTMETRICS` is unavailable (12px at 96 DPI).
 const SETTINGS_FONT_PX: i32 = 12;
 /// Longest custom LLM instruction kept from the settings window, in characters.
@@ -446,6 +454,7 @@ struct TranslationResult {
     generation: u64,
     source: String,
     result: Result<String, String>,
+    hint: Option<String>,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -1738,13 +1747,15 @@ unsafe fn submit(hwnd: HWND, state: &State, chinese: bool) {
             for attempt in &outcome.attempts {
                 translate_log(attempt);
             }
-            outcome.result
+            (outcome.result, outcome.fallback_hint)
         })
-        .unwrap_or_else(|_| Err("翻译处理出错，请重试".into()));
+        .unwrap_or_else(|_| (Err("翻译处理出错，请重试".into()), None));
+        let (result, hint) = result;
         let response = TranslationResult {
             generation,
             source: draft,
             result,
+            hint,
         };
         if response_tx.send(response).is_ok() {
             unsafe { PostMessageW(window as HWND, WM_TRANSLATED, 0, 0) };
@@ -2006,7 +2017,12 @@ unsafe fn on_translated(hwnd: HWND, state: &State, response: TranslationResult) 
     }
     match response.result {
         Ok(english) => unsafe {
-            *state.status.borrow_mut() = None;
+            if let Some(hint) = response.hint {
+                service_log(&hint);
+                set_status(hwnd, state, Some((hint, false)));
+            } else {
+                *state.status.borrow_mut() = None;
+            }
             if !state.private_field.get() {
                 *state.pending_history.borrow_mut() = Some((response.source, english.clone()));
             }

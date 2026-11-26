@@ -319,6 +319,61 @@ impl Sealer for PlainSealer {
     }
 }
 
+/// Maximum number of OpenAI-compatible model profiles (primary and backups).
+pub const LLM_PROFILE_COUNT: usize = 3;
+
+/// One OpenAI-compatible LLM endpoint. An all-empty profile is an unused slot.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LlmProfile {
+    pub url: String,
+    pub model: String,
+    pub key: String,
+    /// When true, send `reasoning_effort: "none"` and drop it if the endpoint refuses (400/422).
+    pub disable_thinking: bool,
+}
+
+impl LlmProfile {
+    pub fn is_empty(&self) -> bool {
+        self.url.trim().is_empty() && self.model.trim().is_empty() && self.key.trim().is_empty()
+    }
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.is_empty() {
+            return Ok(());
+        }
+        if self.url.trim().is_empty() || self.model.trim().is_empty() || self.key.trim().is_empty()
+        {
+            Err("请填写该模型的 API 地址、模型和密钥")
+        } else if !llm_url_allowed(&self.url) {
+            Err("API 地址请使用 HTTPS（不能带用户名或密码）；仅本机测试允许 HTTP")
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        self.validate().is_ok() && !self.is_empty()
+    }
+}
+
+/// Default for a missing `disable_thinking` field: on for DeepInfra, off otherwise.
+/// Existing DeepInfra setups therefore keep sending `reasoning_effort: "none"`.
+pub fn default_disable_thinking(endpoint: &str) -> bool {
+    let Ok(url) = url::Url::parse(endpoint.trim()) else {
+        return false;
+    };
+    let deepinfra = url.host_str().is_some_and(|host| {
+        let host = host.to_ascii_lowercase();
+        host == "deepinfra.com" || host.ends_with(".deepinfra.com")
+    });
+    deepinfra || (cfg!(test) && url.path().starts_with("/deepinfra-test/"))
+}
+
+/// Status line when translation used a later profile in the saved order (1-based index).
+pub fn llm_backup_hint(slot: usize) -> Option<String> {
+    (slot > 0).then(|| format!("已切换到备用模型 {}", slot + 1))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiSettings {
     /// Translation engine; Azure by default (free Google until an Azure key is set).
@@ -329,6 +384,10 @@ pub struct ApiSettings {
     pub url: String,
     pub model: String,
     pub key: String,
+    /// Primary profile: send `reasoning_effort: "none"` when true.
+    pub disable_thinking: bool,
+    /// Optional backup profiles, in saved order after the primary (`url` / `model` / `key`).
+    pub backup_llm: [LlmProfile; 2],
     pub style: TranslationStyle,
     pub custom: String,
     /// Google Cloud Translation v2 API key (stored encrypted in [`GOOGLE_KEY_FILE`]).
@@ -425,6 +484,8 @@ impl Default for ApiSettings {
             url: DEFAULT_URL.to_owned(),
             model: String::new(),
             key: String::new(),
+            disable_thinking: default_disable_thinking(DEFAULT_URL),
+            backup_llm: Default::default(),
             style: TranslationStyle::default(),
             custom: String::new(),
             google_key: String::new(),
@@ -438,9 +499,23 @@ impl Default for ApiSettings {
     }
 }
 
-fn open_key_bundle(blob: &serde_json::Value, sealer: &dyn Sealer) -> Option<[String; 4]> {
+fn open_key_bundle(blob: &serde_json::Value, sealer: &dyn Sealer) -> Option<[String; 6]> {
     let bytes = serde_json::from_value::<Vec<u8>>(blob.clone()).ok()?;
-    serde_json::from_slice(&sealer.open(&bytes)?).ok()
+    let value: serde_json::Value = serde_json::from_slice(&sealer.open(&bytes)?).ok()?;
+    let arr = value.as_array()?;
+    // 4-element bundles from 0.2.5 and earlier are the primary LLM key plus the other services.
+    if arr.len() < 4 {
+        return None;
+    }
+    let at = |i: usize| arr.get(i).and_then(|v| v.as_str()).unwrap_or("").to_owned();
+    Some([at(0), at(1), at(2), at(3), at(4), at(5)])
+}
+
+fn thinking_flag(value: &serde_json::Value, url: &str, key: &str) -> bool {
+    value
+        .get(key)
+        .and_then(|v| v.as_bool())
+        .unwrap_or_else(|| default_disable_thinking(url))
 }
 
 impl ApiSettings {
@@ -504,17 +579,23 @@ impl ApiSettings {
             if let Some(on) = value["allow_fallback"].as_bool() {
                 settings.allow_fallback = on;
             }
+            let mut backup_keys = [String::new(), String::new()];
             if let Some(blob) = value.get("sealed_keys") {
-                if let Some([key, google, azure, deepl]) = open_key_bundle(blob, sealer) {
+                if let Some([key, google, azure, deepl, backup1, backup2]) =
+                    open_key_bundle(blob, sealer)
+                {
                     settings.key = key;
                     settings.google_key = google;
                     settings.azure_key = azure;
                     settings.deepl_key = deepl;
+                    backup_keys = [backup1, backup2];
                 } else {
                     settings.keys_unreadable = true;
                 }
+                settings.apply_llm_fields(value, backup_keys);
                 return settings;
             }
+            // Legacy per-file keys below, then llm_models if present.
         }
         for (file, key) in [
             (KEY_FILE, &mut settings.key),
@@ -533,8 +614,62 @@ impl ApiSettings {
                 Err(_) => {}
             }
         }
+        if let Some(value) = value {
+            settings.apply_llm_fields(value, Default::default());
+        }
         settings
     }
+
+    /// The three model profiles in saved order (slot 0 is also `url` / `model` / `key`).
+    pub fn llm_profiles(&self) -> [LlmProfile; LLM_PROFILE_COUNT] {
+        [
+            LlmProfile {
+                url: self.url.clone(),
+                model: self.model.clone(),
+                key: self.key.clone(),
+                disable_thinking: self.disable_thinking,
+            },
+            self.backup_llm[0].clone(),
+            self.backup_llm[1].clone(),
+        ]
+    }
+
+    pub fn set_llm_profiles(&mut self, profiles: [LlmProfile; LLM_PROFILE_COUNT]) {
+        self.url = profiles[0].url.clone();
+        self.model = profiles[0].model.clone();
+        self.key = profiles[0].key.clone();
+        self.disable_thinking = profiles[0].disable_thinking;
+        self.backup_llm = [profiles[1].clone(), profiles[2].clone()];
+    }
+
+    fn apply_llm_fields(&mut self, value: &serde_json::Value, backup_keys: [String; 2]) {
+        self.disable_thinking = thinking_flag(value, &self.url, "disable_thinking");
+        let Some(arr) = value.get("llm_models").and_then(|v| v.as_array()) else {
+            self.backup_llm = Default::default();
+            return;
+        };
+        let mut loaded = self.llm_profiles();
+        for (i, item) in arr.iter().take(LLM_PROFILE_COUNT).enumerate() {
+            if !item.is_object() {
+                continue;
+            }
+            if let Some(url) = item.get("url").and_then(|v| v.as_str()) {
+                loaded[i].url = url.to_owned();
+            } else if i > 0 {
+                loaded[i].url.clear();
+            }
+            if let Some(model) = item.get("model").and_then(|v| v.as_str()) {
+                loaded[i].model = model.to_owned();
+            } else if i > 0 {
+                loaded[i].model.clear();
+            }
+            loaded[i].disable_thinking = thinking_flag(item, &loaded[i].url, "disable_thinking");
+        }
+        loaded[1].key = backup_keys[0].clone();
+        loaded[2].key = backup_keys[1].clone();
+        self.set_llm_profiles(loaded);
+    }
+
     pub fn save(&self, dir: &Path, sealer: &dyn Sealer) -> std::io::Result<()> {
         self.save_merged(None, dir, sealer).map(|_| ())
     }
@@ -578,6 +713,17 @@ impl ApiSettings {
                         cur.clone()
                     }
                 };
+                let pick_profile =
+                    |cur: &LlmProfile, orig: &LlmProfile, on_disk: &LlmProfile| LlmProfile {
+                        url: pick_str(&cur.url, &orig.url, &on_disk.url),
+                        model: pick_str(&cur.model, &orig.model, &on_disk.model),
+                        key: pick_str(&cur.key, &orig.key, &on_disk.key),
+                        disable_thinking: if cur.disable_thinking == orig.disable_thinking {
+                            on_disk.disable_thinking
+                        } else {
+                            cur.disable_thinking
+                        },
+                    };
                 Self {
                     engine: if self.engine == base.engine && !disk.unknown_engine {
                         disk.engine
@@ -592,6 +738,23 @@ impl ApiSettings {
                     url: pick_str(&self.url, &base.url, &disk.url),
                     model: pick_str(&self.model, &base.model, &disk.model),
                     key: pick_str(&self.key, &base.key, &disk.key),
+                    disable_thinking: if self.disable_thinking == base.disable_thinking {
+                        disk.disable_thinking
+                    } else {
+                        self.disable_thinking
+                    },
+                    backup_llm: [
+                        pick_profile(
+                            &self.backup_llm[0],
+                            &base.backup_llm[0],
+                            &disk.backup_llm[0],
+                        ),
+                        pick_profile(
+                            &self.backup_llm[1],
+                            &base.backup_llm[1],
+                            &disk.backup_llm[1],
+                        ),
+                    ],
                     style: if self.style == base.style {
                         disk.style
                     } else {
@@ -610,7 +773,8 @@ impl ApiSettings {
                         && self.key == base.key
                         && self.google_key == base.google_key
                         && self.azure_key == base.azure_key
-                        && self.deepl_key == base.deepl_key,
+                        && self.deepl_key == base.deepl_key
+                        && self.backup_llm == base.backup_llm,
                     settings_broken: false,
                     unknown_engine: false,
                 }
@@ -625,6 +789,8 @@ impl ApiSettings {
             merged.google_key.trim(),
             merged.azure_key.trim(),
             merged.deepl_key.trim(),
+            merged.backup_llm[0].key.as_str(),
+            merged.backup_llm[1].key.as_str(),
         ])?;
         if old.get("sealed_keys").is_none() {
             if merged.keys_unreadable {
@@ -649,14 +815,17 @@ impl ApiSettings {
         let encrypted = match old.get("sealed_keys") {
             Some(blob) if merged.keys_unreadable || open_key_bundle(blob, sealer).is_none() => {
                 if [
-                    &merged.key,
-                    &merged.azure_key,
-                    &merged.google_key,
-                    &merged.deepl_key,
+                    merged.key.as_str(),
+                    merged.azure_key.as_str(),
+                    merged.google_key.as_str(),
+                    merged.deepl_key.as_str(),
+                    merged.backup_llm[0].key.as_str(),
+                    merged.backup_llm[1].key.as_str(),
                 ]
                 .iter()
                 .any(|k| !k.is_empty())
                     || old["url"].as_str() != Some(merged.url.as_str())
+                    || merged.backup_llm.iter().any(|p| !p.url.trim().is_empty())
                 {
                     return Err(std::io::Error::other(
                         "原密钥暂时无法解密，已保留原设置；请恢复密钥后再更改密钥或 API 地址",
@@ -696,6 +865,26 @@ impl ApiSettings {
         object.insert(
             "azure_region".into(),
             serde_json::Value::String(merged.azure_region.trim().to_owned()),
+        );
+        object.insert(
+            "disable_thinking".into(),
+            serde_json::Value::Bool(merged.disable_thinking),
+        );
+        object.insert(
+            "llm_models".into(),
+            serde_json::Value::Array(
+                merged
+                    .llm_profiles()
+                    .into_iter()
+                    .map(|profile| {
+                        serde_json::json!({
+                            "url": profile.url,
+                            "model": profile.model,
+                            "disable_thinking": profile.disable_thinking,
+                        })
+                    })
+                    .collect(),
+            ),
         );
         let snapshot = serde_json::to_vec(&serde_json::Value::Object(object))?;
         if !crate::write_atomically(&dir.join(SETTINGS_FILE), &snapshot) {
@@ -738,13 +927,14 @@ impl ApiSettings {
     /// LLM usable: URL, model and key are set; HTTPS only, except HTTP to this machine for
     /// testing (see [`llm_url_allowed`]).
     pub fn validate_llm(&self) -> Result<(), &'static str> {
-        if self.url.trim().is_empty() || self.model.trim().is_empty() || self.key.trim().is_empty()
-        {
-            Err("请先在“设置”中填写 API 地址、模型和密钥")
-        } else if !llm_url_allowed(&self.url) {
-            Err("API 地址请使用 HTTPS（不能带用户名或密码）；仅本机测试允许 HTTP")
-        } else {
+        let profiles = self.llm_profiles();
+        for profile in &profiles {
+            profile.validate()?;
+        }
+        if profiles.iter().any(LlmProfile::is_ready) {
             Ok(())
+        } else {
+            Err("请先在“设置”中填写 API 地址、模型和密钥")
         }
     }
 }
@@ -1034,6 +1224,8 @@ mod tests {
             url: "https://example.com/v1".into(),
             model: "m".into(),
             key: "secret".into(),
+            disable_thinking: false,
+            backup_llm: Default::default(),
             style: TranslationStyle::Academic,
             custom: "x".into(),
             google_key: "gkey".into(),
@@ -1138,5 +1330,125 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.join(SETTINGS_FILE)).unwrap()).unwrap();
         assert_eq!(raw_after["future_flag"], serde_json::json!(42));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn xor_dir(name: &str) -> (std::path::PathBuf, XorSealer) {
+        let dir = std::env::temp_dir().join(format!("yiime-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        (dir, XorSealer)
+    }
+
+    struct XorSealer;
+    impl Sealer for XorSealer {
+        fn seal(&self, data: &[u8]) -> Option<Vec<u8>> {
+            Some(data.iter().map(|b| b ^ 0x5a).collect())
+        }
+        fn open(&self, data: &[u8]) -> Option<Vec<u8>> {
+            Some(data.iter().map(|b| b ^ 0x5a).collect())
+        }
+    }
+
+    #[test]
+    fn llm_models_migrate_from_single_profile() {
+        let (dir, sealer) = xor_dir("migrate-llm");
+        let settings = ApiSettings {
+            engine: Engine::Llm,
+            url: "https://api.deepinfra.com/v1/openai/chat/completions".into(),
+            model: "deepseek-ai/DeepSeek-V4.1-Flash-1017".into(),
+            key: "primary-secret".into(),
+            ..ApiSettings::default()
+        };
+        // Save without llm_models first: write a 0.2.5-style file (4 keys, no llm_models).
+        settings.save(&dir, &sealer).unwrap();
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join(SETTINGS_FILE)).unwrap()).unwrap();
+        raw.as_object_mut().unwrap().remove("llm_models");
+        raw.as_object_mut().unwrap().remove("disable_thinking");
+        // Shrink the sealed bundle back to four strings, like an older build.
+        let four = sealer
+            .seal(&serde_json::to_vec(&["primary-secret", "", "", ""]).unwrap())
+            .unwrap();
+        raw.as_object_mut()
+            .unwrap()
+            .insert("sealed_keys".into(), serde_json::to_value(four).unwrap());
+        std::fs::write(dir.join(SETTINGS_FILE), serde_json::to_vec(&raw).unwrap()).unwrap();
+
+        let loaded = ApiSettings::load(&dir, &sealer);
+        assert_eq!(loaded.url, settings.url);
+        assert_eq!(loaded.model, settings.model);
+        assert_eq!(loaded.key, "primary-secret");
+        assert!(
+            loaded.disable_thinking,
+            "DeepInfra defaults to disabling thinking"
+        );
+        assert!(loaded.backup_llm.iter().all(LlmProfile::is_empty));
+        let json = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
+        assert!(!json.contains("primary-secret"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn llm_models_openai_default_keeps_thinking() {
+        assert!(!default_disable_thinking(DEFAULT_URL));
+        assert!(default_disable_thinking(
+            "https://api.deepinfra.com/v1/openai/chat/completions"
+        ));
+        assert!(!default_disable_thinking(
+            "https://deepinfra.com.evil.example/v1"
+        ));
+    }
+
+    #[test]
+    fn llm_models_round_trip_preserves_order_and_keys() {
+        let (dir, sealer) = xor_dir("llm-order");
+        let mut settings = ApiSettings {
+            engine: Engine::Llm,
+            url: "https://primary.example/v1".into(),
+            model: "model-a".into(),
+            key: "key-a".into(),
+            disable_thinking: true,
+            ..ApiSettings::default()
+        };
+        settings.backup_llm = [
+            LlmProfile {
+                url: "https://backup.example/v1".into(),
+                model: "model-b".into(),
+                key: "key-b".into(),
+                disable_thinking: false,
+            },
+            LlmProfile {
+                url: "https://third.example/v1".into(),
+                model: "model-c".into(),
+                key: "key-c".into(),
+                disable_thinking: true,
+            },
+        ];
+        settings.save(&dir, &sealer).unwrap();
+        let json = std::fs::read_to_string(dir.join(SETTINGS_FILE)).unwrap();
+        assert!(!json.contains("key-a") && !json.contains("key-b") && !json.contains("key-c"));
+        let loaded = ApiSettings::load(&dir, &sealer);
+        assert_eq!(loaded, settings);
+
+        // Reorder: B, A, C.
+        let mut reordered = loaded;
+        let mut profiles = reordered.llm_profiles();
+        profiles.swap(0, 1);
+        reordered.set_llm_profiles(profiles);
+        reordered.save(&dir, &sealer).unwrap();
+        let again = ApiSettings::load(&dir, &sealer);
+        let names: Vec<_> = again.llm_profiles().into_iter().map(|p| p.model).collect();
+        assert_eq!(names, ["model-b", "model-a", "model-c"]);
+        assert_eq!(again.key, "key-b");
+        assert_eq!(again.backup_llm[0].key, "key-a");
+        assert!(!again.disable_thinking);
+        assert!(again.backup_llm[0].disable_thinking);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn llm_backup_hint_names_the_saved_slot() {
+        assert_eq!(llm_backup_hint(0), None);
+        assert_eq!(llm_backup_hint(1).as_deref(), Some("已切换到备用模型 2"));
+        assert_eq!(llm_backup_hint(2).as_deref(), Some("已切换到备用模型 3"));
     }
 }

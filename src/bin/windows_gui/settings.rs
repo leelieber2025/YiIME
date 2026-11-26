@@ -25,7 +25,7 @@ pub(super) unsafe fn open_settings(owner: HWND) {
         left: 0,
         top: 0,
         right: scale_px(720, dpi),
-        bottom: scale_px(760, dpi),
+        bottom: scale_px(900, dpi),
     };
     unsafe {
         AdjustWindowRectExForDpi(&mut rect, style, 0, ex_style, dpi);
@@ -208,10 +208,12 @@ impl SettingsLayout {
                 "DeepL 密钥（加密保存；以 :fx 结尾为免费版，译文为美式英文）",
                 m.btn_pad,
             ),
+            ("模型 1 API 地址（OpenAI 兼容）", m.btn_pad),
             (
-                "大模型 API 地址（OpenAI 兼容；选 Google 时作备用，可不填）",
-                m.btn_pad,
+                "关闭思考（更快；接口不支持时会自动去掉该参数）",
+                m.check_extra,
             ),
+            ("模型 3（可选）", m.btn_pad),
             (
                 "自定义要求（可选，追加到翻译提示词，例如“保留产品名不翻译”）",
                 m.btn_pad,
@@ -249,6 +251,16 @@ impl SettingsLayout {
             scale_combo = scale_combo.max(text_cx(font, label) + m.combo_extra);
         }
         preferred = preferred.max(m.margin * 2 + scale_label_w + m.gutter + scale_combo);
+
+        let move_w = (text_cx(font, "上移") + m.btn_pad * 2).max(scale_px(52, dpi));
+        preferred = preferred.max(
+            m.margin * 2
+                + text_cx(font, "模型 3（可选）")
+                + m.btn_pad
+                + m.gutter
+                + move_w * 2
+                + m.gutter / 2,
+        );
 
         let words_w = text_cx(font, "用户词库…") + m.btn_pad * 2;
         let save_w = (text_cx(font, "保存") + m.btn_pad * 2).max(scale_px(80, dpi));
@@ -289,17 +301,46 @@ impl SettingsLayout {
         place(SETTINGS_FALLBACK, right, y, col_w, m.edit_h);
         y += m.edit_h + m.row_gap;
 
-        place(LBL_URL, left, y, full_w, m.label_h);
-        y += m.label_h + m.label_gap;
-        place(SETTINGS_URL, left, y, full_w, m.edit_h);
-        y += m.edit_h + m.row_gap;
+        let move_w = (text_cx(font, "上移") + m.btn_pad * 2).max(scale_px(52, dpi));
+        for index in 0..LLM_PROFILE_COUNT {
+            let title = if index == 0 {
+                "模型 1"
+            } else {
+                // Labels are static; 2 and 3 are optional backups.
+                if index == 1 {
+                    "模型 2（可选）"
+                } else {
+                    "模型 3（可选）"
+                }
+            };
+            let title_w = text_cx(font, title) + m.btn_pad;
+            place(
+                LBL_LLM_PROFILE[index],
+                left,
+                y + (m.btn_h - m.label_h) / 2,
+                title_w,
+                m.label_h,
+            );
+            let down_x = left + full_w - move_w;
+            let up_x = down_x - m.gutter / 2 - move_w;
+            place(SETTINGS_LLM_UP[index], up_x, y, move_w, m.btn_h);
+            place(SETTINGS_LLM_DOWN[index], down_x, y, move_w, m.btn_h);
+            y += m.btn_h.max(m.label_h) + m.label_gap;
 
-        place(LBL_MODEL, left, y, col_w, m.label_h);
-        place(LBL_KEY, right, y, col_w, m.label_h);
-        y += m.label_h + m.label_gap;
-        place(SETTINGS_MODEL, left, y, col_w, m.edit_h);
-        place(SETTINGS_KEY, right, y, col_w, m.edit_h);
-        y += m.edit_h + m.row_gap;
+            place(LBL_LLM_URL[index], left, y, full_w, m.label_h);
+            y += m.label_h + m.label_gap;
+            place(SETTINGS_LLM_URL[index], left, y, full_w, m.edit_h);
+            y += m.edit_h + m.row_gap;
+
+            place(LBL_LLM_MODEL[index], left, y, col_w, m.label_h);
+            place(LBL_LLM_KEY[index], right, y, col_w, m.label_h);
+            y += m.label_h + m.label_gap;
+            place(SETTINGS_LLM_MODEL[index], left, y, col_w, m.edit_h);
+            place(SETTINGS_LLM_KEY[index], right, y, col_w, m.edit_h);
+            y += m.edit_h + m.tight_gap;
+            place(SETTINGS_LLM_THINK[index], left, y, full_w, m.edit_h);
+            y += m.edit_h + m.row_gap;
+        }
 
         place(LBL_STYLE, left, y, col_w, m.label_h);
         y += m.label_h + m.label_gap;
@@ -577,6 +618,47 @@ fn add_label(parent: HWND, text: &str, id: i32) -> HWND {
     add_control(parent, "STATIC", text, 0x80, id)
 }
 
+fn read_llm_profile(hwnd: HWND, index: usize, field: &impl Fn(i32) -> String) -> LlmProfile {
+    LlmProfile {
+        url: field(SETTINGS_LLM_URL[index]),
+        model: field(SETTINGS_LLM_MODEL[index]),
+        key: field(SETTINGS_LLM_KEY[index]),
+        disable_thinking: unsafe {
+            SendMessageW(
+                GetDlgItem(hwnd, SETTINGS_LLM_THINK[index]),
+                BM_GETCHECK,
+                0,
+                0,
+            )
+        } == 1,
+    }
+}
+
+fn swap_window_text(hwnd: HWND, a: i32, b: i32) {
+    unsafe {
+        let left = GetDlgItem(hwnd, a);
+        let right = GetDlgItem(hwnd, b);
+        let first = get_text(left);
+        let second = get_text(right);
+        SetWindowTextW(left, wide(&second).as_ptr());
+        SetWindowTextW(right, wide(&first).as_ptr());
+    }
+}
+
+fn swap_llm_profile_fields(hwnd: HWND, left: usize, right: usize) {
+    swap_window_text(hwnd, SETTINGS_LLM_URL[left], SETTINGS_LLM_URL[right]);
+    swap_window_text(hwnd, SETTINGS_LLM_MODEL[left], SETTINGS_LLM_MODEL[right]);
+    swap_window_text(hwnd, SETTINGS_LLM_KEY[left], SETTINGS_LLM_KEY[right]);
+    unsafe {
+        let a = GetDlgItem(hwnd, SETTINGS_LLM_THINK[left]);
+        let b = GetDlgItem(hwnd, SETTINGS_LLM_THINK[right]);
+        let first = SendMessageW(a, BM_GETCHECK, 0, 0);
+        let second = SendMessageW(b, BM_GETCHECK, 0, 0);
+        SendMessageW(a, BM_SETCHECK, second as usize, 0);
+        SendMessageW(b, BM_SETCHECK, first as usize, 0);
+    }
+}
+
 pub(super) unsafe extern "system" fn settings_proc(
     hwnd: HWND,
     msg: u32,
@@ -674,34 +756,71 @@ pub(super) unsafe extern "system" fn settings_proc(
             );
             SendMessageW(fallback, BM_SETCHECK, settings.allow_fallback as usize, 0);
 
-            add_label(
-                hwnd,
-                "大模型 API 地址（OpenAI 兼容；选 Google 时作备用，可不填）",
-                LBL_URL,
-            );
-            add_control(
-                hwnd,
-                "EDIT",
-                &settings.url,
-                ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-                SETTINGS_URL,
-            );
-            add_label(hwnd, "模型", LBL_MODEL);
-            add_control(
-                hwnd,
-                "EDIT",
-                &settings.model,
-                ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-                SETTINGS_MODEL,
-            );
-            add_label(hwnd, "API 密钥（Windows 加密保存）", LBL_KEY);
-            add_control(
-                hwnd,
-                "EDIT",
-                &settings.key,
-                ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
-                SETTINGS_KEY,
-            );
+            let profiles = settings.llm_profiles();
+            for (index, profile) in profiles.iter().enumerate() {
+                let title = if index == 0 {
+                    "模型 1"
+                } else if index == 1 {
+                    "模型 2（可选）"
+                } else {
+                    "模型 3（可选）"
+                };
+                add_label(hwnd, title, LBL_LLM_PROFILE[index]);
+                add_control(
+                    hwnd,
+                    "BUTTON",
+                    "上移",
+                    BS_PUSHBUTTON as u32 | WS_TABSTOP,
+                    SETTINGS_LLM_UP[index],
+                );
+                add_control(
+                    hwnd,
+                    "BUTTON",
+                    "下移",
+                    BS_PUSHBUTTON as u32 | WS_TABSTOP,
+                    SETTINGS_LLM_DOWN[index],
+                );
+                add_label(
+                    hwnd,
+                    if index == 0 {
+                        "API 地址（OpenAI 兼容）"
+                    } else {
+                        "API 地址（可选）"
+                    },
+                    LBL_LLM_URL[index],
+                );
+                add_control(
+                    hwnd,
+                    "EDIT",
+                    &profile.url,
+                    ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+                    SETTINGS_LLM_URL[index],
+                );
+                add_label(hwnd, "模型", LBL_LLM_MODEL[index]);
+                add_control(
+                    hwnd,
+                    "EDIT",
+                    &profile.model,
+                    ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+                    SETTINGS_LLM_MODEL[index],
+                );
+                add_label(hwnd, "API 密钥（Windows 加密保存）", LBL_LLM_KEY[index]);
+                add_control(
+                    hwnd,
+                    "EDIT",
+                    &profile.key,
+                    ES_PASSWORD as u32 | ES_AUTOHSCROLL as u32 | WS_TABSTOP,
+                    SETTINGS_LLM_KEY[index],
+                );
+                let think = add_control(
+                    hwnd,
+                    "BUTTON",
+                    "关闭思考（更快；接口不支持时会自动去掉该参数）",
+                    BS_AUTOCHECKBOX as u32 | WS_TABSTOP,
+                    SETTINGS_LLM_THINK[index],
+                );
+                SendMessageW(think, BM_SETCHECK, profile.disable_thinking as usize, 0);
+            }
             add_label(hwnd, "翻译风格", LBL_STYLE);
             let combo = add_control(
                 hwnd,
@@ -987,7 +1106,20 @@ pub(super) unsafe extern "system" fn settings_proc(
             0
         }
         WM_COMMAND => unsafe {
-            match (w & 0xffff) as i32 {
+            let command_id = (w & 0xffff) as i32;
+            if let Some(index) = SETTINGS_LLM_UP.iter().position(|id| *id == command_id) {
+                if index > 0 {
+                    swap_llm_profile_fields(hwnd, index - 1, index);
+                }
+                return 0;
+            }
+            if let Some(index) = SETTINGS_LLM_DOWN.iter().position(|id| *id == command_id) {
+                if index + 1 < LLM_PROFILE_COUNT {
+                    swap_llm_profile_fields(hwnd, index, index + 1);
+                }
+                return 0;
+            }
+            match command_id {
                 ID_OK => {
                     let Some(state) = state_of(owner) else {
                         DestroyWindow(hwnd);
@@ -1016,9 +1148,19 @@ pub(super) unsafe extern "system" fn settings_proc(
                         azure_key: field(SETTINGS_AZURE_KEY),
                         azure_region: field(SETTINGS_AZURE_REGION),
                         deepl_key: field(SETTINGS_DEEPL_KEY),
-                        url: field(SETTINGS_URL),
-                        model: field(SETTINGS_MODEL),
-                        key: field(SETTINGS_KEY),
+                        url: field(SETTINGS_LLM_URL[0]),
+                        model: field(SETTINGS_LLM_MODEL[0]),
+                        key: field(SETTINGS_LLM_KEY[0]),
+                        disable_thinking: SendMessageW(
+                            GetDlgItem(hwnd, SETTINGS_LLM_THINK[0]),
+                            BM_GETCHECK,
+                            0,
+                            0,
+                        ) == 1,
+                        backup_llm: [
+                            read_llm_profile(hwnd, 1, &field),
+                            read_llm_profile(hwnd, 2, &field),
+                        ],
                         style: usize::try_from(index)
                             .ok()
                             .and_then(|index| TranslationStyle::ALL.get(index).copied())
@@ -1064,11 +1206,10 @@ pub(super) unsafe extern "system" fn settings_proc(
                     // Plain Wubi mode never translates, so API settings are not required. With
                     // Google selected the LLM is an optional fallback, but once a key is
                     // entered the whole LLM configuration must be valid.
-                    let api_check = if settings.keys_unreadable
-                        || (plain && settings.key.is_empty())
-                    {
+                    let llm_blank = settings.llm_profiles().iter().all(LlmProfile::is_empty);
+                    let api_check = if settings.keys_unreadable || (plain && llm_blank) {
                         Ok(())
-                    } else if settings.engine != Engine::Llm && !settings.key.trim().is_empty() {
+                    } else if settings.engine != Engine::Llm && !llm_blank {
                         settings.validate().and_then(|_| settings.validate_llm())
                     } else {
                         settings.validate()
