@@ -635,6 +635,32 @@ fn mark_minimal(endpoint: &str, model: &str) {
     minimal_body().insert((endpoint.to_owned(), model.to_owned()));
 }
 
+/// (endpoint, model) pairs that rejected the explicit "no thinking" parameter: sent without it.
+static THINKING_PARAM_REJECTED: Mutex<BTreeSet<(String, String)>> = Mutex::new(BTreeSet::new());
+
+fn thinking_param_rejected() -> std::sync::MutexGuard<'static, BTreeSet<(String, String)>> {
+    THINKING_PARAM_REJECTED
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// DeepInfra (e.g. `deepseek-ai/DeepSeek-V4.1-Flash-1017`): hybrid reasoning models there take
+/// `reasoning_effort: "none"` to answer without a thinking phase (docs.deepinfra.com/chat/reasoning;
+/// equivalent to `reasoning: {"enabled": false}`, ignored by non-reasoning models). A translation
+/// never needs the thinking phase: it only adds latency, cost and the risk of running out of
+/// tokens.
+fn disables_thinking(endpoint: &str) -> bool {
+    let Ok(url) = url::Url::parse(endpoint.trim()) else {
+        return false;
+    };
+    let deepinfra = url.host_str().is_some_and(|host| {
+        let host = host.to_ascii_lowercase();
+        host == "deepinfra.com" || host.ends_with(".deepinfra.com")
+    });
+    // Local fake endpoint in tests.
+    deepinfra || (cfg!(test) && url.path().starts_with("/deepinfra-test/"))
+}
+
 pub fn translate_openai_with(
     source: &str,
     endpoint: &str,
@@ -686,20 +712,41 @@ fn llm(
     // English is about 1–2 tokens per Chinese character: leave headroom without allowing long
     // rambles.
     let max_tokens = (source.chars().count() * 4 + 64).min(2048);
-    let full = json!({
+    let mut full = json!({
         "model": model,
         "messages": messages,
         "temperature": 0,
         "max_tokens": max_tokens,
     });
-    let minimal = json!({"model": model, "messages": messages});
+    let mut minimal = json!({"model": model, "messages": messages});
+    let pair = (endpoint.to_owned(), model.to_owned());
+    if disables_thinking(endpoint) && !thinking_param_rejected().contains(&pair) {
+        full["reasoning_effort"] = json!("none");
+        minimal["reasoning_effort"] = json!("none");
+    }
     let agent = agent(bypass_proxy(endpoint));
-    let send = |body: &Value| {
+    let post = |body: &Value| {
         agent
             .post(endpoint)
             .timeout(timeout)
             .set("Authorization", &format!("Bearer {key}"))
             .send_json(body.clone())
+    };
+    // An endpoint that refuses the "no thinking" parameter (400/422) is asked again without it,
+    // and only that (endpoint, model) pair stops sending it once the retry is accepted.
+    let send = |body: &Value| match post(body) {
+        Err(ureq::Error::Status(400 | 422, _)) if body.get("reasoning_effort").is_some() => {
+            let mut plain = body.clone();
+            if let Some(fields) = plain.as_object_mut() {
+                fields.remove("reasoning_effort");
+            }
+            let retry = post(&plain);
+            if retry.is_ok() {
+                thinking_param_rejected().insert(pair.clone());
+            }
+            retry
+        }
+        other => other,
     };
     let response = if wants_minimal(endpoint, model) {
         send(&minimal)
@@ -942,6 +989,35 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    /// Reads a whole HTTP request (headers and Content-Length body) and returns the body. Test
+    /// servers must not reply and close before the request is read: Windows then resets the
+    /// connection and the client sees a network error instead of the reply.
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut data = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = stream.read(&mut buf).unwrap_or(0);
+            data.extend_from_slice(&buf[..n]);
+            if let Some(at) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&data[..at]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if data.len() >= at + 4 + length {
+                    return String::from_utf8_lossy(&data[at + 4..at + 4 + length]).into_owned();
+                }
+            }
+            if n == 0 {
+                return String::new();
+            }
+        }
+    }
     #[test]
     fn local_endpoint_and_reasoning_cleanup() {
         assert!(bypass_proxy("http://[::1]:8765/v1"));
@@ -1467,8 +1543,7 @@ mod tests {
         let handle = std::thread::spawn(move || {
             for idx in 0..2 {
                 let (mut stream, _) = server.accept().unwrap();
-                let mut buf = [0u8; 2048];
-                let _ = stream.read(&mut buf);
+                let _ = read_request(&mut stream);
                 let body = if idx == 0 {
                     r#"[[["Hello ","你好"],[null,"世界"]]]"#
                 } else {
@@ -1514,6 +1589,66 @@ mod tests {
     }
 
     #[test]
+    fn deepinfra_requests_skip_thinking_and_retry_without_the_parameter_when_refused() {
+        assert!(disables_thinking(
+            "https://api.deepinfra.com/v1/openai/chat/completions"
+        ));
+        assert!(!disables_thinking(
+            "https://api.openai.com/v1/chat/completions"
+        ));
+        assert!(!disables_thinking("https://deepinfra.com.evil.example/v1"));
+
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        // Model `ok` accepts reasoning_effort; model `strict` refuses it (400).
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..4 {
+                let (mut stream, _) = server.accept().unwrap();
+                let body = read_request(&mut stream);
+                let json: Value = serde_json::from_str(&body).unwrap();
+                let effort = json["reasoning_effort"].as_str().map(str::to_owned);
+                seen.push((json["model"].as_str().unwrap().to_owned(), effort.clone()));
+                let (status, reply) = match (json["model"].as_str().unwrap(), effort) {
+                    ("strict", Some(_)) => (
+                        "400 Bad Request",
+                        r#"{"error":{"message":"unknown field reasoning_effort"}}"#.to_owned(),
+                    ),
+                    _ => (
+                        "200 OK",
+                        r#"{"choices":[{"finish_reason":"stop","message":{"content":"Hello"}}]}"#
+                            .to_owned(),
+                    ),
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+            }
+            seen
+        });
+        let url = format!("http://{addr}/deepinfra-test/v1/openai/chat/completions");
+        let run = |model: &str| {
+            translate_openai_with("你好", &url, model, "k", TranslationStyle::default(), "")
+        };
+        assert_eq!(run("ok").as_deref(), Ok("Hello"));
+        assert_eq!(run("strict").as_deref(), Ok("Hello"));
+        // Remembered: the next request for `strict` goes without the parameter at once.
+        assert_eq!(run("strict").as_deref(), Ok("Hello"));
+        let seen = handle.join().unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                ("ok".to_owned(), Some("none".to_owned())),
+                ("strict".to_owned(), Some("none".to_owned())),
+                ("strict".to_owned(), None),
+                ("strict".to_owned(), None),
+            ]
+        );
+    }
+
+    #[test]
     fn llm_rejects_non_normal_finish_reasons_and_allows_normal_ones() {
         let server = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = server.local_addr().unwrap();
@@ -1526,8 +1661,7 @@ mod tests {
         let handle = std::thread::spawn(move || {
             for reason in reasons {
                 let (mut stream, _) = server.accept().unwrap();
-                let mut buf = [0u8; 2048];
-                let _ = stream.read(&mut buf);
+                let _ = read_request(&mut stream);
                 let body = format!(
                     r#"{{"choices":[{{"finish_reason":"{reason}","message":{{"content":"Hello"}}}}]}}"#
                 );
@@ -1565,8 +1699,7 @@ mod tests {
             while stop_rx.try_recv().is_err() {
                 if let Ok((mut stream, _)) = server.accept() {
                     let _ = stream.set_nonblocking(false);
-                    let mut buf = [0u8; 1024];
-                    let _ = stream.read(&mut buf);
+                    let _ = read_request(&mut stream);
                     count_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let _ = stream.write_all(
                         b"HTTP/1.1 200 OK

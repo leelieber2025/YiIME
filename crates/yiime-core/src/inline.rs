@@ -68,7 +68,10 @@ pub fn is_literal_in_english(ch: char) -> bool {
 pub mod ui {
     use crate::MAX_CODE_LEN;
     use crate::dict::{MixedInput, Source};
-    use crate::engine::{LetterAction, classify_letter, paging_direction_vk};
+    use crate::engine::{
+        LetterAction, LetterRules, auto_commits_four, classify_letter, paging_direction_vk,
+        pushes_fifth,
+    };
     use crate::keys::semicolon_is_code;
     use crate::shuangpin::Shuangpin;
     use crate::text::to_traditional;
@@ -334,6 +337,51 @@ pub mod ui {
         NotHandled,
     }
 
+    /// One key for [`LogicalInline::handle_key_with`].
+    pub struct InlineKey<'a> {
+        pub key: usize,
+        pub shift: bool,
+        pub caps_lock: bool,
+        pub comma_period_paging: bool,
+        pub shuangpin: Option<Shuangpin>,
+        /// Microsoft Wubi letter rules (fifth letter, unique four-letter code); None with
+        /// pinyin-first or Shuangpin.
+        pub wubi: Option<(&'a MixedInput, LetterRules)>,
+        /// What the key types when it is not a composition key (Chinese or ASCII punctuation, a
+        /// digit): the composition is committed and this follows it.
+        pub typed: Option<String>,
+    }
+
+    /// Arrows, Home/End, PageUp/PageDown (when not paging) and Delete: kept while composing.
+    pub fn is_navigation(key: usize) -> bool {
+        matches!(key, 0x21..=0x28 | 0x2E)
+    }
+
+    /// Commits a whole code by taking the first candidate segment by segment, raw letters for a
+    /// segment with none (same as [`crate::Composer::flush_all`] in the draft box).
+    pub fn flush_code(code: &str, first_for: &dyn Fn(&str) -> Option<(String, String)>) -> String {
+        let letters = |code: &str| code.replace('\'', "").len();
+        let mut out = String::new();
+        let mut code = code.to_owned();
+        for _ in 0..=MAX_CODE_LEN {
+            if code.is_empty() {
+                break;
+            }
+            match first_for(&code) {
+                Some((text, rest)) if letters(&rest) < letters(&code) => {
+                    out.push_str(&text);
+                    code = rest;
+                }
+                _ => {
+                    out.push_str(&code);
+                    code.clear();
+                }
+            }
+        }
+        out.push_str(&code);
+        out
+    }
+
     #[derive(Debug, Clone)]
     pub struct LogicalInline<C> {
         active: Option<(C, String)>,
@@ -377,7 +425,26 @@ pub mod ui {
             comma_period_paging: bool,
             shuangpin: Option<Shuangpin>,
         ) -> bool {
+            self.wants_with(context, key, shift, comma_period_paging, shuangpin, false)
+        }
+
+        /// `types_text`: the key types a character (punctuation, digit, numpad); while composing
+        /// it commits the composition and then types that character instead of landing inside
+        /// the composition in the host (SampleIME `_HandleCompositionPunctuation`). Navigation
+        /// keys are kept while composing so the caret cannot leave the composition.
+        pub fn wants_with(
+            &self,
+            context: &C,
+            key: usize,
+            shift: bool,
+            comma_period_paging: bool,
+            shuangpin: Option<Shuangpin>,
+            types_text: bool,
+        ) -> bool {
             if let Some(code) = self.code(context) {
+                if types_text || is_navigation(key) {
+                    return true;
+                }
                 let paging = u16::try_from(key).ok().is_some_and(|vk| {
                     paging_direction_vk(vk, shift, comma_period_paging).is_some()
                 });
@@ -406,6 +473,40 @@ pub mod ui {
             shuangpin: Option<Shuangpin>,
             choice_at: impl FnOnce(usize) -> Option<(String, String)>,
         ) -> InlineKeyOutcome {
+            self.handle_key_with(
+                context,
+                InlineKey {
+                    key,
+                    shift,
+                    caps_lock,
+                    comma_period_paging,
+                    shuangpin,
+                    wubi: None,
+                    typed: None,
+                },
+                choice_at,
+                &|_| None,
+            )
+        }
+
+        /// `first_for(code)`: the first candidate of any code (text, unconsumed rest), used by the
+        /// unique-four-letter rule and to commit the whole code before typed punctuation.
+        pub fn handle_key_with(
+            &mut self,
+            context: &C,
+            input: InlineKey<'_>,
+            choice_at: impl FnOnce(usize) -> Option<(String, String)>,
+            first_for: &dyn Fn(&str) -> Option<(String, String)>,
+        ) -> InlineKeyOutcome {
+            let InlineKey {
+                key,
+                shift,
+                caps_lock,
+                comma_period_paging,
+                shuangpin,
+                wubi,
+                typed,
+            } = input;
             let Some(mut code) = self.code(context).map(str::to_owned) else {
                 if !(0x41..=0x5a).contains(&key) {
                     return InlineKeyOutcome::NotHandled;
@@ -429,12 +530,41 @@ pub mod ui {
                             InlineKeyOutcome::Finish(out)
                         }
                         Some(LetterAction::Compose(c)) => {
+                            // Microsoft Wubi rules, as in the draft box (Composer::type_letter):
+                            // a fifth letter commits the first candidate (or drops four letters
+                            // that have none) and starts the next character.
+                            let mut committed = String::new();
+                            let fifth = wubi.filter(|(input, rules)| {
+                                rules.push_fifth && pushes_fifth(input, &code, c)
+                            });
+                            if let Some((input, _)) = fifth {
+                                if input.wubi_count(&code) > 0 {
+                                    if let Some((text, _)) = choice_at(0) {
+                                        committed = text;
+                                    }
+                                }
+                                code.clear();
+                            }
                             if code.len() >= MAX_CODE_LEN {
                                 return InlineKeyOutcome::Swallow;
                             }
                             code.push(c);
+                            let unique = wubi.is_some_and(|(input, rules)| {
+                                rules.auto_commit4 && auto_commits_four(input, &code)
+                            });
+                            if let Some((text, _)) = unique.then(|| first_for(&code)).flatten() {
+                                self.active = None;
+                                return InlineKeyOutcome::Finish(committed + &text);
+                            }
                             self.active = Some((context.clone(), code.clone()));
-                            InlineKeyOutcome::Update(code)
+                            if committed.is_empty() {
+                                InlineKeyOutcome::Update(code)
+                            } else {
+                                InlineKeyOutcome::PickPartial {
+                                    committed,
+                                    rest: code,
+                                }
+                            }
                         }
                         _ => InlineKeyOutcome::NotHandled,
                     }
@@ -475,18 +605,36 @@ pub mod ui {
                         InlineKeyOutcome::Finish(code)
                     }
                 }
-                0x31..=0x39 => {
+                0x31..=0x39 if !shift => {
                     if let Some((text, rest)) = choice_at(key - 0x31) {
                         self.apply_choice(context, text, rest)
                     } else {
-                        InlineKeyOutcome::NotHandled
+                        // No candidate at that number: keep the digit out of the composition.
+                        InlineKeyOutcome::Swallow
                     }
                 }
-                _ => u16::try_from(key)
-                    .ok()
-                    .and_then(|vk| paging_direction_vk(vk, shift, comma_period_paging))
-                    .map_or(InlineKeyOutcome::NotHandled, InlineKeyOutcome::Page),
+                _ => {
+                    if let Some(forward) = u16::try_from(key)
+                        .ok()
+                        .and_then(|vk| paging_direction_vk(vk, shift, comma_period_paging))
+                    {
+                        return InlineKeyOutcome::Page(forward);
+                    }
+                    if let Some(text) = typed {
+                        self.active = None;
+                        return InlineKeyOutcome::Finish(flush_code(&code, first_for) + &text);
+                    }
+                    if is_navigation(key) {
+                        return InlineKeyOutcome::Swallow;
+                    }
+                    InlineKeyOutcome::NotHandled
+                }
             }
+        }
+
+        /// The active composition's context.
+        pub fn context(&self) -> Option<&C> {
+            self.active.as_ref().map(|(context, _)| context)
         }
 
         pub fn pick_choice(
@@ -686,6 +834,102 @@ mod ui_tests {
             logic.handle_key(&ctx, 0x08, false, false, true, None, |_| None),
             InlineKeyOutcome::Update(logic.code(&ctx).unwrap()[..31].to_owned())
         );
+    }
+
+    #[test]
+    fn inline_commits_before_typed_keys_keeps_navigation_and_applies_wubi_rules() {
+        use crate::LetterRules;
+        let ctx = 1usize;
+        let key = |key: usize, wubi, typed: Option<&str>| InlineKey {
+            key,
+            shift: false,
+            caps_lock: false,
+            comma_period_paging: false,
+            shuangpin: None,
+            wubi,
+            typed: typed.map(str::to_owned),
+        };
+        let first = |code: &str| match code {
+            "ni" => Some(("你".to_owned(), String::new())),
+            "nihao" => Some(("你".to_owned(), "hao".to_owned())),
+            "hao" => Some(("好".to_owned(), String::new())),
+            "gggg" => Some(("王".to_owned(), String::new())),
+            _ => None,
+        };
+        let mut logic = LogicalInline::default();
+        logic.sync_from_composition(&ctx, "ni");
+        // Punctuation (or a numpad digit) commits the composition, then its own character.
+        assert!(logic.wants_with(&ctx, 0xBC, false, false, None, true));
+        assert_eq!(
+            logic.handle_key_with(&ctx, key(0xBC, None, Some("，")), |_| None, &first),
+            InlineKeyOutcome::Finish("你，".into())
+        );
+        assert!(!logic.active());
+        // The whole code is committed segment by segment; letters with no candidate stay.
+        assert_eq!(flush_code("nihao", &first), "你好");
+        assert_eq!(flush_code("xq", &first), "xq");
+        // Arrows and Delete stay out of the host while composing; an empty number slot too.
+        logic.sync_from_composition(&ctx, "ni");
+        assert!(logic.wants_with(&ctx, 0x25, false, false, None, false));
+        assert_eq!(
+            logic.handle_key_with(&ctx, key(0x25, None, None), |_| None, &first),
+            InlineKeyOutcome::Swallow
+        );
+        assert_eq!(
+            logic.handle_key_with(&ctx, key(0x37, None, None), |_| None, &first),
+            InlineKeyOutcome::Swallow
+        );
+        assert_eq!(logic.code(&ctx), Some("ni"));
+        // Not composing: arrows and punctuation belong to the host.
+        logic.clear();
+        assert!(!logic.wants_with(&ctx, 0x25, false, false, None, true));
+
+        // Unique four-letter Wubi code commits itself; a fifth letter commits the first one.
+        let wubi =
+            MixedInput::from_rime("...\n王\tgggg\t100\n工\taaaa\t100\n式\taaaa\t90\n", "...\n");
+        let rules = LetterRules {
+            push_fifth: true,
+            auto_commit4: true,
+        };
+        logic.sync_from_composition(&ctx, "ggg");
+        assert_eq!(
+            logic.handle_key_with(
+                &ctx,
+                key(b'G' as usize, Some((&wubi, rules)), None),
+                |_| None,
+                &first
+            ),
+            InlineKeyOutcome::Finish("王".into())
+        );
+        logic.sync_from_composition(&ctx, "aaaa");
+        assert_eq!(
+            logic.handle_key_with(
+                &ctx,
+                key(b'G' as usize, Some((&wubi, rules)), None),
+                |_| Some(("工".into(), String::new())),
+                &first
+            ),
+            InlineKeyOutcome::PickPartial {
+                committed: "工".into(),
+                rest: "g".into(),
+            }
+        );
+        // Rules off (the settings): four letters keep composing.
+        logic.sync_from_composition(&ctx, "ggg");
+        let off = LetterRules {
+            push_fifth: false,
+            auto_commit4: false,
+        };
+        assert_eq!(
+            logic.handle_key_with(
+                &ctx,
+                key(b'G' as usize, Some((&wubi, off)), None),
+                |_| None,
+                &first
+            ),
+            InlineKeyOutcome::Update("gggg".into())
+        );
+        assert_eq!(logic.context(), Some(&ctx));
     }
 
     #[test]

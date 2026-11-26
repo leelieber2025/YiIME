@@ -18,7 +18,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     MA_NOACTIVATE, SW_SHOWNA, WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_PAINT,
 };
 use yiime_core::inline_ui::{
-    CandidateView, DisplayCandidate, HitTarget, InlineKeyOutcome, LogicalInline, build_candidates,
+    CandidateView, DisplayCandidate, HitTarget, InlineKey, InlineKeyOutcome, LogicalInline,
+    build_candidates,
 };
 
 const CANDIDATE_GUID: GUID = GUID::from_u128(0xd39fb88b_09bb_4ca2_a050_174b5ab3b7c0);
@@ -1428,31 +1429,85 @@ impl InlineInput {
                 .sync_from_composition(context, &active.code);
         }
     }
-    pub(super) fn wants(&self, context: &ITfContext, key: usize) -> bool {
+    /// `types_text`: the key types a character when it is not a code key (see
+    /// [`LogicalInline::wants_with`]).
+    pub(super) fn wants(&self, context: &ITfContext, key: usize, types_text: bool) -> bool {
         self.sync_logical_from_state(context);
         let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
-        self.ui.logical.borrow().wants(
+        self.ui.logical.borrow().wants_with(
             context,
             key,
             shift,
             option(Flag::CommaPeriodPaging),
             shuangpin_scheme(),
+            types_text,
         )
     }
-    pub(super) fn key(&self, context: &ITfContext, client_id: u32, key: usize) -> bool {
+    /// `typed`: what the key types after the composition is committed (punctuation, digits).
+    pub(super) fn key(
+        &self,
+        context: &ITfContext,
+        client_id: u32,
+        key: usize,
+        typed: Option<String>,
+    ) -> bool {
         self.sync_logical_from_state(context);
         let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
         let caps = unsafe { GetKeyState(VK_CAPITAL as i32) } & 1 != 0;
-        let outcome = self.ui.logical.borrow_mut().handle_key(
+        let scheme = shuangpin_scheme();
+        // Microsoft Wubi rules as in the draft box (Composer::type_letter): not with pinyin
+        // first or Shuangpin.
+        let rules = yiime_core::LetterRules {
+            push_fifth: option(Flag::PushFifth),
+            auto_commit4: option(Flag::AutoCommit4),
+        };
+        let wubi_rules = !option(Flag::PinyinFirst) && scheme.is_none();
+        let first_for = |code: &str| {
+            candidates(code)
+                .into_iter()
+                .next()
+                .map(|row| (row.text, row.rest))
+        };
+        let outcome = self.ui.logical.borrow_mut().handle_key_with(
             context,
-            key,
-            shift,
-            caps,
-            option(Flag::CommaPeriodPaging),
-            shuangpin_scheme(),
+            InlineKey {
+                key,
+                shift,
+                caps_lock: caps,
+                comma_period_paging: option(Flag::CommaPeriodPaging),
+                shuangpin: scheme,
+                wubi: wubi_rules.then(|| (dictionary(), rules)),
+                typed,
+            },
             |idx| self.ui.page_choice(idx),
+            &first_for,
         );
         self.ui.dispatch_outcome(context, client_id, outcome)
+    }
+    /// Shift tap while composing: commit the letters as typed (English), as Microsoft Pinyin and
+    /// Sogou do, instead of discarding them. The caller then switches to English.
+    pub(super) fn commit_letters(&self, client_id: u32) {
+        let context = self.ui.logical.borrow().context().cloned().or_else(|| {
+            self.ui
+                .state
+                .borrow()
+                .as_ref()
+                .map(|state| state.context.clone())
+        });
+        let Some(context) = context else {
+            self.cancel(client_id);
+            return;
+        };
+        self.sync_logical_from_state(&context);
+        let code = self.ui.logical.borrow_mut().commit_raw(&context);
+        let committed = code
+            .and_then(|code| yiime_core::literal_code(&code))
+            .is_some_and(|text| self.ui.edit(&context, client_id, Action::Finish(text)));
+        if !committed {
+            self.cancel(client_id);
+        } else {
+            log("Shift 单击：编码按英文上屏");
+        }
     }
     /// Commits the letters typed so far as they are (not a candidate) and ends the composition:
     /// used when the field turns out to be a password field after the first key.

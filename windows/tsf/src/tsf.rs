@@ -1408,9 +1408,13 @@ impl TextService {
     /// Unreadable compartments do not disable (yiime_core::FieldSwitches).
     fn compartment_on(manager: &ITfCompartmentMgr, id: &GUID) -> Option<bool> {
         let compartment = unsafe { manager.GetCompartment(id) }.ok()?;
-        let value = unsafe { compartment.GetValue() }.ok()?;
-        let inner = unsafe { &*value.Anonymous.Anonymous };
-        Some(inner.vt.0 == 3 && unsafe { inner.Anonymous.lVal != 0 })
+        let mut value = unsafe { compartment.GetValue() }.ok()?;
+        let on = {
+            let inner = unsafe { &*value.Anonymous.Anonymous };
+            inner.vt == VT_I4 && unsafe { inner.Anonymous.lVal != 0 }
+        };
+        let _ = unsafe { VariantClear(&mut value) };
+        Some(on)
     }
     /// The field refuses IME input: TF_SD_READONLY, KEYBOARD_DISABLED or EMPTYCONTEXT.
     fn disabled(context: &ITfContext) -> bool {
@@ -1571,7 +1575,9 @@ impl TextService {
                     .into_iter()
                     .any(modifier)
                 && (active || !modifier(VK_SHIFT))
-                && self.inline.wants(context, key);
+                && self
+                    .inline
+                    .wants(context, key, active && self.composing_text(key).is_some());
         }
         if !(0x41..=0x5a).contains(&key) || Self::disabled(context) || self.password_field(context)
         {
@@ -1658,6 +1664,26 @@ impl TextService {
             ("：", true) => ":".to_owned(),
             _ => text.to_owned(),
         })
+    }
+    /// What a key types after an in-document composition is committed: Chinese punctuation
+    /// (unless English punctuation is on), otherwise the US-layout character, numpad included.
+    fn composing_text(&self, key: usize) -> Option<String> {
+        let vk = u16::try_from(key).ok()?;
+        let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
+        let numpad = (0x60..=0x6F).contains(&vk);
+        if !numpad && !option(Flag::PunctEnglish) {
+            if key == 0xDE {
+                return self
+                    .quotes
+                    .get()
+                    .peek(if shift { '"' } else { '\'' })
+                    .map(str::to_owned);
+            }
+            if let Some(text) = chinese_punctuation(key, shift, false) {
+                return Some(text.to_owned());
+            }
+        }
+        yiime_core::key_char(vk, shift).map(String::from)
     }
     /// Inserts text straight into the document (without the box).
     fn insert_direct(&self, context: &ITfContext, text: String) -> bool {
@@ -1750,7 +1776,9 @@ impl TextService {
                 .into_iter()
                 .any(|vk| unsafe { GetKeyState(vk as i32) } < 0)
         {
-            self.inline.cancel(self.client_id.get());
+            if self.inline.active() {
+                self.inline.commit_letters(self.client_id.get());
+            }
             let ok = self.toggle_keyboard_mode();
             log(&format!(
                 "Shift 单击切换中/英：{ok}，现在中文={}",

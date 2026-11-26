@@ -98,7 +98,7 @@ pub use shuangpin::Shuangpin;
 pub use style::{TranslationStyle, system_prompt};
 #[cfg(feature = "engine")]
 pub use text::to_traditional;
-pub use text::{Quotes, closing_pair, full_width, is_closing, single_line, us_key_char};
+pub use text::{Quotes, closing_pair, full_width, is_closing, key_char, single_line, us_key_char};
 #[cfg(feature = "translate")]
 pub use translate::{
     Attempt, Outcome, prewarm, translate, translate_openai, translate_openai_with,

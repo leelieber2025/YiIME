@@ -164,6 +164,21 @@ pub fn us_key_char(vk: u16, shift: bool) -> Option<char> {
     Some(if shift { shifted } else { plain })
 }
 
+/// Character a virtual key types on a US layout, numpad keys included (digits and `* + - . /`);
+/// None for letters and keys that type nothing. Used to commit a composition and then type the
+/// key's own character (Microsoft Pinyin / SampleIME punctuation-while-composing).
+pub fn key_char(vk: u16, shift: bool) -> Option<char> {
+    match vk {
+        0x60..=0x69 => Some((b'0' + (vk - 0x60) as u8) as char),
+        0x6A => Some('*'),
+        0x6B => Some('+'),
+        0x6D => Some('-'),
+        0x6E => Some('.'),
+        0x6F => Some('/'),
+        _ => us_key_char(vk, shift),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +189,18 @@ mod tests {
             "Hello World Next Line"
         );
         assert_eq!(single_line("段一\n\n段二"), "段一 段二");
+    }
+
+    #[test]
+    fn key_char_covers_numpad_and_us_punctuation() {
+        assert_eq!(key_char(0x60, false), Some('0'));
+        assert_eq!(key_char(0x69, true), Some('9'));
+        assert_eq!(key_char(0x6E, false), Some('.'));
+        assert_eq!(key_char(0x6F, false), Some('/'));
+        assert_eq!(key_char(0xBC, false), Some(','));
+        assert_eq!(key_char(0x31, true), Some('!'));
+        assert_eq!(key_char(0x41, false), None);
+        assert_eq!(key_char(0x25, false), None);
     }
 
     #[test]

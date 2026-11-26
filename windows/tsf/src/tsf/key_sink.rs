@@ -144,7 +144,19 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
             {
                 log("翻译模式：此宿主不能打开草稿框，改在文档内组字");
             }
-            if self.inline.key(context, self.client_id.get(), key.0) {
+            let typed = self
+                .inline
+                .active()
+                .then(|| self.composing_text(key.0))
+                .flatten();
+            let quote = key.0 == 0xDE && typed.is_some() && !option(Flag::PunctEnglish);
+            if self.inline.key(context, self.client_id.get(), key.0, typed) {
+                if quote && !self.inline.active() {
+                    let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
+                    let mut quotes = self.quotes.get();
+                    quotes.next(if shift { '"' } else { '\'' });
+                    self.quotes.set(quotes);
+                }
                 return Ok(true.into());
             }
             // The host did not accept the composition session. Fall back to the draft box
