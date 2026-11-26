@@ -6,7 +6,9 @@
 
 ## [Unreleased]
 
-## [0.2.6]
+## [0.2.6] - 2026-11-26
+
+**升级后请重启电脑。**
 
 ### 新增
 
@@ -354,8 +356,8 @@ Linux：
 
 - 命令行工具 `yiime`（`query` 查候选、`translate` 测试翻译），提供 tar.gz 与 .deb。
 
-[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.5...HEAD
-[0.2.6]: https://github.com/leelieber2025/YiIME/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/leelieber2025/YiIME/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/leelieber2025/YiIME/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/leelieber2025/YiIME/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/leelieber2025/YiIME/compare/v0.2.2...v0.2.3
