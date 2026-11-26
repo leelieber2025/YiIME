@@ -71,6 +71,8 @@ pub struct Outcome {
     pub attempts: Vec<Attempt>,
     /// Set when a later model in the saved list produced the translation after a transient failure.
     pub fallback_hint: Option<String>,
+    /// Short success line, e.g. `模型 1 · DeepSeek-V4.1-Flash-1017 · 1.8s`.
+    pub status: Option<String>,
 }
 
 impl Attempt {
@@ -323,6 +325,7 @@ pub fn translate(settings: &ApiSettings, source: &str) -> Outcome {
             result: Err(e.to_owned()),
             attempts: Vec::new(),
             fallback_hint: None,
+            status: None,
         };
     }
     let key = cache_key(settings, source);
@@ -340,10 +343,13 @@ pub fn translate(settings: &ApiSettings, source: &str) -> Outcome {
                 result: Ok(text.to_owned()),
                 attempts: Vec::new(),
                 fallback_hint: None,
+                status: None,
             };
         }
     }
+    let started = Instant::now();
     let mut attempts = Vec::new();
+    let mut llm_slot = None;
     let llm_ok = settings.validate_llm().is_ok();
     let skip_google = fallback && engine == Engine::GoogleFree && llm_ok && google_blocked();
     // Service that produced the result, for the cache.
@@ -351,13 +357,15 @@ pub fn translate(settings: &ApiSettings, source: &str) -> Outcome {
     let mut fallback_hint = None;
     let result = if skip_google {
         provider = Engine::Llm;
-        let (result, hint) = run_llm(settings, source, &mut attempts);
+        let (result, hint, slot) = run_llm(settings, source, &mut attempts);
         fallback_hint = hint;
+        llm_slot = slot;
         result
     } else {
         let first = if engine == Engine::Llm {
-            let (result, hint) = run_llm(settings, source, &mut attempts);
+            let (result, hint, slot) = run_llm(settings, source, &mut attempts);
             fallback_hint = hint;
+            llm_slot = slot;
             result
         } else {
             run(settings, engine, source, &mut attempts)
@@ -370,8 +378,9 @@ pub fn translate(settings: &ApiSettings, source: &str) -> Outcome {
         match first {
             Err(error) if fallback && engine != Engine::Llm && llm_ok => {
                 provider = Engine::Llm;
-                let (result, hint) = run_llm(settings, source, &mut attempts);
+                let (result, hint, slot) = run_llm(settings, source, &mut attempts);
                 fallback_hint = hint;
+                llm_slot = slot;
                 result.map_err(|llm| format!("{error}；改用大模型也失败：{llm}"))
             }
             Err(error) if fallback && engine == Engine::Azure && !google_blocked() => {
@@ -392,10 +401,20 @@ pub fn translate(settings: &ApiSettings, source: &str) -> Outcome {
             .unwrap_or_else(|p| p.into_inner())
             .put(key, provider, text.clone());
     }
+    let status = result.as_ref().ok().map(|_| {
+        success_status(
+            provider,
+            llm_slot,
+            &attempts,
+            fallback_hint.as_deref(),
+            started.elapsed(),
+        )
+    });
     Outcome {
         result,
         attempts,
         fallback_hint,
+        status,
     }
 }
 
@@ -412,19 +431,74 @@ fn is_transient_llm_failure(fail: &Fail) -> bool {
         .is_some_and(|code| (500..600).contains(&code))
 }
 
-/// Wall-clock budget for trying the saved model list (each still has [`LLM_TIMEOUT`]).
+/// Wall-clock budget for trying the saved model list.
 const LLM_TOTAL_BUDGET: Duration = Duration::from_secs(30);
 const LLM_MIN_ATTEMPT: Duration = Duration::from_secs(4);
+/// When a later ready profile exists, abandon a silent or busy model after this, not the full
+/// 20 s solo timeout — otherwise a hanging primary (e.g. DeepInfra 1017 at ~16–20 s) blocks
+/// a healthy backup.
+const LLM_FALLBACK_ATTEMPT: Duration = Duration::from_secs(5);
+
+/// Last path segment of a model id (`deepseek-ai/DeepSeek-V4.1-Flash-1017` → `DeepSeek-V4.1-Flash-1017`).
+fn short_model_name(model: &str) -> &str {
+    model
+        .rsplit('/')
+        .next()
+        .filter(|part| !part.is_empty())
+        .unwrap_or(model)
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    format!("{:.1}s", elapsed.as_secs_f64())
+}
+
+fn engine_status_name(engine: Engine) -> &'static str {
+    match engine {
+        Engine::Azure => "Azure",
+        Engine::GoogleFree => "Google",
+        Engine::GoogleCloud => "Google Cloud",
+        Engine::DeepL => "DeepL",
+        Engine::Llm => "大模型",
+    }
+}
+
+/// Status shown after a successful translation: which model answered, and how long the user waited.
+fn success_status(
+    provider: Engine,
+    llm_slot: Option<usize>,
+    attempts: &[Attempt],
+    fallback_hint: Option<&str>,
+    elapsed: Duration,
+) -> String {
+    let time = format_elapsed(elapsed);
+    if provider == Engine::Llm {
+        let name = attempts
+            .iter()
+            .rev()
+            .find(|attempt| attempt.failure.is_none() && attempt.engine == Engine::Llm)
+            .map(|attempt| short_model_name(&attempt.model).to_owned())
+            .unwrap_or_else(|| "大模型".to_owned());
+        if let Some(hint) = fallback_hint {
+            format!("{hint} · {name} · {time}")
+        } else {
+            let slot = llm_slot.unwrap_or(0) + 1;
+            format!("模型 {slot} · {name} · {time}")
+        }
+    } else {
+        format!("{} · {time}", engine_status_name(provider))
+    }
+}
 
 fn run_llm(
     settings: &ApiSettings,
     source: &str,
     attempts: &mut Vec<Attempt>,
-) -> (Result<String, String>, Option<String>) {
+) -> (Result<String, String>, Option<String>, Option<usize>) {
+    let profiles = settings.llm_profiles();
     let deadline = Instant::now() + LLM_TOTAL_BUDGET;
     let mut last_error: Option<Fail> = None;
     let mut tried = false;
-    for (slot, profile) in settings.llm_profiles().into_iter().enumerate() {
+    for (slot, profile) in profiles.iter().enumerate() {
         if !profile.is_ready() {
             continue;
         }
@@ -433,7 +507,16 @@ fn run_llm(
         if last_error.is_some() && remaining < LLM_MIN_ATTEMPT {
             break;
         }
-        let timeout = LLM_TIMEOUT.min(remaining.max(LLM_MIN_ATTEMPT));
+        let has_later = profiles
+            .iter()
+            .skip(slot + 1)
+            .any(crate::LlmProfile::is_ready);
+        let cap = if has_later {
+            LLM_FALLBACK_ATTEMPT
+        } else {
+            LLM_TIMEOUT
+        };
+        let timeout = cap.min(remaining);
         let started = Instant::now();
         let mut first_byte = None;
         let result = llm(
@@ -447,6 +530,7 @@ fn run_llm(
             started,
             timeout,
             profile.disable_thinking,
+            !has_later,
         );
         attempts.push(Attempt {
             engine: Engine::Llm,
@@ -463,12 +547,12 @@ fn run_llm(
                     .is_some()
                     .then(|| crate::settings::llm_backup_hint(slot))
                     .flatten();
-                return (Ok(text), hint);
+                return (Ok(text), hint, Some(slot));
             }
             Err(fail) if is_transient_llm_failure(&fail) => {
                 last_error = Some(fail);
             }
-            Err(fail) => return (Err(fail.message), None),
+            Err(fail) => return (Err(fail.message), None, None),
         }
     }
     if !tried {
@@ -483,12 +567,13 @@ fn run_llm(
                 }
             })
             .unwrap_or_else(|| "请先在“设置”中填写 API 地址、模型和密钥".to_owned());
-        return (Err(message), None);
+        return (Err(message), None, None);
     }
     (
         Err(last_error
             .map(|fail| fail.message)
             .unwrap_or_else(|| "翻译失败".to_owned())),
+        None,
         None,
     )
 }
@@ -551,6 +636,7 @@ fn run(
                 started,
                 LLM_TIMEOUT,
                 settings.disable_thinking,
+                true,
             ),
         ),
     };
@@ -826,6 +912,7 @@ pub fn translate_openai_with(
         Instant::now(),
         LLM_TIMEOUT,
         disables_thinking(endpoint),
+        true,
     )
     .map_err(|fail| fail.message)
 }
@@ -842,6 +929,8 @@ fn llm(
     started: Instant,
     timeout: Duration,
     disable_thinking: bool,
+    // When false (a later ready profile exists), a 429 is returned immediately so fallback can start.
+    busy_retry: bool,
 ) -> Result<String, Fail> {
     if endpoint.is_empty() || model.is_empty() || key.is_empty() {
         return Err(Fail::new("config", "请填写 API 地址、模型和密钥"));
@@ -882,7 +971,7 @@ fn llm(
                 .set("Authorization", &format!("Bearer {key}"))
                 .send_json(body.clone())
             {
-                Err(ureq::Error::Status(429, response)) if attempt < BUSY_RETRIES => {
+                Err(ureq::Error::Status(429, response)) if busy_retry && attempt < BUSY_RETRIES => {
                     let delay = retry_after_delay(response.header("retry-after"))
                         .unwrap_or_else(|| busy_backoff(attempt))
                         .min(BUSY_RETRY_AFTER_MAX);
@@ -1503,6 +1592,7 @@ mod tests {
             Instant::now(),
             Duration::from_millis(100),
             false,
+            true,
         )
         .unwrap_err();
         server.join().unwrap();
@@ -2145,8 +2235,8 @@ Connection: close
 
     #[test]
     fn llm_falls_back_in_saved_order_and_sets_hint() {
-        // 1 initial + 2 short 429 retries for model-a, then model-b succeeds.
-        let (url, handle) = model_script_server(&[BUSY, BUSY, BUSY, OK]);
+        // With a backup configured, a 429 is not retried on the same model.
+        let (url, handle) = model_script_server(&[BUSY, OK]);
         let mut settings = llm_settings(&url, "model-a");
         settings.backup_llm = [
             profile(&url, "model-b", "k", false),
@@ -2155,14 +2245,14 @@ Connection: close
         let outcome = translate(&settings, "你好");
         assert_eq!(outcome.result.as_deref(), Ok("Hello"));
         assert_eq!(outcome.fallback_hint.as_deref(), Some("已切换到备用模型 2"));
+        let status = outcome.status.as_deref().unwrap();
+        assert!(
+            status.starts_with("已切换到备用模型 2 · model-b · ") && status.ends_with("s"),
+            "{status}"
+        );
         assert_eq!(
             handle.join().unwrap(),
-            vec![
-                ("model-a".into(), false),
-                ("model-a".into(), false),
-                ("model-a".into(), false),
-                ("model-b".into(), false),
-            ]
+            vec![("model-a".into(), false), ("model-b".into(), false)]
         );
     }
 
@@ -2194,7 +2284,7 @@ Connection: close
 
     #[test]
     fn reordered_profiles_change_fallback_order() {
-        let (url, handle) = model_script_server(&[BUSY, BUSY, BUSY, OK]);
+        let (url, handle) = model_script_server(&[BUSY, OK]);
         let mut settings = llm_settings(&url, "model-a");
         settings.backup_llm[0] = profile(&url, "model-b", "k", false);
         // Saved order becomes B, A: B is busy, A succeeds — hint names saved slot 2.
@@ -2207,32 +2297,129 @@ Connection: close
         assert_eq!(outcome.fallback_hint.as_deref(), Some("已切换到备用模型 2"));
         assert_eq!(
             handle.join().unwrap(),
-            vec![
-                ("model-b".into(), false),
-                ("model-b".into(), false),
-                ("model-b".into(), false),
-                ("model-a".into(), false),
-            ]
+            vec![("model-b".into(), false), ("model-a".into(), false)]
         );
     }
 
     #[test]
     fn all_models_failing_returns_the_last_error_without_a_hint() {
-        let (url, handle) = model_script_server(&[BUSY, BUSY, BUSY, FAIL5]);
+        let (url, handle) = model_script_server(&[BUSY, FAIL5]);
         let mut settings = llm_settings(&url, "a");
         settings.backup_llm[0] = profile(&url, "b", "k", false);
         let outcome = translate(&settings, "你好");
         let error = outcome.result.unwrap_err();
         assert!(error.contains("HTTP 503"), "{error}");
         assert!(outcome.fallback_hint.is_none());
+        assert!(outcome.status.is_none());
+        assert_eq!(
+            handle.join().unwrap(),
+            vec![("a".into(), false), ("b".into(), false)]
+        );
+    }
+
+    #[test]
+    fn short_model_name_strips_provider_prefix() {
+        assert_eq!(
+            short_model_name("deepseek-ai/DeepSeek-V4.1-Flash-1017"),
+            "DeepSeek-V4.1-Flash-1017"
+        );
+        assert_eq!(short_model_name("deepseek-v4-flash"), "deepseek-v4-flash");
+        assert_eq!(format_elapsed(Duration::from_millis(1800)), "1.8s");
+        assert_eq!(format_elapsed(Duration::from_millis(15900)), "15.9s");
+        assert_eq!(
+            success_status(
+                Engine::Llm,
+                Some(0),
+                &[Attempt {
+                    engine: Engine::Llm,
+                    model: "deepseek-ai/DeepSeek-V4.1-Flash-1017".into(),
+                    host: "api.deepinfra.com".into(),
+                    first_byte_ms: Some(15891),
+                    total_ms: 15900,
+                    chars: 14,
+                    failure: None,
+                }],
+                None,
+                Duration::from_millis(15900),
+            ),
+            "模型 1 · DeepSeek-V4.1-Flash-1017 · 15.9s"
+        );
+        assert_eq!(
+            success_status(
+                Engine::Llm,
+                Some(1),
+                &[Attempt {
+                    engine: Engine::Llm,
+                    model: "deepseek-v4-flash".into(),
+                    host: "api.deepseek.com".into(),
+                    first_byte_ms: Some(1254),
+                    total_ms: 1263,
+                    chars: 9,
+                    failure: None,
+                }],
+                Some("已切换到备用模型 2"),
+                Duration::from_millis(6300),
+            ),
+            "已切换到备用模型 2 · deepseek-v4-flash · 6.3s"
+        );
+    }
+
+    #[test]
+    fn solo_profile_still_retries_429() {
+        let (url, handle) = model_script_server(&[BUSY, BUSY, OK]);
+        let settings = llm_settings(&url, "only");
+        let outcome = translate(&settings, "你好");
+        assert_eq!(outcome.result.as_deref(), Ok("Hello"));
+        assert!(outcome.fallback_hint.is_none());
+        let status = outcome.status.as_deref().unwrap();
+        assert!(
+            status.starts_with("模型 1 · only · ") && status.ends_with("s"),
+            "{status}"
+        );
         assert_eq!(
             handle.join().unwrap(),
             vec![
-                ("a".into(), false),
-                ("a".into(), false),
-                ("a".into(), false),
-                ("b".into(), false),
+                ("only".into(), false),
+                ("only".into(), false),
+                ("only".into(), false),
             ]
         );
+    }
+
+    #[test]
+    fn hanging_primary_falls_back_before_the_solo_timeout() {
+        let primary = TcpListener::bind("127.0.0.1:0").unwrap();
+        let primary_url = format!(
+            "http://{}/v1/chat/completions",
+            primary.local_addr().unwrap()
+        );
+        let hang = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = primary.accept() {
+                // Keep the socket open until the client gives up (fallback timeout).
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(15)));
+                let mut buf = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut stream, &mut buf);
+            }
+        });
+        let (backup_url, handle) = model_script_server(&[OK]);
+        let mut settings = llm_settings(&primary_url, "slow");
+        settings.backup_llm[0] = profile(&backup_url, "fast", "k", false);
+        let started = Instant::now();
+        let outcome = translate(&settings, "你好");
+        let elapsed = started.elapsed();
+        assert_eq!(outcome.result.as_deref(), Ok("Hello"));
+        assert_eq!(outcome.fallback_hint.as_deref(), Some("已切换到备用模型 2"));
+        assert_eq!(outcome.attempts[0].failure.as_deref(), Some("timeout"));
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "fallback waited {elapsed:?}, expected under 10s"
+        );
+        assert!(
+            outcome.attempts[0].total_ms < 10_000,
+            "primary attempt {}ms",
+            outcome.attempts[0].total_ms
+        );
+        assert_eq!(handle.join().unwrap(), vec![("fast".into(), false)]);
+        hang.join().unwrap();
     }
 }

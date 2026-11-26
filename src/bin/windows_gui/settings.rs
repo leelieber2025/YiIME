@@ -25,7 +25,7 @@ pub(super) unsafe fn open_settings(owner: HWND) {
         left: 0,
         top: 0,
         right: scale_px(720, dpi),
-        bottom: scale_px(900, dpi),
+        bottom: scale_px(640, dpi),
     };
     unsafe {
         AdjustWindowRectExForDpi(&mut rect, style, 0, ex_style, dpi);
@@ -151,8 +151,8 @@ struct SettingsMetrics {
 fn settings_metrics(font: HFONT, dpi: u32) -> SettingsMetrics {
     let font_h = font_height(font).max(1);
     SettingsMetrics {
-        margin: scale_px(16, dpi),
-        gutter: scale_px(16, dpi),
+        margin: scale_px(12, dpi),
+        gutter: scale_px(12, dpi),
         label_h: font_h + scale_px(2, dpi),
         edit_h: font_h + scale_px(8, dpi),
         btn_h: font_h + scale_px(12, dpi),
@@ -160,7 +160,7 @@ fn settings_metrics(font: HFONT, dpi: u32) -> SettingsMetrics {
         combo_extra: metric_for_dpi(SM_CXVSCROLL, dpi).max(scale_px(16, dpi)) + scale_px(12, dpi),
         combo_list_h: font_h * 10 + scale_px(8, dpi),
         label_gap: scale_px(2, dpi),
-        row_gap: scale_px(8, dpi),
+        row_gap: scale_px(6, dpi),
         tight_gap: scale_px(2, dpi),
         btn_pad: scale_px(8, dpi),
     }
@@ -204,25 +204,15 @@ impl SettingsLayout {
 
         let mut preferred = m.margin * 2 + col * 2 + m.gutter;
         for (text, extra) in [
-            (
-                "DeepL 密钥（加密保存；以 :fx 结尾为免费版，译文为美式英文）",
-                m.btn_pad,
-            ),
-            ("模型 1 API 地址（OpenAI 兼容）", m.btn_pad),
+            ("DeepL 密钥（:fx 为免费版）", m.btn_pad),
+            ("API 地址（OpenAI 兼容）", m.btn_pad),
             (
                 "关闭思考（更快；接口不支持时会自动去掉该参数）",
                 m.check_extra,
             ),
-            ("模型 3（可选）", m.btn_pad),
-            (
-                "自定义要求（可选，追加到翻译提示词，例如“保留产品名不翻译”）",
-                m.btn_pad,
-            ),
+            ("自定义要求", m.btn_pad),
             ("普通五笔模式（不翻译，选字直接上屏）", m.check_extra),
-            (
-                "切换快捷键（如 Ctrl+Shift+Space；重新切到本输入法后生效）",
-                m.btn_pad,
-            ),
+            ("切换快捷键", m.btn_pad),
             (
                 "输入记忆：保存翻译过的中文，快捷键找回重新编辑/翻译",
                 m.check_extra,
@@ -253,14 +243,14 @@ impl SettingsLayout {
         preferred = preferred.max(m.margin * 2 + scale_label_w + m.gutter + scale_combo);
 
         let move_w = (text_cx(font, "上移") + m.btn_pad * 2).max(scale_px(52, dpi));
-        preferred = preferred.max(
-            m.margin * 2
-                + text_cx(font, "模型 3（可选）")
-                + m.btn_pad
-                + m.gutter
-                + move_w * 2
-                + m.gutter / 2,
-        );
+        let tab_row = (0..LLM_PROFILE_COUNT)
+            .map(|index| text_cx(font, llm_profile_title(index)) + m.btn_pad * 2)
+            .sum::<i32>()
+            + m.gutter / 2 * (LLM_PROFILE_COUNT as i32 - 1)
+            + m.gutter
+            + move_w * 2
+            + m.gutter / 2;
+        preferred = preferred.max(m.margin * 2 + tab_row);
 
         let words_w = text_cx(font, "用户词库…") + m.btn_pad * 2;
         let save_w = (text_cx(font, "保存") + m.btn_pad * 2).max(scale_px(80, dpi));
@@ -295,69 +285,155 @@ impl SettingsLayout {
         place(SETTINGS_AZURE_REGION, right, y, col_w, m.edit_h);
         y += m.edit_h + m.row_gap;
 
-        place(LBL_DEEPL, left, y, full_w, m.label_h);
-        y += m.label_h + m.label_gap;
-        place(SETTINGS_DEEPL_KEY, left, y, col_w, m.edit_h);
+        let deepl_label_w = text_cx(font, "DeepL 密钥（:fx 为免费版）") + m.btn_pad;
+        place(
+            LBL_DEEPL,
+            left,
+            y + (m.edit_h - m.label_h) / 2,
+            deepl_label_w.min(col_w),
+            m.label_h,
+        );
+        let deepl_edit_x = left + deepl_label_w.min(col_w) + m.gutter / 2;
+        place(
+            SETTINGS_DEEPL_KEY,
+            deepl_edit_x,
+            y,
+            (left + col_w - deepl_edit_x).max(scale_px(80, dpi)),
+            m.edit_h,
+        );
         place(SETTINGS_FALLBACK, right, y, col_w, m.edit_h);
         y += m.edit_h + m.row_gap;
 
         let move_w = (text_cx(font, "上移") + m.btn_pad * 2).max(scale_px(52, dpi));
-        for index in 0..LLM_PROFILE_COUNT {
-            let title = if index == 0 {
-                "模型 1"
-            } else {
-                // Labels are static; 2 and 3 are optional backups.
-                if index == 1 {
-                    "模型 2（可选）"
-                } else {
-                    "模型 3（可选）"
-                }
-            };
-            let title_w = text_cx(font, title) + m.btn_pad;
+        let down_x = left + full_w - move_w;
+        let up_x = down_x - m.gutter / 2 - move_w;
+        let tab_area = (up_x - m.gutter / 2 - left).max(scale_px(180, dpi));
+        let tab_gap = m.gutter / 2;
+        let tab_w = ((tab_area - tab_gap * (LLM_PROFILE_COUNT as i32 - 1))
+            / LLM_PROFILE_COUNT as i32)
+            .max(scale_px(64, dpi));
+        for (index, id) in SETTINGS_LLM_TAB.iter().enumerate() {
             place(
-                LBL_LLM_PROFILE[index],
+                *id,
+                left + index as i32 * (tab_w + tab_gap),
+                y,
+                tab_w,
+                m.btn_h,
+            );
+        }
+        place(SETTINGS_LLM_UP, up_x, y, move_w, m.btn_h);
+        place(SETTINGS_LLM_DOWN, down_x, y, move_w, m.btn_h);
+        y += m.btn_h + m.tight_gap;
+
+        // All three profile field groups share the same coordinates; only the selected tab is shown.
+        let url_label_w = text_cx(font, "API 地址") + m.btn_pad;
+        let model_label_w = text_cx(font, "模型") + m.btn_pad;
+        let key_label_w = text_cx(font, "API 密钥") + m.btn_pad;
+        let fields_top = y;
+        for index in 0..LLM_PROFILE_COUNT {
+            let mut fy = fields_top;
+            place(
+                LBL_LLM_URL[index],
                 left,
-                y + (m.btn_h - m.label_h) / 2,
-                title_w,
+                fy + (m.edit_h - m.label_h) / 2,
+                url_label_w,
                 m.label_h,
             );
-            let down_x = left + full_w - move_w;
-            let up_x = down_x - m.gutter / 2 - move_w;
-            place(SETTINGS_LLM_UP[index], up_x, y, move_w, m.btn_h);
-            place(SETTINGS_LLM_DOWN[index], down_x, y, move_w, m.btn_h);
-            y += m.btn_h.max(m.label_h) + m.label_gap;
+            place(
+                SETTINGS_LLM_URL[index],
+                left + url_label_w + m.gutter / 2,
+                fy,
+                (full_w - url_label_w - m.gutter / 2).max(scale_px(80, dpi)),
+                m.edit_h,
+            );
+            fy += m.edit_h + m.tight_gap;
 
-            place(LBL_LLM_URL[index], left, y, full_w, m.label_h);
-            y += m.label_h + m.label_gap;
-            place(SETTINGS_LLM_URL[index], left, y, full_w, m.edit_h);
-            y += m.edit_h + m.row_gap;
-
-            place(LBL_LLM_MODEL[index], left, y, col_w, m.label_h);
-            place(LBL_LLM_KEY[index], right, y, col_w, m.label_h);
-            y += m.label_h + m.label_gap;
-            place(SETTINGS_LLM_MODEL[index], left, y, col_w, m.edit_h);
-            place(SETTINGS_LLM_KEY[index], right, y, col_w, m.edit_h);
-            y += m.edit_h + m.tight_gap;
-            place(SETTINGS_LLM_THINK[index], left, y, full_w, m.edit_h);
-            y += m.edit_h + m.row_gap;
+            place(
+                LBL_LLM_MODEL[index],
+                left,
+                fy + (m.edit_h - m.label_h) / 2,
+                model_label_w,
+                m.label_h,
+            );
+            let model_x = left + model_label_w + m.gutter / 2;
+            let model_w = (left + col_w - model_x).max(scale_px(60, dpi));
+            place(SETTINGS_LLM_MODEL[index], model_x, fy, model_w, m.edit_h);
+            place(
+                LBL_LLM_KEY[index],
+                right,
+                fy + (m.edit_h - m.label_h) / 2,
+                key_label_w,
+                m.label_h,
+            );
+            let key_x = right + key_label_w + m.gutter / 2;
+            place(
+                SETTINGS_LLM_KEY[index],
+                key_x,
+                fy,
+                (left + full_w - key_x).max(scale_px(60, dpi)),
+                m.edit_h,
+            );
+            fy += m.edit_h + m.tight_gap;
+            place(SETTINGS_LLM_THINK[index], left, fy, full_w, m.edit_h);
+            fy += m.edit_h;
+            if index == 0 {
+                y = fy + m.row_gap;
+            }
         }
 
-        place(LBL_STYLE, left, y, col_w, m.label_h);
-        y += m.label_h + m.label_gap;
-        place(SETTINGS_STYLE, left, y, col_w, m.combo_list_h);
+        let style_label_w = text_cx(font, "翻译风格") + m.btn_pad;
+        place(
+            LBL_STYLE,
+            left,
+            y + (m.edit_h - m.label_h) / 2,
+            style_label_w,
+            m.label_h,
+        );
+        let style_x = left + style_label_w + m.gutter / 2;
+        place(
+            SETTINGS_STYLE,
+            style_x,
+            y,
+            (left + col_w - style_x).max(scale_px(80, dpi)),
+            m.combo_list_h,
+        );
+        place(SETTINGS_PLAIN, right, y, col_w, m.edit_h);
+        y += m.edit_h.max(m.btn_h) + m.row_gap;
+
+        let custom_label_w = text_cx(font, "自定义要求") + m.btn_pad;
+        place(
+            LBL_CUSTOM,
+            left,
+            y + (m.edit_h - m.label_h) / 2,
+            custom_label_w,
+            m.label_h,
+        );
+        place(
+            SETTINGS_CUSTOM,
+            left + custom_label_w + m.gutter / 2,
+            y,
+            (full_w - custom_label_w - m.gutter / 2).max(scale_px(80, dpi)),
+            m.edit_h,
+        );
         y += m.edit_h + m.row_gap;
 
-        place(LBL_CUSTOM, left, y, full_w, m.label_h);
-        y += m.label_h + m.label_gap;
-        place(SETTINGS_CUSTOM, left, y, full_w, m.edit_h);
-        y += m.edit_h + m.row_gap;
+        let hotkey_label_w = text_cx(font, "切换快捷键") + m.btn_pad;
+        place(
+            LBL_HOTKEY,
+            left,
+            y + (m.edit_h - m.label_h) / 2,
+            hotkey_label_w,
+            m.label_h,
+        );
+        let hotkey_x = left + hotkey_label_w + m.gutter / 2;
+        place(
+            SETTINGS_HOTKEY,
+            hotkey_x,
+            y,
+            (left + col_w - hotkey_x).max(scale_px(80, dpi)),
+            m.edit_h,
+        );
 
-        place(SETTINGS_PLAIN, left, y, full_w, m.edit_h);
-        y += m.edit_h + m.row_gap;
-
-        place(LBL_HOTKEY, left, y, full_w, m.label_h);
-        y += m.label_h + m.label_gap;
-        place(SETTINGS_HOTKEY, left, y, col_w, m.edit_h);
         let page_label_w = text_cx(font, "每页候选数（1–9）") + m.btn_pad;
         let page_edit_w = scale_px(48, dpi);
         place(
@@ -585,6 +661,7 @@ fn relayout_settings(hwnd: HWND, state: &State) {
     state.settings_dpi.set(dpi);
     sync_settings_scroll(hwnd, state, layout.min_h, client.bottom);
     apply_settings_layout(hwnd, &layout, state.settings_scroll.get());
+    apply_llm_tab(hwnd, state);
     unsafe {
         InvalidateRect(hwnd, null(), 1);
     }
@@ -616,6 +693,55 @@ fn add_control(parent: HWND, class: &str, text: &str, style: u32, id: i32) -> HW
 
 fn add_label(parent: HWND, text: &str, id: i32) -> HWND {
     add_control(parent, "STATIC", text, 0x80, id)
+}
+
+fn llm_profile_title(index: usize) -> &'static str {
+    match index {
+        0 => "模型 1",
+        1 => "模型 2（可选）",
+        _ => "模型 3（可选）",
+    }
+}
+
+fn llm_profile_field_ids(index: usize) -> [i32; 7] {
+    [
+        LBL_LLM_URL[index],
+        SETTINGS_LLM_URL[index],
+        LBL_LLM_MODEL[index],
+        SETTINGS_LLM_MODEL[index],
+        LBL_LLM_KEY[index],
+        SETTINGS_LLM_KEY[index],
+        SETTINGS_LLM_THINK[index],
+    ]
+}
+
+fn apply_llm_tab(hwnd: HWND, state: &State) {
+    let selected = state.settings_llm_tab.get().min(LLM_PROFILE_COUNT - 1);
+    state.settings_llm_tab.set(selected);
+    unsafe {
+        for (index, tab) in SETTINGS_LLM_TAB.iter().enumerate() {
+            let show = if index == selected { SW_SHOW } else { SW_HIDE };
+            for id in llm_profile_field_ids(index) {
+                ShowWindow(GetDlgItem(hwnd, id), show);
+            }
+            SendMessageW(
+                GetDlgItem(hwnd, *tab),
+                BM_SETCHECK,
+                (index == selected) as usize,
+                0,
+            );
+        }
+        EnableWindow(GetDlgItem(hwnd, SETTINGS_LLM_UP), (selected > 0) as i32);
+        EnableWindow(
+            GetDlgItem(hwnd, SETTINGS_LLM_DOWN),
+            (selected + 1 < LLM_PROFILE_COUNT) as i32,
+        );
+    }
+}
+
+fn select_llm_tab(hwnd: HWND, state: &State, index: usize) {
+    state.settings_llm_tab.set(index.min(LLM_PROFILE_COUNT - 1));
+    apply_llm_tab(hwnd, state);
 }
 
 fn read_llm_profile(hwnd: HWND, index: usize, field: &impl Fn(i32) -> String) -> LlmProfile {
@@ -685,6 +811,7 @@ pub(super) unsafe extern "system" fn settings_proc(
             }
             state.settings_dpi.set(dpi);
             state.settings_scroll.set(0);
+            state.settings_llm_tab.set(0);
 
             add_label(hwnd, "翻译引擎", LBL_ENGINE);
             let _engine = add_control(
@@ -735,11 +862,7 @@ pub(super) unsafe extern "system" fn settings_proc(
                 ES_AUTOHSCROLL as u32 | WS_TABSTOP,
                 SETTINGS_AZURE_REGION,
             );
-            add_label(
-                hwnd,
-                "DeepL 密钥（加密保存；以 :fx 结尾为免费版，译文为美式英文）",
-                LBL_DEEPL,
-            );
+            add_label(hwnd, "DeepL 密钥（:fx 为免费版）", LBL_DEEPL);
             add_control(
                 hwnd,
                 "EDIT",
@@ -756,39 +879,34 @@ pub(super) unsafe extern "system" fn settings_proc(
             );
             SendMessageW(fallback, BM_SETCHECK, settings.allow_fallback as usize, 0);
 
+            add_control(
+                hwnd,
+                "BUTTON",
+                "上移",
+                BS_PUSHBUTTON as u32 | WS_TABSTOP,
+                SETTINGS_LLM_UP,
+            );
+            add_control(
+                hwnd,
+                "BUTTON",
+                "下移",
+                BS_PUSHBUTTON as u32 | WS_TABSTOP,
+                SETTINGS_LLM_DOWN,
+            );
             let profiles = settings.llm_profiles();
             for (index, profile) in profiles.iter().enumerate() {
-                let title = if index == 0 {
-                    "模型 1"
-                } else if index == 1 {
-                    "模型 2（可选）"
-                } else {
-                    "模型 3（可选）"
-                };
-                add_label(hwnd, title, LBL_LLM_PROFILE[index]);
+                let mut tab_style = BS_AUTORADIOBUTTON as u32 | BS_PUSHLIKE as u32 | WS_TABSTOP;
+                if index == 0 {
+                    tab_style |= WS_GROUP;
+                }
                 add_control(
                     hwnd,
                     "BUTTON",
-                    "上移",
-                    BS_PUSHBUTTON as u32 | WS_TABSTOP,
-                    SETTINGS_LLM_UP[index],
+                    llm_profile_title(index),
+                    tab_style,
+                    SETTINGS_LLM_TAB[index],
                 );
-                add_control(
-                    hwnd,
-                    "BUTTON",
-                    "下移",
-                    BS_PUSHBUTTON as u32 | WS_TABSTOP,
-                    SETTINGS_LLM_DOWN[index],
-                );
-                add_label(
-                    hwnd,
-                    if index == 0 {
-                        "API 地址（OpenAI 兼容）"
-                    } else {
-                        "API 地址（可选）"
-                    },
-                    LBL_LLM_URL[index],
-                );
+                add_label(hwnd, "API 地址", LBL_LLM_URL[index]);
                 add_control(
                     hwnd,
                     "EDIT",
@@ -804,7 +922,7 @@ pub(super) unsafe extern "system" fn settings_proc(
                     ES_AUTOHSCROLL as u32 | WS_TABSTOP,
                     SETTINGS_LLM_MODEL[index],
                 );
-                add_label(hwnd, "API 密钥（Windows 加密保存）", LBL_LLM_KEY[index]);
+                add_label(hwnd, "API 密钥", LBL_LLM_KEY[index]);
                 add_control(
                     hwnd,
                     "EDIT",
@@ -842,11 +960,7 @@ pub(super) unsafe extern "system" fn settings_proc(
                 .position(|style| *style == settings.style)
                 .unwrap_or(0);
             SendMessageW(combo, CB_SETCURSEL, selected, 0);
-            add_label(
-                hwnd,
-                "自定义要求（可选，追加到翻译提示词，例如“保留产品名不翻译”）",
-                LBL_CUSTOM,
-            );
+            add_label(hwnd, "自定义要求", LBL_CUSTOM);
             add_control(
                 hwnd,
                 "EDIT",
@@ -862,11 +976,7 @@ pub(super) unsafe extern "system" fn settings_proc(
                 SETTINGS_PLAIN,
             );
             SendMessageW(plain, BM_SETCHECK, plain_mode() as usize, 0);
-            add_label(
-                hwnd,
-                "切换快捷键（如 Ctrl+Shift+Space；重新切到本输入法后生效）",
-                LBL_HOTKEY,
-            );
+            add_label(hwnd, "切换快捷键", LBL_HOTKEY);
             add_control(
                 hwnd,
                 "EDIT",
@@ -1107,15 +1217,22 @@ pub(super) unsafe extern "system" fn settings_proc(
         }
         WM_COMMAND => unsafe {
             let command_id = (w & 0xffff) as i32;
-            if let Some(index) = SETTINGS_LLM_UP.iter().position(|id| *id == command_id) {
-                if index > 0 {
-                    swap_llm_profile_fields(hwnd, index - 1, index);
+            if let Some(index) = SETTINGS_LLM_TAB.iter().position(|id| *id == command_id) {
+                if let Some(state) = state_of(owner) {
+                    select_llm_tab(hwnd, state, index);
                 }
                 return 0;
             }
-            if let Some(index) = SETTINGS_LLM_DOWN.iter().position(|id| *id == command_id) {
-                if index + 1 < LLM_PROFILE_COUNT {
-                    swap_llm_profile_fields(hwnd, index, index + 1);
+            if command_id == SETTINGS_LLM_UP || command_id == SETTINGS_LLM_DOWN {
+                if let Some(state) = state_of(owner) {
+                    let index = state.settings_llm_tab.get();
+                    if command_id == SETTINGS_LLM_UP && index > 0 {
+                        swap_llm_profile_fields(hwnd, index - 1, index);
+                        select_llm_tab(hwnd, state, index - 1);
+                    } else if command_id == SETTINGS_LLM_DOWN && index + 1 < LLM_PROFILE_COUNT {
+                        swap_llm_profile_fields(hwnd, index, index + 1);
+                        select_llm_tab(hwnd, state, index + 1);
+                    }
                 }
                 return 0;
             }

@@ -263,13 +263,14 @@ const SETTINGS_FALLBACK: i32 = 231;
 const SETTINGS_SCHEME: i32 = 232;
 const SETTINGS_IMPORT: i32 = 233;
 /// Ordered LLM profiles in the settings window (slot 0 reuses SETTINGS_URL / MODEL / KEY).
+/// One profile is shown at a time; `SETTINGS_LLM_TAB` switches among them.
 const SETTINGS_LLM_URL: [i32; 3] = [SETTINGS_URL, 255, 263];
 const SETTINGS_LLM_MODEL: [i32; 3] = [SETTINGS_MODEL, 256, 264];
 const SETTINGS_LLM_KEY: [i32; 3] = [SETTINGS_KEY, 257, 265];
 const SETTINGS_LLM_THINK: [i32; 3] = [235, 258, 266];
-const SETTINGS_LLM_UP: [i32; 3] = [236, 270, 272];
-const SETTINGS_LLM_DOWN: [i32; 3] = [237, 271, 273];
-const LBL_LLM_PROFILE: [i32; 3] = [260, 262, 269];
+const SETTINGS_LLM_UP: i32 = 236;
+const SETTINGS_LLM_DOWN: i32 = 237;
+const SETTINGS_LLM_TAB: [i32; 3] = [260, 262, 269];
 const LBL_LLM_URL: [i32; 3] = [245, 274, 277];
 const LBL_LLM_MODEL: [i32; 3] = [246, 275, 278];
 const LBL_LLM_KEY: [i32; 3] = [247, 276, 279];
@@ -389,6 +390,8 @@ struct State {
     /// Minimum client size that fits every label (unscrolled content height).
     settings_min: Cell<(i32, i32)>,
     settings_scroll: Cell<i32>,
+    /// Which LLM profile tab is visible in the settings window (0..LLM_PROFILE_COUNT).
+    settings_llm_tab: Cell<usize>,
     /// Screen rectangle of the target's text cursor; the box is placed against it.
     anchor: Cell<RECT>,
     /// Cursor rectangle sent by the TSF DLL before activation.
@@ -454,7 +457,7 @@ struct TranslationResult {
     generation: u64,
     source: String,
     result: Result<String, String>,
-    hint: Option<String>,
+    status: Option<String>,
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -1747,15 +1750,15 @@ unsafe fn submit(hwnd: HWND, state: &State, chinese: bool) {
             for attempt in &outcome.attempts {
                 translate_log(attempt);
             }
-            (outcome.result, outcome.fallback_hint)
+            (outcome.result, outcome.status)
         })
         .unwrap_or_else(|_| (Err("翻译处理出错，请重试".into()), None));
-        let (result, hint) = result;
+        let (result, status) = result;
         let response = TranslationResult {
             generation,
             source: draft,
             result,
-            hint,
+            status,
         };
         if response_tx.send(response).is_ok() {
             unsafe { PostMessageW(window as HWND, WM_TRANSLATED, 0, 0) };
@@ -2017,9 +2020,9 @@ unsafe fn on_translated(hwnd: HWND, state: &State, response: TranslationResult) 
     }
     match response.result {
         Ok(english) => unsafe {
-            if let Some(hint) = response.hint {
-                service_log(&hint);
-                set_status(hwnd, state, Some((hint, false)));
+            if let Some(status) = response.status {
+                service_log(&status);
+                set_status(hwnd, state, Some((status, false)));
             } else {
                 *state.status.borrow_mut() = None;
             }
@@ -2784,6 +2787,7 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
             settings_dpi: Cell::new(0),
             settings_min: Cell::new((0, 0)),
             settings_scroll: Cell::new(0),
+            settings_llm_tab: Cell::new(0),
             anchor: Cell::new(caret_of(target)),
             pending_anchor: Cell::new(None),
             target: Cell::new(target),
