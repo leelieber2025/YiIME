@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+## [0.2.5] - 2026-11-25
+
+**升级后请重启电脑。**
+
 ### 修复
 
 - 普通五笔在文档内组字时，按标点、数字小键盘会先上屏首选再输入该符号，方向键不再把光标移出组字。
@@ -329,7 +333,8 @@ Linux：
 
 - 命令行工具 `yiime`（`query` 查候选、`translate` 测试翻译），提供 tar.gz 与 .deb。
 
-[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.4...HEAD
+[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/leelieber2025/YiIME/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/leelieber2025/YiIME/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/leelieber2025/YiIME/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/leelieber2025/YiIME/compare/v0.2.1...v0.2.2
