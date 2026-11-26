@@ -149,7 +149,11 @@ impl ITfKeyEventSink_Impl for TextService_Impl {
                 .active()
                 .then(|| self.composing_text(key.0))
                 .flatten();
-            let quote = key.0 == 0xDE && typed.is_some() && !option(Flag::PunctEnglish);
+            // Unshifted `'` is a pinyin separator or a candidate pick, not a quote, so it must
+            // not advance the quote pair. Shift+`'` is the double quote and does.
+            let shift_quote = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;
+            let quote =
+                key.0 == 0xDE && shift_quote && typed.is_some() && !option(Flag::PunctEnglish);
             if self.inline.key(context, self.client_id.get(), key.0, typed) {
                 if quote && !self.inline.active() {
                     let shift = unsafe { GetKeyState(VK_SHIFT as i32) } < 0;

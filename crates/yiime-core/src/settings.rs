@@ -250,6 +250,12 @@ impl<S: OptionStore> Options<S> {
 }
 
 /// Monitor DPI after the composition-window scale. 100% returns `dpi` (at least 96).
+/// Scale to write on save. `None` when the control is still the value this window opened with,
+/// so a second settings window does not put an older percent back over a newer one.
+pub fn ui_scale_to_write(opened: u32, selected: u32) -> Option<u32> {
+    (selected != opened).then_some(selected)
+}
+
 pub fn scaled_dpi(dpi: u32, percent: u32) -> u32 {
     let percent = if UI_SCALES.contains(&percent) {
         percent
@@ -868,6 +874,8 @@ mod tests {
         assert_eq!(scaled_dpi(96, 200), 192);
         assert_eq!(scaled_dpi(120, 150), 180);
         assert_eq!(scaled_dpi(80, 130), 96);
+        assert_eq!(ui_scale_to_write(100, 100), None);
+        assert_eq!(ui_scale_to_write(100, 200), Some(200));
         assert_eq!(parse_page_size(" 12 "), Ok(9));
         assert_eq!(parse_page_size("0"), Ok(1));
         assert!(parse_page_size("x").is_err());

@@ -16,7 +16,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 use yiime_core::inline_ui::{
     CandidateView, DisplayCandidate, HitTarget, InlineKey, InlineKeyOutcome, LogicalInline,
-    build_candidates,
+    build_candidates, layout_candidate_bar,
 };
 
 const CANDIDATE_GUID: GUID = GUID::from_u128(0xd39fb88b_09bb_4ca2_a050_174b5ab3b7c0);
@@ -114,11 +114,12 @@ struct BarLayout {
     hint_y: i32,
     pill_top: i32,
     pill_bottom: i32,
-    items: Vec<(i32, i32)>,
+    items: Vec<(i32, i32, i32)>,
     divider_x: i32,
-    prev_x: i32,
-    next_x: i32,
-    icon_x: i32,
+    prev: (i32, i32),
+    next: (i32, i32),
+    icon: (i32, i32),
+    row_h: i32,
     radius: i32,
 }
 
@@ -167,6 +168,7 @@ fn layout_bar(
     small: HFONT,
     view: &CandidateView,
     dpi: u32,
+    max_width: i32,
 ) -> BarLayout {
     let (text_h, small_h, height) = measure_fonts(hdc, font, small, dpi);
     let pad_x = scale_px(PAD_X, dpi);
@@ -178,53 +180,81 @@ fn layout_bar(
     let hint_y = (height - small_h) / 2 + scale_px(1, dpi);
     let pill_top = pad_y.max(1);
     let pill_bottom = height - pad_y.max(1);
-    let items_on_page = view.page_items();
-    let mut x = pad_x;
-    let mut items = Vec::new();
-    for (index, row) in items_on_page.iter().enumerate() {
-        let w = item_width(hdc, font, small, index, row, dpi);
-        items.push((x, w));
-        x += w + gap;
-    }
-    if items.is_empty() {
-        x += scale_px(24, dpi);
-    }
-    // divider + ◀ + ▶ + menu icon, as in the Win11 Wubi bar.
-    let divider_x = x - gap / 2 + scale_px(2, dpi);
-    x = divider_x + scale_px(8, dpi);
-    let prev_x = x;
-    x += slot;
-    let next_x = x;
-    x += slot;
-    let icon_x = x;
-    x += slot + pad_x;
-    BarLayout {
-        width: x.max(scale_px(80, dpi)),
+    let widths: Vec<i32> = view
+        .page_items()
+        .iter()
+        .enumerate()
+        .map(|(index, row)| item_width(hdc, font, small, index, row, dpi))
+        .collect();
+    // Same trail as the old single row: a short gap, the divider, then ◀ ▶ and the menu.
+    let before_buttons = gap / 2 + scale_px(2, dpi) + scale_px(8, dpi);
+    let placed = layout_candidate_bar(
+        &widths,
         height,
+        gap,
+        pad_x,
+        slot,
+        before_buttons,
+        max_width.max(scale_px(80, dpi)),
+    );
+    BarLayout {
+        width: placed.width.max(scale_px(80, dpi)),
+        height: placed.height,
         text_y,
         hint_y,
         pill_top,
         pill_bottom,
-        items,
-        divider_x,
-        prev_x,
-        next_x,
-        icon_x,
+        items: placed
+            .items
+            .iter()
+            .map(|slot| (slot.x, slot.y, slot.w))
+            .collect(),
+        divider_x: placed.divider_x,
+        prev: (placed.prev.x, placed.prev.y),
+        next: (placed.next.x, placed.next.y),
+        icon: (placed.menu.x, placed.menu.y),
+        row_h: placed.row_h,
         radius,
+    }
+}
+
+fn monitor_work_width(hwnd: HWND) -> i32 {
+    unsafe {
+        let monitor = windows_sys::Win32::Graphics::Gdi::MonitorFromWindow(
+            hwnd,
+            windows_sys::Win32::Graphics::Gdi::MONITOR_DEFAULTTONEAREST,
+        );
+        let mut info: windows_sys::Win32::Graphics::Gdi::MONITORINFO = std::mem::zeroed();
+        info.cbSize = std::mem::size_of::<windows_sys::Win32::Graphics::Gdi::MONITORINFO>() as u32;
+        if windows_sys::Win32::Graphics::Gdi::GetMonitorInfoW(monitor, &mut info) != 0 {
+            (info.rcWork.right - info.rcWork.left - 2).max(1)
+        } else {
+            4096
+        }
     }
 }
 
 fn store_hit_spans(view: &mut CandidateView, layout: &BarLayout, dpi: u32) {
     let pill = scale_px(PILL_PAD_X, dpi);
     let slot = scale_px(TRAIL_SLOT, dpi);
-    view.item_spans = layout
+    let items: Vec<(i32, i32, i32, i32)> = layout
         .items
         .iter()
-        .map(|&(x, w)| (x - pill, x + w + pill))
+        .map(|&(x, y, w)| (x - pill, y, x + w + pill, y + layout.row_h))
         .collect();
-    view.prev_span = (layout.prev_x, layout.prev_x + slot);
-    view.next_span = (layout.next_x, layout.next_x + slot);
-    view.bar_height = layout.height;
+    let prev = (
+        layout.prev.0,
+        layout.prev.1,
+        layout.prev.0 + slot,
+        layout.prev.1 + layout.row_h,
+    );
+    let next = (
+        layout.next.0,
+        layout.next.1,
+        layout.next.0 + slot,
+        layout.next.1 + layout.row_h,
+    );
+    view.publish_click_rects(&items, prev, next, layout.height);
 }
 
 fn measure_view(hwnd: HWND, view: &mut CandidateView) -> (i32, i32) {
@@ -235,7 +265,7 @@ fn measure_view(hwnd: HWND, view: &mut CandidateView) -> (i32, i32) {
     }
     let font = unsafe { create_font(scale_px(FONT_PX, dpi)) };
     let small = unsafe { create_font(scale_px(SMALL_FONT_PX, dpi)) };
-    let layout = layout_bar(hdc, font, small, view, dpi);
+    let layout = layout_bar(hdc, font, small, view, dpi, monitor_work_width(hwnd));
     store_hit_spans(view, &layout, dpi);
     unsafe {
         if !font.is_null() {
@@ -823,11 +853,6 @@ fn paint_candidates(hwnd: HWND) {
         return;
     }
     let data = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *const CandidateWindowData;
-    let view = if data.is_null() {
-        None
-    } else {
-        Some(unsafe { (*data).view.borrow() })
-    };
     let mut client = windows_sys::Win32::Foundation::RECT {
         left: 0,
         top: 0,
@@ -839,14 +864,20 @@ fn paint_candidates(hwnd: HWND) {
     unsafe { FillRect(hdc, &client, background) };
     unsafe { DeleteObject(background as _) };
     unsafe { SetBkMode(hdc, TRANSPARENT as i32) };
-    let Some(view) = view.as_ref() else {
+    if data.is_null() {
         unsafe { EndPaint(hwnd, &paint) };
         return;
-    };
+    }
+    let data = unsafe { &*data };
     let dpi = box_dpi(hwnd);
     let font = unsafe { create_font(scale_px(FONT_PX, dpi)) };
     let small = unsafe { create_font(scale_px(SMALL_FONT_PX, dpi)) };
-    let layout = layout_bar(hdc, font, small, view, dpi);
+    let layout = {
+        let view = data.view.borrow();
+        layout_bar(hdc, font, small, &view, dpi, monitor_work_width(hwnd))
+    };
+    store_hit_spans(&mut data.view.borrow_mut(), &layout, dpi);
+    let view = data.view.borrow();
     let old = unsafe { SelectObject(hdc, font as _) };
     let items = view.page_items();
     let num_gap = scale_px(NUM_GAP, dpi);
@@ -855,7 +886,7 @@ fn paint_candidates(hwnd: HWND) {
     let accent_w = scale_px(2, dpi).max(2);
     let accent_inset = scale_px(3, dpi);
     for (index, row) in items.iter().enumerate() {
-        let Some(&(x, w)) = layout.items.get(index) else {
+        let Some(&(x, y, w)) = layout.items.get(index) else {
             break;
         };
         if index == 0 {
@@ -863,9 +894,9 @@ fn paint_candidates(hwnd: HWND) {
                 hdc,
                 windows_sys::Win32::Foundation::RECT {
                     left: x - pill,
-                    top: layout.pill_top,
+                    top: y + layout.pill_top,
                     right: x + w + pill,
-                    bottom: layout.pill_bottom,
+                    bottom: y + layout.pill_bottom,
                 },
                 HIGHLIGHT,
                 scale_px(4, dpi),
@@ -873,9 +904,9 @@ fn paint_candidates(hwnd: HWND) {
             let accent = unsafe { CreateSolidBrush(ACCENT) };
             let bar = windows_sys::Win32::Foundation::RECT {
                 left: x - pill,
-                top: layout.pill_top + accent_inset,
+                top: y + layout.pill_top + accent_inset,
                 right: x - pill + accent_w,
-                bottom: layout.pill_bottom - accent_inset,
+                bottom: y + layout.pill_bottom - accent_inset,
             };
             unsafe {
                 FillRect(hdc, &bar, accent);
@@ -885,15 +916,15 @@ fn paint_candidates(hwnd: HWND) {
         let number = format!("{}", index + 1);
         unsafe { SelectObject(hdc, font as _) };
         let num_w = unsafe { text_width(hdc, &number) };
-        unsafe { draw_text(hdc, x, layout.text_y, MUTED, &number) };
+        unsafe { draw_text(hdc, x, y + layout.text_y, MUTED, &number) };
         let text_x = x + num_w + num_gap;
         let color = if row.complete { INK } else { GRAY };
-        unsafe { draw_text(hdc, text_x, layout.text_y, color, &row.text) };
+        unsafe { draw_text(hdc, text_x, y + layout.text_y, color, &row.text) };
         if !row.hint.is_empty() {
             let hx = text_x + unsafe { text_width(hdc, &row.text) } + hint_gap;
             unsafe {
                 let previous = SelectObject(hdc, small as _);
-                draw_text(hdc, hx, layout.hint_y, GRAY, &row.hint);
+                draw_text(hdc, hx, y + layout.hint_y, GRAY, &row.hint);
                 SelectObject(hdc, previous);
             }
         }
@@ -901,9 +932,9 @@ fn paint_candidates(hwnd: HWND) {
     let divider = unsafe { CreateSolidBrush(DIVIDER) };
     let mid = windows_sys::Win32::Foundation::RECT {
         left: layout.divider_x,
-        top: layout.pill_top + scale_px(2, dpi),
+        top: layout.prev.1 + layout.pill_top + scale_px(2, dpi),
         right: layout.divider_x + scale_px(1, dpi).max(1),
-        bottom: layout.pill_bottom - scale_px(2, dpi),
+        bottom: layout.prev.1 + layout.pill_bottom - scale_px(2, dpi),
     };
     unsafe {
         FillRect(hdc, &mid, divider);
@@ -917,16 +948,32 @@ fn paint_candidates(hwnd: HWND) {
         DISABLED
     };
     unsafe { SelectObject(hdc, small as _) };
-    unsafe { draw_text(hdc, layout.prev_x, layout.hint_y, prev_color, "◀") };
-    unsafe { draw_text(hdc, layout.next_x, layout.hint_y, next_color, "▶") };
+    unsafe {
+        draw_text(
+            hdc,
+            layout.prev.0,
+            layout.prev.1 + layout.hint_y,
+            prev_color,
+            "◀",
+        )
+    };
+    unsafe {
+        draw_text(
+            hdc,
+            layout.next.0,
+            layout.next.1 + layout.hint_y,
+            next_color,
+            "▶",
+        )
+    };
     // Menu button: a compact rounded chip with a down chevron, not a Microsoft logo.
     fill_round(
         hdc,
         windows_sys::Win32::Foundation::RECT {
-            left: layout.icon_x,
-            top: layout.pill_top,
-            right: layout.icon_x + scale_px(TRAIL_SLOT, dpi) - scale_px(2, dpi),
-            bottom: layout.pill_bottom,
+            left: layout.icon.0,
+            top: layout.icon.1 + layout.pill_top,
+            right: layout.icon.0 + scale_px(TRAIL_SLOT, dpi) - scale_px(2, dpi),
+            bottom: layout.icon.1 + layout.pill_bottom,
         },
         HIGHLIGHT,
         scale_px(4, dpi),
@@ -934,8 +981,8 @@ fn paint_candidates(hwnd: HWND) {
     unsafe {
         draw_text(
             hdc,
-            layout.icon_x + scale_px(3, dpi),
-            layout.hint_y,
+            layout.icon.0 + scale_px(3, dpi),
+            layout.icon.1 + layout.hint_y,
             MUTED,
             "▾",
         )
@@ -1335,6 +1382,7 @@ impl InlineInput {
                 .next()
                 .map(|row| (row.text, row.rest))
         };
+        let page_code = self.ui.view.borrow().code.clone();
         let outcome = self.ui.logical.borrow_mut().handle_key_with(
             context,
             InlineKey {
@@ -1345,6 +1393,10 @@ impl InlineInput {
                 shuangpin: scheme,
                 wubi: wubi_rules.then(|| (dictionary(), rules)),
                 typed,
+                semicolon_select: option(Flag::SemicolonSelect),
+                select_input: Some(dictionary()),
+                bracket_char_pick: option(Flag::BracketCharPick),
+                page_code: Some(page_code.as_str()),
             },
             |idx| self.ui.page_choice(idx),
             &first_for,
@@ -1352,8 +1404,9 @@ impl InlineInput {
         self.ui.dispatch_outcome(context, client_id, outcome)
     }
     /// Shift tap while composing: commit the letters as typed (English), as Microsoft Pinyin and
-    /// Sogou do, instead of discarding them. The caller then switches to English.
-    pub(super) fn commit_letters(&self, client_id: u32) {
+    /// Sogou do, instead of discarding them. False leaves the composition in place so the tap can
+    /// be retried; the caller must not switch the input mode in that case.
+    pub(super) fn commit_letters(&self, client_id: u32) -> bool {
         let context = self.ui.logical.borrow().context().cloned().or_else(|| {
             self.ui
                 .state
@@ -1362,19 +1415,28 @@ impl InlineInput {
                 .map(|state| state.context.clone())
         });
         let Some(context) = context else {
-            self.cancel(client_id);
-            return;
+            log("Shift 单击：没有组字上下文，保留组字");
+            return false;
         };
         self.sync_logical_from_state(&context);
-        let code = self.ui.logical.borrow_mut().commit_raw(&context);
-        let committed = code
-            .and_then(|code| yiime_core::literal_code(&code))
-            .is_some_and(|text| self.ui.edit(&context, client_id, Action::Finish(text)));
-        if !committed {
-            self.cancel(client_id);
-        } else {
+        let code = self
+            .ui
+            .logical
+            .borrow()
+            .code(&context)
+            .unwrap_or("")
+            .to_owned();
+        let Some(text) = yiime_core::literal_code(&code) else {
+            return true;
+        };
+        let committed = self.ui.edit(&context, client_id, Action::Finish(text));
+        if committed {
+            let _ = self.ui.logical.borrow_mut().commit_raw(&context);
             log("Shift 单击：编码按英文上屏");
+        } else {
+            log("Shift 单击：字母未能上屏，保留组字");
         }
+        committed
     }
     /// Commits the letters typed so far as they are (not a candidate) and ends the composition:
     /// used when the field turns out to be a password field after the first key.

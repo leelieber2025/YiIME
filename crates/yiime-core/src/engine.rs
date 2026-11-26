@@ -351,6 +351,23 @@ pub fn auto_commits_four(input: &MixedInput, code: &str) -> bool {
         && !input.pinyin_continues(code)
 }
 
+/// The candidate to commit when the drawn page may be a key behind the logical code.
+///
+/// Use the current page only when it belongs to `logical_code` and actually has that candidate.
+/// Otherwise use a fresh lookup of `logical_code` (the four letters, for a fifth-letter commit).
+/// An empty page is not "no candidate": the edit that fills it may still be in flight.
+pub fn shown_candidate(
+    page_code: Option<&str>,
+    logical_code: &str,
+    on_page: Option<(String, String)>,
+    fresh: Option<(String, String)>,
+) -> Option<(String, String)> {
+    match page_code {
+        Some(shown) if shown != logical_code => fresh,
+        _ => on_page.or(fresh),
+    }
+}
+
 /// Pick a character from a word (`[` `]` in Microsoft Pinyin and Sogou): the first or last
 /// character; None for a single character (the key is then plain punctuation).
 pub fn char_of_word(text: &str, last: bool) -> Option<String> {

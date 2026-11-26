@@ -65,7 +65,8 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, VK_CAPITAL, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    GetFocus, GetKeyState, GetKeyboardLayout, GetKeyboardState, ToUnicodeEx, VK_CAPITAL,
+    VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, CREATESTRUCTW, CreateWindowExW, DefWindowProcW, DestroyWindow,
@@ -1665,6 +1666,47 @@ impl TextService {
             _ => text.to_owned(),
         })
     }
+    /// The character the active keyboard layout produces for `vk`, using the current modifier state.
+    /// A dead key is undone and reported as None so the US fallback can run without eating it.
+    fn layout_char(vk: u16) -> Option<char> {
+        let mut state = [0u8; 256];
+        if unsafe { GetKeyboardState(state.as_mut_ptr()) } == 0 {
+            return None;
+        }
+        let layout = unsafe { GetKeyboardLayout(0) };
+        let mut buffer = [0u16; 8];
+        let count = unsafe {
+            ToUnicodeEx(
+                vk as u32,
+                0,
+                state.as_ptr(),
+                buffer.as_mut_ptr(),
+                buffer.len() as i32,
+                0,
+                layout,
+            )
+        };
+        if count < 0 {
+            let _ = unsafe {
+                ToUnicodeEx(
+                    vk as u32,
+                    0,
+                    state.as_ptr(),
+                    buffer.as_mut_ptr(),
+                    buffer.len() as i32,
+                    0,
+                    layout,
+                )
+            };
+            return None;
+        }
+        let count = usize::try_from(count).ok()?;
+        char::decode_utf16(buffer.iter().copied().take(count))
+            .next()?
+            .ok()
+            .filter(|ch| !ch.is_control())
+    }
+
     /// What a key types after an in-document composition is committed: Chinese punctuation
     /// (unless English punctuation is on), otherwise the US-layout character, numpad included.
     fn composing_text(&self, key: usize) -> Option<String> {
@@ -1683,7 +1725,11 @@ impl TextService {
                 return Some(text.to_owned());
             }
         }
-        yiime_core::key_char(vk, shift).map(String::from)
+        if numpad {
+            return yiime_core::key_char(vk, shift).map(String::from);
+        }
+        // English punctuation follows the active layout (UK Shift+2 is `"`, not `@`).
+        yiime_core::typed_from_layout(Self::layout_char(vk), vk, shift).map(String::from)
     }
     /// Inserts text straight into the document (without the box).
     fn insert_direct(&self, context: &ITfContext, text: String) -> bool {
@@ -1776,14 +1822,21 @@ impl TextService {
                 .into_iter()
                 .any(|vk| unsafe { GetKeyState(vk as i32) } < 0)
         {
-            if self.inline.active() {
-                self.inline.commit_letters(self.client_id.get());
+            let composing = self.inline.active();
+            let committed = if composing {
+                self.inline.commit_letters(self.client_id.get())
+            } else {
+                true
+            };
+            if yiime_core::shift_keeps_mode(composing, committed) {
+                log("Shift 单击：字母未能上屏，保持当前中/英模式");
+            } else {
+                let ok = self.toggle_keyboard_mode();
+                log(&format!(
+                    "Shift 单击切换中/英：{ok}，现在中文={}",
+                    self.keyboard_open()
+                ));
             }
-            let ok = self.toggle_keyboard_mode();
-            log(&format!(
-                "Shift 单击切换中/英：{ok}，现在中文={}",
-                self.keyboard_open()
-            ));
         }
     }
     /// Chinese → English (OPENCLOSE off), for a Shift tap in the empty input box. True when the

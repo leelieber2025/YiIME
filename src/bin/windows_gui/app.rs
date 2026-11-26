@@ -372,6 +372,8 @@ struct State {
     settings_window: Cell<HWND>,
     /// Snapshot of settings when the settings window opened, for merge-on-save.
     dialog_base: RefCell<Option<ApiSettings>>,
+    /// Composition-window scale when this settings window opened. Saved only if the control changed.
+    ui_scale_opened: Cell<u32>,
     dialog_keys_unreadable: Cell<bool>,
     /// Dialog font for the settings window (message font, scaled to the window DPI).
     settings_font: Cell<HFONT>,
@@ -2760,6 +2762,7 @@ unsafe fn create(hwnd: HWND) -> LRESULT {
             settings: RefCell::new(load_settings()),
             settings_window: Cell::new(null_mut()),
             dialog_base: RefCell::new(None),
+            ui_scale_opened: Cell::new(yiime_core::UI_SCALE),
             dialog_keys_unreadable: Cell::new(false),
             settings_font: Cell::new(null_mut()),
             settings_dpi: Cell::new(0),

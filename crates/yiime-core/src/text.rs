@@ -167,6 +167,17 @@ pub fn us_key_char(vk: u16, shift: bool) -> Option<char> {
 /// Character a virtual key types on a US layout, numpad keys included (digits and `* + - . /`);
 /// None for letters and keys that type nothing. Used to commit a composition and then type the
 /// key's own character (Microsoft Pinyin / SampleIME punctuation-while-composing).
+/// Character typed after a composition, preferring the active keyboard layout.
+///
+/// `layout` is what that layout produces for the key (US Shift+2 is `@`, UK Shift+2 is `"`).
+/// When the layout has no character, the US virtual-key table is the fallback.
+pub fn typed_from_layout(layout: Option<char>, vk: u16, shift: bool) -> Option<char> {
+    match layout {
+        Some(ch) if !ch.is_control() => Some(ch),
+        _ => key_char(vk, shift),
+    }
+}
+
 pub fn key_char(vk: u16, shift: bool) -> Option<char> {
     match vk {
         0x60..=0x69 => Some((b'0' + (vk - 0x60) as u8) as char),

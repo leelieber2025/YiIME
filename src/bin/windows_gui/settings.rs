@@ -775,9 +775,11 @@ pub(super) unsafe extern "system" fn settings_proc(
             for label in UI_SCALE_CHOICES {
                 SendMessageW(scale, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
             }
+            let opened = OPTIONS.ui_scale();
+            state.ui_scale_opened.set(opened);
             let selected = yiime_core::UI_SCALES
                 .iter()
-                .position(|percent| *percent == OPTIONS.ui_scale())
+                .position(|percent| *percent == opened)
                 .unwrap_or(0);
             SendMessageW(scale, CB_SETCURSEL, selected, 0);
             for (id, text, option_key) in OPTION_BOXES {
@@ -1114,11 +1116,17 @@ pub(super) unsafe extern "system" fn settings_proc(
                         .ok()
                         .and_then(|index| yiime_core::UI_SCALES.get(index).copied())
                         .unwrap_or(yiime_core::UI_SCALE);
+                        let scale_ok =
+                            match yiime_core::ui_scale_to_write(state.ui_scale_opened.get(), scale)
+                            {
+                                Some(scale) => OPTIONS.set_ui_scale(scale),
+                                None => true,
+                            };
                         let options_ok = set_plain_mode(plain)
                             && OPTIONS.set_plain_toggle_key(&hotkey)
                             && set_option(Flag::HistoryEnabled, history_on)
                             && OPTIONS.set_page_size(page)
-                            && OPTIONS.set_ui_scale(scale)
+                            && scale_ok
                             && OPTIONS.set_shuangpin(shuangpin)
                             && OPTIONS.set_history_key(&history_key)
                             && OPTION_BOXES.iter().all(|(id, _, option_key)| {

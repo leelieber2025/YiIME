@@ -841,6 +841,12 @@ pub enum ShiftTapAction {
 
 /// `tsf`: the box serves a TSF session (not the standalone tray box). `english_segment`: the
 /// inline English segment is on (a tap turns it off and keeps the box).
+/// A Shift tap that was composing must not switch Chinese/English when the letters failed to
+/// commit. The composition stays, so the tap can be retried.
+pub fn shift_keeps_mode(composing: bool, letters_committed: bool) -> bool {
+    composing && !letters_committed
+}
+
 pub fn shift_tap_action(
     tsf: bool,
     code_empty: bool,
@@ -1546,6 +1552,9 @@ mod tests {
         assert_eq!(shift_tap_action(true, true, true, true), ToggleSegment);
         // The standalone box has no application to switch.
         assert_eq!(shift_tap_action(false, true, true, false), ToggleSegment);
+        assert!(shift_keeps_mode(true, false));
+        assert!(!shift_keeps_mode(true, true));
+        assert!(!shift_keeps_mode(false, false));
     }
 
     #[test]

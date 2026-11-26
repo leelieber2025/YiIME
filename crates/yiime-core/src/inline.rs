@@ -69,9 +69,13 @@ pub mod ui {
     use crate::MAX_CODE_LEN;
     use crate::dict::{MixedInput, Source};
     use crate::engine::{
-        LetterAction, LetterRules, classify_letter, edit_code, paging_direction_vk,
+        LetterAction, LetterRules, char_of_word, classify_letter, edit_code, paging_direction_vk,
+        selection_index, shown_candidate,
     };
-    use crate::keys::{KeyAction, KeyContext, classify_char, semicolon_is_code};
+    use crate::keys::{
+        KeyAction, KeyContext, classify_char, semicolon_is_code, shuangpin_selection,
+        with_separator,
+    };
     use crate::shuangpin::Shuangpin;
     use crate::text::to_traditional;
     use std::collections::HashSet;
@@ -187,6 +191,11 @@ pub mod ui {
         pub prev_span: (i32, i32),
         pub next_span: (i32, i32),
         pub bar_height: i32,
+        /// Drawn rectangles `(left, top, right, bottom)`. Clicks use these when present, so a
+        /// repaint that changes the scale updates the hit targets to the same edges it draws.
+        pub item_rects: Vec<(i32, i32, i32, i32)>,
+        pub prev_rect: (i32, i32, i32, i32),
+        pub next_rect: (i32, i32, i32, i32),
     }
 
     impl CandidateView {
@@ -201,6 +210,9 @@ pub mod ui {
                 prev_span: (0, 0),
                 next_span: (0, 0),
                 bar_height: 0,
+                item_rects: Vec::new(),
+                prev_rect: (0, 0, 0, 0),
+                next_rect: (0, 0, 0, 0),
             }
         }
 
@@ -226,6 +238,9 @@ pub mod ui {
                 prev_span: (0, 0),
                 next_span: (0, 0),
                 bar_height: 0,
+                item_rects: Vec::new(),
+                prev_rect: (0, 0, 0, 0),
+                next_rect: (0, 0, 0, 0),
             }
         }
 
@@ -238,6 +253,29 @@ pub mod ui {
             self.prev_span = (0, 0);
             self.next_span = (0, 0);
             self.bar_height = 0;
+            self.item_rects.clear();
+            self.prev_rect = (0, 0, 0, 0);
+            self.next_rect = (0, 0, 0, 0);
+        }
+
+        /// Replace the click map with the rectangles just drawn.
+        pub fn publish_click_rects(
+            &mut self,
+            items: &[(i32, i32, i32, i32)],
+            prev: (i32, i32, i32, i32),
+            next: (i32, i32, i32, i32),
+            height: i32,
+        ) {
+            self.item_rects = items.to_vec();
+            self.item_spans = items
+                .iter()
+                .map(|&(left, _, right, _)| (left, right))
+                .collect();
+            self.prev_rect = prev;
+            self.next_rect = next;
+            self.prev_span = (prev.0, prev.2);
+            self.next_span = (next.0, next.2);
+            self.bar_height = height;
         }
 
         pub fn set_page_starts(&mut self, starts: &[u32]) -> bool {
@@ -310,6 +348,22 @@ pub mod ui {
             if y < 0 || y >= self.bar_height {
                 return None;
             }
+            if !self.item_rects.is_empty() {
+                for (idx, &(left, top, right, bottom)) in self.item_rects.iter().enumerate() {
+                    if x >= left && x < right && y >= top && y < bottom {
+                        return Some(HitTarget::Candidate(idx));
+                    }
+                }
+                let (left, top, right, bottom) = self.prev_rect;
+                if x >= left && x < right && y >= top && y < bottom {
+                    return Some(HitTarget::PrevPage);
+                }
+                let (left, top, right, bottom) = self.next_rect;
+                if x >= left && x < right && y >= top && y < bottom {
+                    return Some(HitTarget::NextPage);
+                }
+                return None;
+            }
             for (idx, &(left, right)) in self.item_spans.iter().enumerate() {
                 if x >= left && x < right {
                     return Some(HitTarget::Candidate(idx));
@@ -349,6 +403,17 @@ pub mod ui {
         /// What the key types when it is not a composition key (Chinese or ASCII punctuation, a
         /// digit): the composition is committed and this follows it.
         pub typed: Option<String>,
+        /// `;` picks the 2nd candidate and `'` the 3rd, except where `'` continues pinyin or
+        /// 微软双拼 uses `;` as a code key. Off: `'` is still the pinyin separator.
+        pub semicolon_select: bool,
+        /// Dictionary for the pinyin-continues check on `'`. [`Self::wubi`]'s dictionary is used
+        /// when this is None.
+        pub select_input: Option<&'a MixedInput>,
+        /// `[` `]` take one character from the first candidate (on by default).
+        pub bracket_char_pick: bool,
+        /// Code the drawn candidate page belongs to. When it differs from the logical code, a
+        /// commit re-queries the logical code instead of using that page.
+        pub page_code: Option<&'a str>,
     }
 
     /// Arrows, Home/End, PageUp/PageDown (when not paging) and Delete: kept while composing.
@@ -358,6 +423,34 @@ pub mod ui {
 
     /// Commits a whole code by taking the first candidate segment by segment, raw letters for a
     /// segment with none (same as [`crate::Composer::flush_all`] in the draft box).
+    /// Punctuation commits the highlighted candidate on the current page, then any unconsumed
+    /// tail by a fresh lookup (not another page of the old list).
+    pub fn flush_visible(
+        code: &str,
+        page_code: Option<&str>,
+        choice_at: &mut impl FnMut(usize) -> Option<(String, String)>,
+        first_for: &dyn Fn(&str) -> Option<(String, String)>,
+    ) -> String {
+        let letters = |code: &str| code.replace('\'', "").len();
+        let on_page = choice_at(0);
+        let fresh = first_for(code);
+        let mut out = String::new();
+        let mut rest_code = code.to_owned();
+        if let Some((text, rest)) = shown_candidate(page_code, code, on_page, fresh) {
+            if letters(&rest) < letters(code) {
+                out.push_str(&text);
+                rest_code = rest;
+            } else {
+                out.push_str(code);
+                return out;
+            }
+        }
+        if !rest_code.is_empty() {
+            out.push_str(&flush_code(&rest_code, first_for));
+        }
+        out
+    }
+
     pub fn flush_code(code: &str, first_for: &dyn Fn(&str) -> Option<(String, String)>) -> String {
         let letters = |code: &str| code.replace('\'', "").len();
         let mut out = String::new();
@@ -454,7 +547,16 @@ pub mod ui {
                     || shuangpin_semi
                     || matches!(
                         key,
-                        0x41..=0x5a | 0x08 | 0x1b | 0x0d | 0x20 | 0x31..=0x39
+                        0x41..=0x5a
+                            | 0x08
+                            | 0x1b
+                            | 0x0d
+                            | 0x20
+                            | 0x31..=0x39
+                            | 0xBA
+                            | 0xDE
+                            | 0xDB
+                            | 0xDD
                     )
             } else {
                 (0x41..=0x5a).contains(&key)
@@ -470,7 +572,7 @@ pub mod ui {
             caps_lock: bool,
             comma_period_paging: bool,
             shuangpin: Option<Shuangpin>,
-            choice_at: impl FnOnce(usize) -> Option<(String, String)>,
+            choice_at: impl FnMut(usize) -> Option<(String, String)>,
         ) -> InlineKeyOutcome {
             self.handle_key_with(
                 context,
@@ -482,6 +584,10 @@ pub mod ui {
                     shuangpin,
                     wubi: None,
                     typed: None,
+                    semicolon_select: false,
+                    select_input: None,
+                    bracket_char_pick: false,
+                    page_code: None,
                 },
                 choice_at,
                 &|_| None,
@@ -494,7 +600,7 @@ pub mod ui {
             &mut self,
             context: &C,
             input: InlineKey<'_>,
-            choice_at: impl FnOnce(usize) -> Option<(String, String)>,
+            mut choice_at: impl FnMut(usize) -> Option<(String, String)>,
             first_for: &dyn Fn(&str) -> Option<(String, String)>,
         ) -> InlineKeyOutcome {
             let InlineKey {
@@ -505,6 +611,10 @@ pub mod ui {
                 shuangpin,
                 wubi,
                 typed,
+                semicolon_select,
+                select_input,
+                bracket_char_pick,
+                page_code,
             } = input;
             let Some(code) = self.code(context).map(str::to_owned) else {
                 if !(0x41..=0x5a).contains(&key) {
@@ -528,21 +638,48 @@ pub mod ui {
                             self.active = None;
                             InlineKeyOutcome::Finish(out)
                         }
-                        Some(LetterAction::Compose(c)) => {
-                            self.compose_letter(context, &code, c, wubi, choice_at, first_for)
-                        }
+                        Some(LetterAction::Compose(c)) => self.compose_letter(
+                            context, &code, c, wubi, page_code, choice_at, first_for,
+                        ),
                         _ => InlineKeyOutcome::NotHandled,
                     }
                 }
                 0xBA if !shift
                     && shuangpin.is_some_and(|scheme| semicolon_is_code(scheme, &code)) =>
                 {
-                    self.compose_letter(context, &code, ';', None, choice_at, first_for)
+                    self.compose_letter(context, &code, ';', None, page_code, choice_at, first_for)
                 }
                 _ => {
-                    if let Some(outcome) =
-                        self.box_key(context, &code, key, shift, comma_period_paging, choice_at)
-                    {
+                    if let Some(outcome) = self.box_key(
+                        context,
+                        &code,
+                        key,
+                        shift,
+                        comma_period_paging,
+                        &mut choice_at,
+                    ) {
+                        return outcome;
+                    }
+                    if let Some(outcome) = self.mark_key(
+                        context,
+                        &code,
+                        key,
+                        shift,
+                        shuangpin,
+                        semicolon_select,
+                        select_input.or(wubi.map(|(input, _)| input)),
+                        &mut choice_at,
+                    ) {
+                        return outcome;
+                    }
+                    if let Some(outcome) = self.bracket_key(
+                        context,
+                        &code,
+                        key,
+                        shift,
+                        bracket_char_pick,
+                        &mut choice_at,
+                    ) {
                         return outcome;
                     }
                     if let Some(forward) = u16::try_from(key)
@@ -552,8 +689,9 @@ pub mod ui {
                         return InlineKeyOutcome::Page(forward);
                     }
                     if let Some(text) = typed {
+                        let committed = flush_visible(&code, page_code, &mut choice_at, first_for);
                         self.active = None;
-                        return InlineKeyOutcome::Finish(flush_code(&code, first_for) + &text);
+                        return InlineKeyOutcome::Finish(committed + &text);
                     }
                     if is_navigation(key) {
                         return InlineKeyOutcome::Swallow;
@@ -566,12 +704,14 @@ pub mod ui {
         /// Fifth-letter and unique-four edits from [`edit_code`] (the same steps as
         /// [`crate::Composer::type_letter`]). The candidate text still comes from this
         /// composition's own list.
+        #[allow(clippy::too_many_arguments)]
         fn compose_letter(
             &mut self,
             context: &C,
             code: &str,
             letter: char,
             wubi: Option<(&MixedInput, LetterRules)>,
+            page_code: Option<&str>,
             choice_at: impl FnOnce(usize) -> Option<(String, String)>,
             first_for: &dyn Fn(&str) -> Option<(String, String)>,
         ) -> InlineKeyOutcome {
@@ -581,7 +721,9 @@ pub mod ui {
             }
             let mut committed = String::new();
             if edit.fifth && wubi.is_some_and(|(input, _)| input.wubi_count(code) > 0) {
-                if let Some((text, _)) = choice_at(0) {
+                let on_page = choice_at(0);
+                let fresh = first_for(code);
+                if let Some((text, _)) = shown_candidate(page_code, code, on_page, fresh) {
                     committed = text;
                 }
             }
@@ -611,7 +753,7 @@ pub mod ui {
             key: usize,
             shift: bool,
             comma_period_paging: bool,
-            choice_at: impl FnOnce(usize) -> Option<(String, String)>,
+            choice_at: &mut impl FnMut(usize) -> Option<(String, String)>,
         ) -> Option<InlineKeyOutcome> {
             let ch = match key {
                 0x08 => '\u{8}',
@@ -674,6 +816,85 @@ pub mod ui {
             })
         }
 
+        /// `'` continues a pinyin code (`xi'an`). `;` / `'` select the 2nd / 3rd candidate when
+        /// that switch is on. 微软双拼's code-key `;` is handled before this. A `;` that selects
+        /// nothing falls through to punctuation; a `'` that selects nothing is still a separator.
+        #[allow(clippy::too_many_arguments)]
+        fn mark_key(
+            &mut self,
+            context: &C,
+            code: &str,
+            key: usize,
+            shift: bool,
+            shuangpin: Option<Shuangpin>,
+            semicolon_select: bool,
+            input: Option<&MixedInput>,
+            choice_at: &mut impl FnMut(usize) -> Option<(String, String)>,
+        ) -> Option<InlineKeyOutcome> {
+            let ch = match (key, shift) {
+                (0xBA, false) => ';',
+                (0xDE, false) => '\'',
+                _ => return None,
+            };
+            let selection = if semicolon_select {
+                match shuangpin {
+                    Some(scheme) => shuangpin_selection(scheme, code, ch),
+                    None if ch == ';' => Some(1),
+                    None => input.and_then(|input| selection_index(input, code, ch)),
+                }
+            } else {
+                None
+            };
+            if let Some(index) = selection
+                && let Some((text, rest)) = choice_at(index)
+            {
+                return Some(self.apply_choice(context, text, rest));
+            }
+            if ch == '\'' {
+                return Some(match with_separator(code, MAX_CODE_LEN) {
+                    Some(next) => {
+                        self.active = Some((context.clone(), next.clone()));
+                        InlineKeyOutcome::Update(next)
+                    }
+                    None => InlineKeyOutcome::Swallow,
+                });
+            }
+            None
+        }
+
+        /// `[` `]` take the first or last character of the highlighted candidate. A single
+        /// character, or the switch being off, leaves the key to ordinary punctuation.
+        fn bracket_key(
+            &mut self,
+            context: &C,
+            _code: &str,
+            key: usize,
+            shift: bool,
+            bracket_char_pick: bool,
+            choice_at: &mut impl FnMut(usize) -> Option<(String, String)>,
+        ) -> Option<InlineKeyOutcome> {
+            if shift || !bracket_char_pick {
+                return None;
+            }
+            let last = match key {
+                0xDB => false,
+                0xDD => true,
+                _ => return None,
+            };
+            let (text, rest) = choice_at(0)?;
+            let ch = char_of_word(&text, last)?;
+            Some(if rest.is_empty() {
+                self.active = None;
+                InlineKeyOutcome::Finish(ch)
+            } else {
+                self.active = Some((context.clone(), rest.clone()));
+                InlineKeyOutcome::PickPartial {
+                    committed: ch,
+                    rest,
+                }
+            })
+        }
+
         /// The active composition's context.
         pub fn context(&self) -> Option<&C> {
             self.active.as_ref().map(|(context, _)| context)
@@ -706,6 +927,115 @@ pub mod ui {
             let code = self.code(context)?.to_owned();
             self.active = None;
             Some(code)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct BarSlot {
+        pub x: i32,
+        pub y: i32,
+        pub w: i32,
+        pub h: i32,
+    }
+
+    /// One page of the in-document candidate bar. Items wrap so the page controls stay inside
+    /// `max_width`. A single candidate wider than the row is narrowed to that row.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct CandidateBarLayout {
+        pub width: i32,
+        pub height: i32,
+        pub items: Vec<BarSlot>,
+        pub prev: BarSlot,
+        pub next: BarSlot,
+        pub menu: BarSlot,
+        pub divider_x: i32,
+        pub row_h: i32,
+    }
+
+    pub fn layout_candidate_bar(
+        item_widths: &[i32],
+        row_h: i32,
+        gap: i32,
+        pad_x: i32,
+        slot: i32,
+        before_buttons: i32,
+        max_width: i32,
+    ) -> CandidateBarLayout {
+        let row_h = row_h.max(1);
+        let gap = gap.max(0);
+        let pad_x = pad_x.max(0);
+        let slot = slot.max(1);
+        let before_buttons = before_buttons.max(0);
+        // From the last item's right edge: the gap before the buttons, three slots, right pad.
+        let trail = before_buttons + slot * 3 + pad_x;
+        let max_width = max_width.max(pad_x + trail + 1);
+        let item_limit = (max_width - pad_x - trail).max(1);
+        let mut rows: Vec<Vec<(usize, i32)>> = Vec::new();
+        let mut current = Vec::new();
+        let mut used = pad_x;
+        for (index, &natural) in item_widths.iter().enumerate() {
+            let w = natural.max(1).min(item_limit);
+            let next = if current.is_empty() {
+                pad_x + w
+            } else {
+                used + gap + w
+            };
+            if !current.is_empty() && next + trail > max_width {
+                rows.push(std::mem::take(&mut current));
+                current.push((index, w));
+                used = pad_x + w;
+            } else {
+                current.push((index, w));
+                used = next;
+            }
+        }
+        rows.push(current);
+        let mut items = Vec::with_capacity(item_widths.len());
+        let mut width = pad_x + trail;
+        for (row_index, row) in rows.iter().enumerate() {
+            let y = row_index as i32 * row_h;
+            let mut x = pad_x;
+            for &(_index, w) in row {
+                items.push(BarSlot { x, y, w, h: row_h });
+                x += w + gap;
+            }
+            let content_right = if row.is_empty() { pad_x } else { x - gap };
+            width = width.max(content_right + trail).min(max_width);
+        }
+        let last_y = rows.len().saturating_sub(1) as i32 * row_h;
+        let last = rows.last().map(Vec::as_slice).unwrap_or(&[]);
+        let mut x = pad_x;
+        for &(_, w) in last {
+            x += w + gap;
+        }
+        let content_right = if last.is_empty() { pad_x } else { x - gap };
+        let prev_x = content_right + before_buttons;
+        let next_x = prev_x + slot;
+        let menu_x = next_x + slot;
+        CandidateBarLayout {
+            width,
+            height: rows.len().max(1) as i32 * row_h,
+            items,
+            prev: BarSlot {
+                x: prev_x,
+                y: last_y,
+                w: slot,
+                h: row_h,
+            },
+            next: BarSlot {
+                x: next_x,
+                y: last_y,
+                w: slot,
+                h: row_h,
+            },
+            menu: BarSlot {
+                x: menu_x,
+                y: last_y,
+                w: slot,
+                h: row_h,
+            },
+            divider_x: content_right + gap / 2,
+            row_h,
         }
     }
 }
@@ -757,7 +1087,7 @@ mod tests {
 #[cfg(all(test, feature = "engine"))]
 mod ui_tests {
     use super::ui::*;
-    use crate::{MixedInput, Shuangpin};
+    use crate::{LetterRules, MixedInput, Shuangpin};
 
     #[test]
     fn build_candidates_handles_shuangpin_odd_key_partial_and_traditional_dedup() {
@@ -890,6 +1220,10 @@ mod ui_tests {
             shuangpin: None,
             wubi,
             typed: typed.map(str::to_owned),
+            semicolon_select: false,
+            select_input: None,
+            bracket_char_pick: false,
+            page_code: None,
         };
         let first = |code: &str| match code {
             "ni" => Some(("你".to_owned(), String::new())),
@@ -1009,6 +1343,10 @@ mod ui_tests {
             shuangpin: None,
             wubi,
             typed: None,
+            semicolon_select: false,
+            select_input: None,
+            bracket_char_pick: false,
+            page_code: None,
         };
         let mut composer = Composer::default();
         for ch in ['g', 'g', 'g'] {
@@ -1086,6 +1424,10 @@ mod ui_tests {
             shuangpin: None,
             wubi: None,
             typed: None,
+            semicolon_select: false,
+            select_input: None,
+            bracket_char_pick: false,
+            page_code: None,
         };
         let mut logic = LogicalInline::default();
         logic.sync_from_composition(&ctx, "ni");
@@ -1133,6 +1475,260 @@ mod ui_tests {
             ),
             InlineKeyOutcome::Finish("好".into())
         );
+    }
+
+    fn sample_key(vk: usize) -> InlineKey<'static> {
+        InlineKey {
+            key: vk,
+            shift: false,
+            caps_lock: false,
+            comma_period_paging: false,
+            shuangpin: None,
+            wubi: None,
+            typed: None,
+            semicolon_select: false,
+            select_input: None,
+            bracket_char_pick: false,
+            page_code: None,
+        }
+    }
+
+    #[test]
+    fn apostrophe_continues_pinyin_semicolon_selects_and_shuangpin_keeps_its_code_key() {
+        let ctx = 1u8;
+        let mut logic = LogicalInline::default();
+        logic.sync_from_composition(&ctx, "xi");
+        assert!(logic.wants(&ctx, 0xDE, false, false, None));
+        let mut key = sample_key(0xDE);
+        key.typed = Some("‘".into());
+        assert_eq!(
+            logic.handle_key_with(&ctx, key, |_| Some(("西".into(), String::new())), &|_| {
+                None
+            }),
+            InlineKeyOutcome::Update("xi'".into())
+        );
+        assert_eq!(logic.code(&ctx), Some("xi'"));
+        assert_eq!(
+            logic.handle_key_with(&ctx, sample_key(b'A' as usize), |_| None, &|_| None),
+            InlineKeyOutcome::Update("xi'a".into())
+        );
+        assert_eq!(
+            logic.handle_key_with(&ctx, sample_key(b'N' as usize), |_| None, &|_| None),
+            InlineKeyOutcome::Update("xi'an".into())
+        );
+
+        logic.sync_from_composition(&ctx, "ggg");
+        let mut semi = sample_key(0xBA);
+        semi.semicolon_select = true;
+        semi.typed = Some("；".into());
+        assert_eq!(
+            logic.handle_key_with(
+                &ctx,
+                semi,
+                |index| (index == 1).then_some(("工".into(), String::new())),
+                &|_| None
+            ),
+            InlineKeyOutcome::Finish("工".into())
+        );
+
+        logic.sync_from_composition(&ctx, "b");
+        let mut code_key = sample_key(0xBA);
+        code_key.shuangpin = Some(Shuangpin::Microsoft);
+        code_key.semicolon_select = true;
+        code_key.typed = Some("；".into());
+        assert!(logic.wants(&ctx, 0xBA, false, false, Some(Shuangpin::Microsoft)));
+        assert_eq!(
+            logic.handle_key_with(&ctx, code_key, |_| None, &|_| None),
+            InlineKeyOutcome::Update("b;".into())
+        );
+    }
+
+    #[test]
+    fn punctuation_commits_the_current_page_then_the_rest() {
+        let ctx = 1u8;
+        let mut logic = LogicalInline::default();
+        logic.sync_from_composition(&ctx, "xian");
+        let mut key = sample_key(0x31);
+        key.shift = true;
+        key.typed = Some("！".into());
+        key.page_code = Some("xian");
+        let first = |code: &str| match code {
+            "xian" => Some(("先".into(), String::new())),
+            "an" => Some(("安".into(), String::new())),
+            _ => None,
+        };
+        assert_eq!(
+            logic.handle_key_with(&ctx, key, |_| Some(("西安".into(), String::new())), &first),
+            InlineKeyOutcome::Finish("西安！".into())
+        );
+
+        logic.sync_from_composition(&ctx, "xian");
+        let mut key = sample_key(0x31);
+        key.shift = true;
+        key.typed = Some("！".into());
+        key.page_code = Some("xian");
+        assert_eq!(
+            logic.handle_key_with(&ctx, key, |_| Some(("西".into(), "an".into())), &first),
+            InlineKeyOutcome::Finish("西安！".into())
+        );
+    }
+
+    #[test]
+    fn fifth_letter_uses_the_page_only_when_it_shows_that_code() {
+        let ctx = 1u8;
+        let input =
+            MixedInput::from_rime("...\n王\tgggg\t100\n工\taaaa\t100\n式\taaaa\t90\n", "...\n");
+        let rules = LetterRules {
+            push_fifth: true,
+            auto_commit4: false,
+        };
+        let fresh = |code: &str| {
+            input
+                .candidates(code, 1)
+                .into_iter()
+                .next()
+                .map(|row| (row.text, row.rest))
+        };
+        let mut logic = LogicalInline::default();
+        // Fourth key is in the logical code; the candidate page is still the third key.
+        logic.sync_from_composition(&ctx, "gggg");
+        let mut key = sample_key(b'G' as usize);
+        key.wubi = Some((&input, rules));
+        key.page_code = Some("ggg");
+        assert_eq!(
+            logic.handle_key_with(&ctx, key, |_| Some(("工".into(), String::new())), &fresh),
+            InlineKeyOutcome::PickPartial {
+                committed: "王".into(),
+                rest: "g".into(),
+            }
+        );
+        assert_eq!(logic.code(&ctx), Some("g"));
+
+        // The page caught up but has no rows yet: still look up the four letters.
+        logic.sync_from_composition(&ctx, "gggg");
+        let mut key = sample_key(b'G' as usize);
+        key.wubi = Some((&input, rules));
+        key.page_code = Some("gggg");
+        assert_eq!(
+            logic.handle_key_with(&ctx, key, |_| None, &fresh),
+            InlineKeyOutcome::PickPartial {
+                committed: "王".into(),
+                rest: "g".into(),
+            }
+        );
+
+        // A page that really is the four-letter code keeps its highlighted candidate.
+        logic.sync_from_composition(&ctx, "aaaa");
+        let mut key = sample_key(b'G' as usize);
+        key.wubi = Some((&input, rules));
+        key.page_code = Some("aaaa");
+        assert_eq!(
+            logic.handle_key_with(&ctx, key, |_| Some(("式".into(), String::new())), &fresh),
+            InlineKeyOutcome::PickPartial {
+                committed: "式".into(),
+                rest: "g".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn brackets_take_a_character_unless_the_candidate_is_one_or_the_switch_is_off() {
+        let ctx = 1u8;
+        let mut logic = LogicalInline::default();
+        logic.sync_from_composition(&ctx, "nihao");
+        let mut key = sample_key(0xDD);
+        key.bracket_char_pick = true;
+        key.typed = Some("】".into());
+        assert_eq!(
+            logic.handle_key_with(
+                &ctx,
+                key,
+                |_| Some(("你好".into(), String::new())),
+                &|_| None
+            ),
+            InlineKeyOutcome::Finish("好".into())
+        );
+
+        logic.sync_from_composition(&ctx, "ni");
+        let mut key = sample_key(0xDD);
+        key.bracket_char_pick = true;
+        key.typed = Some("】".into());
+        assert_eq!(
+            logic.handle_key_with(
+                &ctx,
+                key,
+                |_| Some(("你".into(), String::new())),
+                &|code: &str| (code == "ni").then_some(("你".into(), String::new()))
+            ),
+            InlineKeyOutcome::Finish("你】".into())
+        );
+
+        logic.sync_from_composition(&ctx, "nihao");
+        let mut key = sample_key(0xDD);
+        key.bracket_char_pick = false;
+        key.typed = Some("】".into());
+        assert_eq!(
+            logic.handle_key_with(
+                &ctx,
+                key,
+                |_| Some(("你好".into(), String::new())),
+                &|code: &str| (code == "nihao").then_some(("你好".into(), String::new()))
+            ),
+            InlineKeyOutcome::Finish("你好】".into())
+        );
+    }
+
+    #[test]
+    fn english_punctuation_uses_the_layout_character_once() {
+        assert_eq!(crate::typed_from_layout(Some('@'), 0x32, true), Some('@'));
+        assert_eq!(crate::typed_from_layout(Some('"'), 0x32, true), Some('"'));
+        assert_eq!(crate::typed_from_layout(None, 0x32, true), Some('@'));
+
+        let ctx = 1u8;
+        let mut logic = LogicalInline::default();
+        logic.sync_from_composition(&ctx, "ni");
+        let mut key = sample_key(0x32);
+        key.shift = true;
+        key.typed = Some("\"".into());
+        assert_eq!(
+            logic.handle_key_with(&ctx, key, |_| Some(("你".into(), String::new())), &|_| {
+                Some(("你".into(), String::new()))
+            }),
+            InlineKeyOutcome::Finish("你\"".into())
+        );
+        assert!(!logic.active());
+    }
+
+    #[test]
+    fn a_wide_page_keeps_the_last_candidate_and_the_page_buttons_on_screen() {
+        let layout = layout_candidate_bar(&[80, 80, 80, 80], 28, 16, 8, 18, 12, 160);
+        assert!(layout.width <= 160);
+        assert!(layout.items.len() == 4);
+        assert!(layout.height > 28);
+        let last = layout.items.last().unwrap();
+        assert!(last.x + last.w <= layout.width);
+        assert!(layout.next.x + layout.next.w <= layout.width);
+        assert!(layout.prev.x + layout.prev.w <= layout.width);
+        assert_ne!(layout.items[0].y, layout.items[3].y);
+
+        let one_row = layout_candidate_bar(&[40, 40], 28, 16, 8, 18, 12, 400);
+        assert_eq!(one_row.height, 28);
+        assert_eq!(one_row.items[0].y, one_row.items[1].y);
+        assert!(one_row.next.x > one_row.items[1].x);
+    }
+
+    #[test]
+    fn redraw_publishes_the_click_rects_it_draws() {
+        let mut view = CandidateView::empty(5);
+        view.bar_height = 28;
+        view.item_spans = vec![(8, 40), (48, 80)];
+        let drawn = [(8, 0, 72, 56), (88, 0, 160, 56)];
+        view.publish_click_rects(&drawn, (170, 0, 188, 56), (188, 0, 206, 56), 56);
+        assert_eq!(view.hit_test(100, 10), Some(HitTarget::Candidate(1)));
+        assert_eq!(view.hit_test(20, 10), Some(HitTarget::Candidate(0)));
+        assert_eq!(view.hit_test(100, 60), None);
+        // The 100% span ended at 80, so this point only belongs to the redrawn second item.
+        assert!(view.item_spans[1].1 > 80);
     }
 
     #[test]

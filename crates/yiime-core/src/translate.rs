@@ -154,42 +154,53 @@ fn host_of(endpoint: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The 400/422 names the `reasoning_effort` parameter or its value, so dropping that field and
+/// sending the text once more is the right retry. A model-not-found (or any other) 400 is not.
+fn reasoning_effort_refused(body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    lower.contains("reasoning_effort") || lower.contains("reasoning effort")
+}
+
+fn http_fail(code: u16, explanation: &str) -> Fail {
+    let category = format!("http {code}");
+    let message = serde_json::from_str::<Value>(explanation)
+        .ok()
+        .and_then(|json| {
+            json["error"]["message"]
+                .as_str()
+                .or_else(|| json["message"].as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| {
+            // HTML error pages (Google rate limiting) do not fit in the status line.
+            if explanation.trim_start().starts_with('<') {
+                String::new()
+            } else {
+                explanation.chars().take(300).collect()
+            }
+        });
+    let message = if message.trim().is_empty() {
+        String::new()
+    } else {
+        format!(": {message}")
+    };
+    if code == 429 {
+        Fail::new(
+            &category,
+            format!("HTTP 429（请求太频繁，被限流）{message}"),
+        )
+    } else if code == 456 {
+        Fail::new(&category, format!("HTTP 456（翻译额度已用完）{message}"))
+    } else {
+        Fail::new(&category, format!("HTTP {code}{message}"))
+    }
+}
+
 fn http_error(error: ureq::Error) -> Fail {
     match error {
         ureq::Error::Status(code, response) => {
-            let category = format!("http {code}");
             let explanation = response.into_string().unwrap_or_default();
-            let message = serde_json::from_str::<Value>(&explanation)
-                .ok()
-                .and_then(|json| {
-                    json["error"]["message"]
-                        .as_str()
-                        .or_else(|| json["message"].as_str())
-                        .map(str::to_owned)
-                })
-                .unwrap_or_else(|| {
-                    // HTML error pages (Google rate limiting) do not fit in the status line.
-                    if explanation.trim_start().starts_with('<') {
-                        String::new()
-                    } else {
-                        explanation.chars().take(300).collect()
-                    }
-                });
-            let message = if message.trim().is_empty() {
-                String::new()
-            } else {
-                format!(": {message}")
-            };
-            if code == 429 {
-                Fail::new(
-                    &category,
-                    format!("HTTP 429（请求太频繁，被限流）{message}"),
-                )
-            } else if code == 456 {
-                Fail::new(&category, format!("HTTP 456（翻译额度已用完）{message}"))
-            } else {
-                Fail::new(&category, format!("HTTP {code}{message}"))
-            }
+            http_fail(code, &explanation)
         }
         ureq::Error::Transport(transport) => {
             // `Display` includes the request URL (the free Google query carries the source
@@ -732,32 +743,42 @@ fn llm(
             .set("Authorization", &format!("Bearer {key}"))
             .send_json(body.clone())
     };
-    // An endpoint that refuses the "no thinking" parameter (400/422) is asked again without it,
-    // and only that (endpoint, model) pair stops sending it once the retry is accepted.
-    let send = |body: &Value| match post(body) {
-        Err(ureq::Error::Status(400 | 422, _)) if body.get("reasoning_effort").is_some() => {
-            let mut plain = body.clone();
-            if let Some(fields) = plain.as_object_mut() {
-                fields.remove("reasoning_effort");
+    // An endpoint that refuses the "no thinking" parameter is asked again without it, and only
+    // that (endpoint, model) pair stops sending it once the retry is accepted. Any other 400/422
+    // (a missing model, for example) is returned as-is so the original text is not sent twice.
+    let send = |body: &Value| -> Result<ureq::Response, Fail> {
+        match post(body) {
+            Ok(response) => Ok(response),
+            Err(ureq::Error::Status(code @ (400 | 422), response))
+                if body.get("reasoning_effort").is_some() =>
+            {
+                let text = response.into_string().unwrap_or_default();
+                if reasoning_effort_refused(&text) {
+                    let mut plain = body.clone();
+                    if let Some(fields) = plain.as_object_mut() {
+                        fields.remove("reasoning_effort");
+                    }
+                    let retry = post(&plain);
+                    if retry.is_ok() {
+                        thinking_param_rejected().insert(pair.clone());
+                    }
+                    retry.map_err(http_error)
+                } else {
+                    Err(http_fail(code, &text))
+                }
             }
-            let retry = post(&plain);
-            if retry.is_ok() {
-                thinking_param_rejected().insert(pair.clone());
-            }
-            retry
+            Err(error) => Err(http_error(error)),
         }
-        other => other,
     };
     let response = if wants_minimal(endpoint, model) {
-        send(&minimal)
+        send(&minimal)?
     } else {
         match send(&full) {
-            Err(ureq::Error::Status(400, response)) => {
-                let text = response.into_string().unwrap_or_default();
-                let lower = text.to_ascii_lowercase();
+            Err(fail) if fail.category == "http 400" => {
+                let lower = fail.message.to_ascii_lowercase();
                 if lower.contains("temperature")
                     || lower.contains("max_tokens")
-                    || lower.contains("unsupported")
+                    || (lower.contains("unsupported") && !reasoning_effort_refused(&lower))
                 {
                     // Remember only when the reduced request works: the 400 may be about
                     // something else (e.g. an unsupported `system` role or model).
@@ -765,26 +786,20 @@ fn llm(
                     if retry.is_ok() {
                         mark_minimal(endpoint, model);
                     }
-                    retry
+                    retry?
                 } else {
-                    let message = serde_json::from_str::<Value>(&text)
-                        .ok()
-                        .and_then(|json| json["error"]["message"].as_str().map(str::to_owned))
-                        .unwrap_or_else(|| text.chars().take(300).collect());
-                    return Err(Fail::new("http 400", format!("HTTP 400: {message}")));
+                    return Err(fail);
                 }
             }
-            other => other,
+            other => other?,
         }
-    }
-    .map_err(http_error)?;
+    };
     *first_byte = Some(started.elapsed().as_millis());
     let response: Value = response.into_json().map_err(|_| "接口返回格式不对")?;
     let mut choice = response["choices"][0].clone();
     // Reasoning models may spend the whole max_tokens budget thinking: retry without the cap.
     if truncated_empty(&choice) && !wants_minimal(endpoint, model) {
-        let retry: Value = send(&minimal)
-            .map_err(http_error)?
+        let retry: Value = send(&minimal)?
             .into_json()
             .map_err(|_| "接口返回格式不对")?;
         choice = retry["choices"][0].clone();
@@ -1643,6 +1658,61 @@ mod tests {
                 ("ok".to_owned(), Some("none".to_owned())),
                 ("strict".to_owned(), Some("none".to_owned())),
                 ("strict".to_owned(), None),
+                ("strict".to_owned(), None),
+            ]
+        );
+    }
+
+    #[test]
+    fn deepinfra_retries_only_when_the_error_names_reasoning_effort() {
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = server.accept().unwrap();
+                let body = read_request(&mut stream);
+                let json: Value = serde_json::from_str(&body).unwrap();
+                let model = json["model"].as_str().unwrap().to_owned();
+                let effort = json["reasoning_effort"].as_str().map(str::to_owned);
+                seen.push((model.clone(), effort.clone()));
+                let (status, reply) = match (model.as_str(), effort.as_deref()) {
+                    ("missing", _) => (
+                        "400 Bad Request",
+                        r#"{"error":{"message":"model not found"}}"#.to_owned(),
+                    ),
+                    ("strict", Some(_)) => (
+                        "400 Bad Request",
+                        r#"{"error":{"message":"unsupported value for reasoning_effort"}}"#
+                            .to_owned(),
+                    ),
+                    _ => (
+                        "200 OK",
+                        r#"{"choices":[{"finish_reason":"stop","message":{"content":"Hello"}}]}"#
+                            .to_owned(),
+                    ),
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+            }
+            seen
+        });
+        let url = format!("http://{addr}/deepinfra-test/v1/openai/chat/completions");
+        let run = |model: &str| {
+            translate_openai_with("你好", &url, model, "k", TranslationStyle::default(), "")
+        };
+        let missing = run("missing").unwrap_err();
+        assert!(missing.contains("model not found"), "{missing}");
+        assert_eq!(run("strict").as_deref(), Ok("Hello"));
+        let seen = handle.join().unwrap();
+        assert_eq!(
+            seen,
+            vec![
+                ("missing".to_owned(), Some("none".to_owned())),
+                ("strict".to_owned(), Some("none".to_owned())),
                 ("strict".to_owned(), None),
             ]
         );
