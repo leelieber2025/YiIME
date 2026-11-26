@@ -196,6 +196,23 @@ fn http_fail(code: u16, explanation: &str) -> Fail {
     }
 }
 
+/// How long to wait after a 429 before sending the same body again. Integer `Retry-After`
+/// seconds are honoured, capped so a translation is not held for a long queue.
+fn retry_after_delay(header: Option<&str>) -> Option<Duration> {
+    header?.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+const BUSY_RETRIES: u32 = 2;
+const BUSY_RETRY_AFTER_MAX: Duration = Duration::from_secs(5);
+
+fn busy_backoff(attempt: u32) -> Duration {
+    if attempt == 0 {
+        Duration::from_millis(500)
+    } else {
+        Duration::from_secs(2)
+    }
+}
+
 fn http_error(error: ureq::Error) -> Fail {
     match error {
         ureq::Error::Status(code, response) => {
@@ -737,11 +754,27 @@ fn llm(
     }
     let agent = agent(bypass_proxy(endpoint));
     let post = |body: &Value| {
-        agent
-            .post(endpoint)
-            .timeout(timeout)
-            .set("Authorization", &format!("Bearer {key}"))
-            .send_json(body.clone())
+        let mut attempt = 0;
+        loop {
+            match agent
+                .post(endpoint)
+                .timeout(timeout)
+                .set("Authorization", &format!("Bearer {key}"))
+                .send_json(body.clone())
+            {
+                Err(ureq::Error::Status(429, response)) if attempt < BUSY_RETRIES => {
+                    let delay = retry_after_delay(response.header("retry-after"))
+                        .unwrap_or_else(|| busy_backoff(attempt))
+                        .min(BUSY_RETRY_AFTER_MAX);
+                    let _ = response.into_string();
+                    if !delay.is_zero() {
+                        std::thread::sleep(delay);
+                    }
+                    attempt += 1;
+                }
+                other => return other,
+            }
+        }
     };
     // An endpoint that refuses the "no thinking" parameter is asked again without it, and only
     // that (endpoint, model) pair stops sending it once the retry is accepted. Any other 400/422
@@ -1172,9 +1205,15 @@ mod tests {
                     ),
                 };
                 let reply = reply.to_string();
+                // Retry-After: 0 keeps the 429 retry tests from sleeping on the default backoff.
+                let retry_after = if status.starts_with("429") {
+                    "Retry-After: 0\r\n"
+                } else {
+                    ""
+                };
                 write!(
                     stream,
-                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{reply}",
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{retry_after}Connection: close\r\nContent-Length: {}\r\n\r\n{reply}",
                     reply.len()
                 )
                 .unwrap();
@@ -1228,7 +1267,8 @@ mod tests {
 
     #[test]
     fn rate_limit_reports_http_status_without_logging_provider_text() {
-        let (url, server) = fake_llm(1);
+        // One initial 429 plus two short retries, all declined.
+        let (url, server) = fake_llm(3);
         let settings = ApiSettings {
             engine: Engine::Llm,
             url,
@@ -1241,6 +1281,57 @@ mod tests {
         assert!(outcome.result.unwrap_err().contains("HTTP 429"));
         assert_eq!(outcome.attempts[0].failure.as_deref(), Some("http 429"));
         assert!(!outcome.attempts[0].log_line().contains("slow down"));
+    }
+
+    #[test]
+    fn retry_after_parses_integer_seconds_and_ignores_http_dates() {
+        assert_eq!(retry_after_delay(Some("0")), Some(Duration::from_secs(0)));
+        assert_eq!(retry_after_delay(Some(" 2 ")), Some(Duration::from_secs(2)));
+        assert_eq!(
+            retry_after_delay(Some("Wed, 21 Oct 2015 07:28:00 GMT")),
+            None
+        );
+        assert_eq!(retry_after_delay(None), None);
+    }
+
+    #[test]
+    fn llm_retries_a_429_and_returns_the_next_success() {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let mut seen = 0;
+            for _ in 0..2 {
+                let (mut stream, _) = server.accept().unwrap();
+                let _ = read_request(&mut stream);
+                seen += 1;
+                let (status, retry, reply) = if seen == 1 {
+                    (
+                        "429 Too Many Requests",
+                        "Retry-After: 0\r\n",
+                        r#"{"error":{"message":"Model busy, retry later","code":"engine_overloaded"}}"#,
+                    )
+                } else {
+                    (
+                        "200 OK",
+                        "",
+                        r#"{"choices":[{"finish_reason":"stop","message":{"content":"Hello"}}]}"#,
+                    )
+                };
+                let resp = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{retry}Content-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                stream.write_all(resp.as_bytes()).unwrap();
+            }
+            seen
+        });
+        let url = format!("http://{addr}/v1/chat/completions");
+        assert_eq!(
+            translate_openai_with("你好", &url, "m", "k", TranslationStyle::default(), "")
+                .as_deref(),
+            Ok("Hello")
+        );
+        assert_eq!(handle.join().unwrap(), 2);
     }
 
     #[test]
