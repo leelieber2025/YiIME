@@ -257,6 +257,7 @@ impl Composer {
     /// Types a code letter (lowercase). Returns candidates committed on the way (fifth-letter
     /// commit, unique four-letter code) in order; the platform layer writes them into the draft.
     /// Afterwards the state is updated (the code is empty after a unique four-letter commit).
+    /// The code edit itself is [`edit_code`], shared with in-document composition.
     pub fn type_letter(
         &mut self,
         input: &MixedInput,
@@ -265,29 +266,65 @@ impl Composer {
         options: &ComposeOptions,
         learned: &Learned,
     ) -> Vec<Pick> {
-        let mut picks = Vec::new();
-        let mut code = self.code.clone();
-        // Fifth letter: after four letters that cannot continue as pinyin, commit the first
-        // candidate, or drop the four letters if there is none; the new letter starts the next
-        // character.
         let wubi_rules = !options.pinyin_first && options.shuangpin.is_none();
-        if wubi_rules && rules.push_fifth && pushes_fifth(input, &code, letter) {
-            if let Some(pick) = self.candidate_at(0).filter(|_| input.wubi_count(&code) > 0) {
+        let edit = edit_code(&self.code, letter, wubi_rules.then_some((input, rules)));
+        if edit.ignored {
+            return Vec::new();
+        }
+        let mut picks = Vec::new();
+        if edit.fifth && input.wubi_count(&self.code) > 0 {
+            if let Some(pick) = self.candidate_at(0) {
                 picks.push(pick);
-                self.set_code(input, String::new(), options, learned);
             }
-            code.clear();
         }
-        if code.len() < MAX_CODE_LEN {
-            code.push(letter);
-            self.set_code(input, code.clone(), options, learned);
-        }
-        let auto = wubi_rules && rules.auto_commit4 && auto_commits_four(input, &code);
-        if let Some(pick) = self.candidate_at(0).filter(|_| auto) {
+        self.set_code(input, edit.code, options, learned);
+        if edit.auto
+            && let Some(pick) = self.candidate_at(0)
+        {
             picks.push(pick);
             self.set_code(input, String::new(), options, learned);
         }
         picks
+    }
+}
+
+/// How [`edit_code`] changes a code. Both the draft box and in-document composition use this,
+/// then each looks up the candidate text in its own list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodeEdit {
+    /// The fifth-letter rule cleared the previous code before `code`.
+    pub fifth: bool,
+    /// Code after the letter, or the original code when [`Self::ignored`].
+    pub code: String,
+    /// The letter was not added: the code was already at [`MAX_CODE_LEN`].
+    pub ignored: bool,
+    /// `code` is a unique four-letter Wubi code and should be committed.
+    pub auto: bool,
+}
+
+/// Fifth-letter and unique-four rules, then the new letter. `wubi` is None for pinyin-first and
+/// Shuangpin, where those rules stay off. A letter past [`MAX_CODE_LEN`] sets [`CodeEdit::ignored`].
+pub fn edit_code(code: &str, letter: char, wubi: Option<(&MixedInput, LetterRules)>) -> CodeEdit {
+    let fifth =
+        wubi.is_some_and(|(input, rules)| rules.push_fifth && pushes_fifth(input, code, letter));
+    let mut next = if fifth {
+        String::new()
+    } else {
+        code.to_owned()
+    };
+    let ignored = next.len() >= MAX_CODE_LEN;
+    if ignored {
+        next = code.to_owned();
+    } else {
+        next.push(letter);
+    }
+    let auto = !ignored
+        && wubi.is_some_and(|(input, rules)| rules.auto_commit4 && auto_commits_four(input, &next));
+    CodeEdit {
+        fifth,
+        code: next,
+        ignored,
+        auto,
     }
 }
 

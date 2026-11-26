@@ -1,5 +1,9 @@
-use super::candidate::{create_font, scale_px, window_dpi};
+use super::candidate::{create_font, relayout, scale_px, window_dpi};
 use super::*;
+
+const UI_SCALE_LABEL: &str = "造字框大小（五笔和翻译）";
+const UI_SCALE_CHOICES: [&str; 5] = ["100%（默认）", "125%", "150%", "175%", "200%"];
+const _: () = assert!(UI_SCALE_CHOICES.len() == yiime_core::UI_SCALES.len());
 
 /// Opens the settings window (or brings it forward).
 pub(super) unsafe fn open_settings(owner: HWND) {
@@ -239,6 +243,13 @@ impl SettingsLayout {
         preferred = preferred
             .max(m.margin * 2 + hist_label_w + m.gutter + scale_px(160, dpi) + m.gutter + clear_w);
 
+        let scale_label_w = text_cx(font, UI_SCALE_LABEL) + m.btn_pad;
+        let mut scale_combo = m.combo_extra;
+        for label in UI_SCALE_CHOICES {
+            scale_combo = scale_combo.max(text_cx(font, label) + m.combo_extra);
+        }
+        preferred = preferred.max(m.margin * 2 + scale_label_w + m.gutter + scale_combo);
+
         let words_w = text_cx(font, "用户词库…") + m.btn_pad * 2;
         let save_w = (text_cx(font, "保存") + m.btn_pad * 2).max(scale_px(80, dpi));
         let cancel_w = (text_cx(font, "取消") + m.btn_pad * 2).max(scale_px(80, dpi));
@@ -321,6 +332,22 @@ impl SettingsLayout {
             y,
             page_edit_w.min(col_w.saturating_sub(page_label_w)),
             m.edit_h,
+        );
+        y += m.edit_h + m.row_gap;
+
+        place(
+            LBL_UI_SCALE,
+            left,
+            y + (m.edit_h - m.label_h) / 2,
+            scale_label_w,
+            m.label_h,
+        );
+        place(
+            SETTINGS_UI_SCALE,
+            left + scale_label_w + m.gutter / 2,
+            y,
+            scale_combo,
+            m.combo_list_h,
         );
         y += m.edit_h + m.row_gap;
 
@@ -737,6 +764,22 @@ pub(super) unsafe extern "system" fn settings_proc(
                 SETTINGS_PAGE_SIZE,
             );
             SendMessageW(GetDlgItem(hwnd, SETTINGS_PAGE_SIZE), EM_LIMITTEXT, 2, 0);
+            add_label(hwnd, UI_SCALE_LABEL, LBL_UI_SCALE);
+            let scale = add_control(
+                hwnd,
+                "COMBOBOX",
+                "",
+                CBS_DROPDOWNLIST as u32 | WS_VSCROLL | WS_TABSTOP,
+                SETTINGS_UI_SCALE,
+            );
+            for label in UI_SCALE_CHOICES {
+                SendMessageW(scale, CB_ADDSTRING, 0, wide(label).as_ptr() as isize);
+            }
+            let selected = yiime_core::UI_SCALES
+                .iter()
+                .position(|percent| *percent == OPTIONS.ui_scale())
+                .unwrap_or(0);
+            SendMessageW(scale, CB_SETCURSEL, selected, 0);
             for (id, text, option_key) in OPTION_BOXES {
                 let checkbox = add_control(
                     hwnd,
@@ -1062,10 +1105,20 @@ pub(super) unsafe extern "system" fn settings_proc(
                         .ok()
                         .and_then(|index| index.checked_sub(1))
                         .and_then(|index| Shuangpin::ALL.get(index).copied());
+                        let scale = usize::try_from(SendMessageW(
+                            GetDlgItem(hwnd, SETTINGS_UI_SCALE),
+                            CB_GETCURSEL,
+                            0,
+                            0,
+                        ))
+                        .ok()
+                        .and_then(|index| yiime_core::UI_SCALES.get(index).copied())
+                        .unwrap_or(yiime_core::UI_SCALE);
                         let options_ok = set_plain_mode(plain)
                             && OPTIONS.set_plain_toggle_key(&hotkey)
                             && set_option(Flag::HistoryEnabled, history_on)
                             && OPTIONS.set_page_size(page)
+                            && OPTIONS.set_ui_scale(scale)
                             && OPTIONS.set_shuangpin(shuangpin)
                             && OPTIONS.set_history_key(&history_key)
                             && OPTION_BOXES.iter().all(|(id, _, option_key)| {
@@ -1108,6 +1161,7 @@ pub(super) unsafe extern "system" fn settings_proc(
                                 Some(("设置已保存，按 Enter 翻译".into(), false)),
                             );
                         }
+                        relayout(owner, state);
                         DestroyWindow(hwnd);
                     }
                 }

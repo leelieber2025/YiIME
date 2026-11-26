@@ -15,6 +15,9 @@ pub const DEFAULT_HISTORY_KEY: &str = "Ctrl+Shift+Z";
 /// Default and allowed range of candidates per page.
 pub const PAGE_SIZE: usize = 9;
 pub const PAGE_SIZE_RANGE: std::ops::RangeInclusive<usize> = 1..=9;
+/// Composition-window scale, in percent. 100 is the size the boxes have always used.
+pub const UI_SCALE: u32 = 100;
+pub const UI_SCALES: [u32; 5] = [100, 125, 150, 175, 200];
 pub const SETTINGS_FILE: &str = "settings.json";
 /// Encrypted API key file.
 pub const KEY_FILE: &str = "key.dpapi";
@@ -203,6 +206,16 @@ impl<S: OptionStore> Options<S> {
         let size = size.clamp(*PAGE_SIZE_RANGE.start(), *PAGE_SIZE_RANGE.end());
         self.0.set_u32("PageSize", size as u32)
     }
+    /// Scale of the Wubi candidate bar and the translation box. An unknown value is 100%.
+    pub fn ui_scale(&self) -> u32 {
+        self.0
+            .get_u32("UiScale")
+            .filter(|value| UI_SCALES.contains(value))
+            .unwrap_or(UI_SCALE)
+    }
+    pub fn set_ui_scale(&self, percent: u32) -> bool {
+        UI_SCALES.contains(&percent) && self.0.set_u32("UiScale", percent)
+    }
     /// Shuangpin layout (`Shuangpin` string: `xiaohe`, `microsoft`, `ziranma`); None (the default)
     /// is Wubi + full pinyin.
     pub fn shuangpin(&self) -> Option<Shuangpin> {
@@ -234,6 +247,17 @@ impl<S: OptionStore> Options<S> {
             .filter(|text| parse_hotkey(text).is_some())
             .unwrap_or_else(|| default.to_owned())
     }
+}
+
+/// Monitor DPI after the composition-window scale. 100% returns `dpi` (at least 96).
+pub fn scaled_dpi(dpi: u32, percent: u32) -> u32 {
+    let percent = if UI_SCALES.contains(&percent) {
+        percent
+    } else {
+        UI_SCALE
+    };
+    let dpi = dpi.max(96);
+    (u64::from(dpi) * u64::from(percent) / 100).max(96) as u32
 }
 
 /// Parses the page-size field in the settings window: an error if not a number, otherwise clamped
@@ -831,6 +855,19 @@ mod tests {
         assert_eq!(options.page_size(), 1);
         assert!(options.set_page_size(5));
         assert_eq!(options.page_size(), 5);
+        assert_eq!(options.ui_scale(), UI_SCALE);
+        assert!(!options.set_ui_scale(110));
+        assert_eq!(options.ui_scale(), UI_SCALE);
+        assert!(options.set_ui_scale(150));
+        assert_eq!(options.ui_scale(), 150);
+        options.0.set_u32("UiScale", 999);
+        assert_eq!(options.ui_scale(), UI_SCALE);
+        assert_eq!(scaled_dpi(96, 100), 96);
+        assert_eq!(scaled_dpi(144, 100), 144);
+        assert_eq!(scaled_dpi(96, 125), 120);
+        assert_eq!(scaled_dpi(96, 200), 192);
+        assert_eq!(scaled_dpi(120, 150), 180);
+        assert_eq!(scaled_dpi(80, 130), 96);
         assert_eq!(parse_page_size(" 12 "), Ok(9));
         assert_eq!(parse_page_size("0"), Ok(1));
         assert!(parse_page_size("x").is_err());

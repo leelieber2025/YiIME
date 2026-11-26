@@ -94,7 +94,7 @@ use inline::InlineInput;
 use lang_bar::{
     InputModeButton, LangBarSink, chinese_punctuation, history_key_text, option, page_size,
     parse_hotkey, plain_mode, plain_toggle_text, refresh_sink, set_plain_mode, shuangpin_scheme,
-    toggle_option,
+    toggle_option, ui_scale,
 };
 use registration::{register, unregister};
 

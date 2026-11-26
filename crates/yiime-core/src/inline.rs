@@ -69,10 +69,9 @@ pub mod ui {
     use crate::MAX_CODE_LEN;
     use crate::dict::{MixedInput, Source};
     use crate::engine::{
-        LetterAction, LetterRules, auto_commits_four, classify_letter, paging_direction_vk,
-        pushes_fifth,
+        LetterAction, LetterRules, classify_letter, edit_code, paging_direction_vk,
     };
-    use crate::keys::semicolon_is_code;
+    use crate::keys::{KeyAction, KeyContext, classify_char, semicolon_is_code};
     use crate::shuangpin::Shuangpin;
     use crate::text::to_traditional;
     use std::collections::HashSet;
@@ -507,7 +506,7 @@ pub mod ui {
                 wubi,
                 typed,
             } = input;
-            let Some(mut code) = self.code(context).map(str::to_owned) else {
+            let Some(code) = self.code(context).map(str::to_owned) else {
                 if !(0x41..=0x5a).contains(&key) {
                     return InlineKeyOutcome::NotHandled;
                 }
@@ -530,41 +529,7 @@ pub mod ui {
                             InlineKeyOutcome::Finish(out)
                         }
                         Some(LetterAction::Compose(c)) => {
-                            // Microsoft Wubi rules, as in the draft box (Composer::type_letter):
-                            // a fifth letter commits the first candidate (or drops four letters
-                            // that have none) and starts the next character.
-                            let mut committed = String::new();
-                            let fifth = wubi.filter(|(input, rules)| {
-                                rules.push_fifth && pushes_fifth(input, &code, c)
-                            });
-                            if let Some((input, _)) = fifth {
-                                if input.wubi_count(&code) > 0 {
-                                    if let Some((text, _)) = choice_at(0) {
-                                        committed = text;
-                                    }
-                                }
-                                code.clear();
-                            }
-                            if code.len() >= MAX_CODE_LEN {
-                                return InlineKeyOutcome::Swallow;
-                            }
-                            code.push(c);
-                            let unique = wubi.is_some_and(|(input, rules)| {
-                                rules.auto_commit4 && auto_commits_four(input, &code)
-                            });
-                            if let Some((text, _)) = unique.then(|| first_for(&code)).flatten() {
-                                self.active = None;
-                                return InlineKeyOutcome::Finish(committed + &text);
-                            }
-                            self.active = Some((context.clone(), code.clone()));
-                            if committed.is_empty() {
-                                InlineKeyOutcome::Update(code)
-                            } else {
-                                InlineKeyOutcome::PickPartial {
-                                    committed,
-                                    rest: code,
-                                }
-                            }
+                            self.compose_letter(context, &code, c, wubi, choice_at, first_for)
                         }
                         _ => InlineKeyOutcome::NotHandled,
                     }
@@ -572,48 +537,14 @@ pub mod ui {
                 0xBA if !shift
                     && shuangpin.is_some_and(|scheme| semicolon_is_code(scheme, &code)) =>
                 {
-                    if code.len() >= MAX_CODE_LEN {
-                        return InlineKeyOutcome::Swallow;
-                    }
-                    code.push(';');
-                    self.active = Some((context.clone(), code.clone()));
-                    InlineKeyOutcome::Update(code)
-                }
-                0x08 => {
-                    code.pop();
-                    if code.is_empty() {
-                        self.active = None;
-                        InlineKeyOutcome::Finish(String::new())
-                    } else {
-                        self.active = Some((context.clone(), code.clone()));
-                        InlineKeyOutcome::Update(code)
-                    }
-                }
-                0x1b => {
-                    self.active = None;
-                    InlineKeyOutcome::Finish(String::new())
-                }
-                0x0d => {
-                    self.active = None;
-                    InlineKeyOutcome::Finish(code)
-                }
-                0x20 => {
-                    if let Some((text, rest)) = choice_at(0) {
-                        self.apply_choice(context, text, rest)
-                    } else {
-                        self.active = None;
-                        InlineKeyOutcome::Finish(code)
-                    }
-                }
-                0x31..=0x39 if !shift => {
-                    if let Some((text, rest)) = choice_at(key - 0x31) {
-                        self.apply_choice(context, text, rest)
-                    } else {
-                        // No candidate at that number: keep the digit out of the composition.
-                        InlineKeyOutcome::Swallow
-                    }
+                    self.compose_letter(context, &code, ';', None, choice_at, first_for)
                 }
                 _ => {
+                    if let Some(outcome) =
+                        self.box_key(context, &code, key, shift, comma_period_paging, choice_at)
+                    {
+                        return outcome;
+                    }
                     if let Some(forward) = u16::try_from(key)
                         .ok()
                         .and_then(|vk| paging_direction_vk(vk, shift, comma_period_paging))
@@ -630,6 +561,117 @@ pub mod ui {
                     InlineKeyOutcome::NotHandled
                 }
             }
+        }
+
+        /// Fifth-letter and unique-four edits from [`edit_code`] (the same steps as
+        /// [`crate::Composer::type_letter`]). The candidate text still comes from this
+        /// composition's own list.
+        fn compose_letter(
+            &mut self,
+            context: &C,
+            code: &str,
+            letter: char,
+            wubi: Option<(&MixedInput, LetterRules)>,
+            choice_at: impl FnOnce(usize) -> Option<(String, String)>,
+            first_for: &dyn Fn(&str) -> Option<(String, String)>,
+        ) -> InlineKeyOutcome {
+            let edit = edit_code(code, letter, wubi);
+            if edit.ignored {
+                return InlineKeyOutcome::Swallow;
+            }
+            let mut committed = String::new();
+            if edit.fifth && wubi.is_some_and(|(input, _)| input.wubi_count(code) > 0) {
+                if let Some((text, _)) = choice_at(0) {
+                    committed = text;
+                }
+            }
+            if edit.auto
+                && let Some((text, _)) = first_for(&edit.code)
+            {
+                self.active = None;
+                return InlineKeyOutcome::Finish(committed + &text);
+            }
+            self.active = Some((context.clone(), edit.code.clone()));
+            if committed.is_empty() {
+                InlineKeyOutcome::Update(edit.code)
+            } else {
+                InlineKeyOutcome::PickPartial {
+                    committed,
+                    rest: edit.code,
+                }
+            }
+        }
+
+        /// Space, digits, Enter, Esc, Backspace and the character paging keys. The decision is
+        /// [`classify_char`], the same function the draft box uses.
+        fn box_key(
+            &mut self,
+            context: &C,
+            code: &str,
+            key: usize,
+            shift: bool,
+            comma_period_paging: bool,
+            choice_at: impl FnOnce(usize) -> Option<(String, String)>,
+        ) -> Option<InlineKeyOutcome> {
+            let ch = match key {
+                0x08 => '\u{8}',
+                0x1b => '\u{1b}',
+                0x0d => '\r',
+                0x20 => ' ',
+                0x31..=0x39 if !shift => key as u8 as char,
+                0xBD if !shift => '-',
+                0xBB if !shift => '=',
+                0xBC if !shift && comma_period_paging => ',',
+                0xBE if !shift && comma_period_paging => '.',
+                _ => return None,
+            };
+            let action = classify_char(
+                ch,
+                &KeyContext {
+                    composing: true,
+                    shift,
+                    comma_period_paging,
+                    ..KeyContext::default()
+                },
+            );
+            Some(match action {
+                KeyAction::Backspace => {
+                    let mut next = code.to_owned();
+                    next.pop();
+                    if next.is_empty() {
+                        self.active = None;
+                        InlineKeyOutcome::Finish(String::new())
+                    } else {
+                        self.active = Some((context.clone(), next.clone()));
+                        InlineKeyOutcome::Update(next)
+                    }
+                }
+                KeyAction::ClearCode => {
+                    self.active = None;
+                    InlineKeyOutcome::Finish(String::new())
+                }
+                KeyAction::CommitRaw => {
+                    self.active = None;
+                    InlineKeyOutcome::Finish(code.to_owned())
+                }
+                KeyAction::PickFirstOrRaw => {
+                    if let Some((text, rest)) = choice_at(0) {
+                        self.apply_choice(context, text, rest)
+                    } else {
+                        self.active = None;
+                        InlineKeyOutcome::Finish(code.to_owned())
+                    }
+                }
+                KeyAction::Pick(index) => {
+                    if let Some((text, rest)) = choice_at(index) {
+                        self.apply_choice(context, text, rest)
+                    } else {
+                        InlineKeyOutcome::Swallow
+                    }
+                }
+                KeyAction::Page { forward } => InlineKeyOutcome::Page(forward),
+                _ => return None,
+            })
         }
 
         /// The active composition's context.
@@ -930,6 +972,167 @@ mod ui_tests {
             InlineKeyOutcome::Update("gggg".into())
         );
         assert_eq!(logic.context(), Some(&ctx));
+    }
+
+    #[test]
+    fn draft_box_and_inline_share_wubi_letter_edits() {
+        use crate::{ComposeOptions, Composer, Learned, LetterRules};
+        let input =
+            MixedInput::from_rime("...\n王\tgggg\t100\n工\taaaa\t100\n式\taaaa\t90\n", "...\n");
+        let options = ComposeOptions {
+            page_size: 5,
+            traditional: false,
+            learn: false,
+            fuzzy: false,
+            pinyin_first: false,
+            common_only: false,
+            shuangpin: None,
+        };
+        let rules = LetterRules {
+            push_fifth: true,
+            auto_commit4: true,
+        };
+        let learned = Learned::default();
+        let ctx = 1u8;
+        let first = |code: &str| {
+            input
+                .candidates(code, 1)
+                .into_iter()
+                .next()
+                .map(|row| (row.text, row.rest))
+        };
+        let key = |wubi| InlineKey {
+            key: b'G' as usize,
+            shift: false,
+            caps_lock: false,
+            comma_period_paging: false,
+            shuangpin: None,
+            wubi,
+            typed: None,
+        };
+        let mut composer = Composer::default();
+        for ch in ['g', 'g', 'g'] {
+            assert!(
+                composer
+                    .type_letter(&input, ch, rules, &options, &learned)
+                    .is_empty()
+            );
+        }
+        let mut logic = LogicalInline::default();
+        logic.sync_from_composition(&ctx, &composer.code);
+        let picks = composer.type_letter(&input, 'g', rules, &options, &learned);
+        let outcome = logic.handle_key_with(&ctx, key(Some((&input, rules))), |_| None, &first);
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].text, "王");
+        assert!(composer.code.is_empty());
+        assert_eq!(outcome, InlineKeyOutcome::Finish("王".into()));
+        assert!(!logic.active());
+
+        let mut composer = Composer::default();
+        for ch in ['a', 'a', 'a', 'a'] {
+            assert!(
+                composer
+                    .type_letter(&input, ch, rules, &options, &learned)
+                    .is_empty()
+            );
+        }
+        assert_eq!(composer.code, "aaaa");
+        let shown = composer.candidate_at(0).map(|pick| (pick.text, pick.rest));
+        logic.sync_from_composition(&ctx, "aaaa");
+        let picks = composer.type_letter(&input, 'g', rules, &options, &learned);
+        let outcome = logic.handle_key_with(
+            &ctx,
+            key(Some((&input, rules))),
+            |index| (index == 0).then(|| shown.clone()).flatten(),
+            &first,
+        );
+        assert_eq!(picks.len(), 1);
+        assert_eq!(picks[0].text, "工");
+        assert_eq!(composer.code, "g");
+        assert_eq!(
+            outcome,
+            InlineKeyOutcome::PickPartial {
+                committed: "工".into(),
+                rest: "g".into(),
+            }
+        );
+
+        let off = LetterRules {
+            push_fifth: false,
+            auto_commit4: false,
+        };
+        let mut composer = Composer::default();
+        for ch in ['g', 'g', 'g', 'g'] {
+            assert!(
+                composer
+                    .type_letter(&input, ch, off, &options, &learned)
+                    .is_empty()
+            );
+        }
+        logic.sync_from_composition(&ctx, "ggg");
+        let outcome = logic.handle_key_with(&ctx, key(Some((&input, off))), |_| None, &first);
+        assert_eq!(composer.code, "gggg");
+        assert_eq!(outcome, InlineKeyOutcome::Update("gggg".into()));
+    }
+
+    #[test]
+    fn shared_composing_keys_follow_the_draft_box() {
+        let ctx = 1u8;
+        let key = |vk| InlineKey {
+            key: vk,
+            shift: false,
+            caps_lock: false,
+            comma_period_paging: true,
+            shuangpin: None,
+            wubi: None,
+            typed: None,
+        };
+        let mut logic = LogicalInline::default();
+        logic.sync_from_composition(&ctx, "ni");
+        assert_eq!(
+            logic.handle_key_with(
+                &ctx,
+                key(0x20),
+                |_| Some(("你".into(), String::new())),
+                &|_| None
+            ),
+            InlineKeyOutcome::Finish("你".into())
+        );
+        logic.sync_from_composition(&ctx, "ni");
+        assert_eq!(
+            logic.handle_key_with(&ctx, key(0x20), |_| None, &|_| None),
+            InlineKeyOutcome::Finish("ni".into())
+        );
+        logic.sync_from_composition(&ctx, "ni");
+        assert_eq!(
+            logic.handle_key_with(&ctx, key(0x0d), |_| None, &|_| None),
+            InlineKeyOutcome::Finish("ni".into())
+        );
+        logic.sync_from_composition(&ctx, "ni");
+        assert_eq!(
+            logic.handle_key_with(&ctx, key(0x1b), |_| None, &|_| None),
+            InlineKeyOutcome::Finish(String::new())
+        );
+        logic.sync_from_composition(&ctx, "ni");
+        assert_eq!(
+            logic.handle_key_with(&ctx, key(0x08), |_| None, &|_| None),
+            InlineKeyOutcome::Update("n".into())
+        );
+        logic.sync_from_composition(&ctx, "ni");
+        assert_eq!(
+            logic.handle_key_with(&ctx, key(0xBD), |_| None, &|_| None),
+            InlineKeyOutcome::Page(false)
+        );
+        logic.sync_from_composition(&ctx, "ni");
+        assert_eq!(
+            logic.handle_key_with(
+                &ctx,
+                key(0x32),
+                |index| (index == 1).then_some(("好".into(), String::new())),
+                &|_| None
+            ),
+            InlineKeyOutcome::Finish("好".into())
+        );
     }
 
     #[test]

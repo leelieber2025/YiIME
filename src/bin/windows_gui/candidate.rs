@@ -1,45 +1,21 @@
+use super::candidate_draw::{apply_window_shape, draw_text, fill_round, stroke_border, text_width};
 use super::*;
 
-pub(super) unsafe fn create_font(height: i32) -> HFONT {
-    unsafe {
-        CreateFontW(
-            -height,
-            0,
-            0,
-            0,
-            400,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET as _,
-            OUT_DEFAULT_PRECIS as _,
-            CLIP_DEFAULT_PRECIS as _,
-            CLEARTYPE_QUALITY as _,
-            0,
-            wide("Microsoft YaHei UI").as_ptr(),
-        )
-    }
+pub(super) use super::candidate_draw::{create_font, scale_px, window_dpi};
+
+/// Monitor DPI times the composition-window scale. 100% is the monitor DPI.
+fn box_dpi(hwnd: HWND) -> u32 {
+    yiime_core::scaled_dpi(window_dpi(hwnd), OPTIONS.ui_scale())
 }
 
-pub(super) fn window_dpi(hwnd: HWND) -> u32 {
-    let dpi = if !hwnd.is_null() {
-        unsafe { GetDpiForWindow(hwnd) }
-    } else {
-        0
-    };
-    let dpi = if dpi == 0 {
-        unsafe { GetDpiForSystem() }
-    } else {
-        dpi
-    };
-    dpi.max(96)
+/// Pixel length that stays the same at 100% and grows with the composition-window scale.
+fn zoom(px: i32) -> i32 {
+    (i64::from(px) * i64::from(OPTIONS.ui_scale()) / 100) as i32
 }
-pub(super) fn scale_px(px: i32, dpi: u32) -> i32 {
-    (i64::from(px) * i64::from(dpi) / 96).max(1) as i32
-}
-/// Recreate the draft fonts when the window's DPI changes.
+
+/// Recreate the draft fonts when the window's DPI or the composition-window scale changes.
 pub(super) unsafe fn ensure_fonts(hwnd: HWND, state: &State) -> u32 {
-    let dpi = window_dpi(hwnd);
+    let dpi = box_dpi(hwnd);
     if dpi == state.font_dpi.get() && !state.font.get().is_null() {
         return dpi;
     }
@@ -63,21 +39,6 @@ pub(super) fn scaled_line_h(state: &State) -> i32 {
     scale_px(LINE_H, state.font_dpi.get().max(96))
 }
 
-unsafe fn text_width(hdc: HDC, text: &str) -> i32 {
-    let units: Vec<u16> = text.encode_utf16().collect();
-    let mut size = SIZE { cx: 0, cy: 0 };
-    unsafe {
-        GetTextExtentPoint32W(hdc, units.as_ptr(), units.len() as i32, &mut size);
-    }
-    size.cx
-}
-unsafe fn draw_text(hdc: HDC, x: i32, y: i32, color: u32, text: &str) {
-    let units: Vec<u16> = text.encode_utf16().collect();
-    unsafe {
-        SetTextColor(hdc, color);
-        TextOutW(hdc, x, y, units.as_ptr(), units.len() as i32);
-    }
-}
 /// Below the cursor, or above it if it does not fit; always inside the monitor's work area.
 unsafe fn place(anchor: RECT, width: i32, height: i32, dpi: u32) -> (i32, i32) {
     let work = unsafe { work_area(anchor) };
@@ -112,68 +73,6 @@ unsafe fn work_area(anchor: RECT) -> RECT {
     }
 }
 
-/// Match the inline candidate bar: DWM small rounded corners, or a region fallback.
-fn apply_window_shape(hwnd: HWND, width: i32, height: i32) {
-    let preference = DWMWCP_ROUNDSMALL;
-    let rounded = unsafe {
-        DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
-            &preference as *const _ as _,
-            std::mem::size_of_val(&preference) as u32,
-        )
-    } >= 0;
-    if !rounded && width > 0 && height > 0 {
-        let radius = scale_px(8, window_dpi(hwnd));
-        let region = unsafe { CreateRoundRectRgn(0, 0, width, height, radius, radius) };
-        if !region.is_null() {
-            unsafe {
-                SetWindowRgn(hwnd, region, 1);
-            }
-        }
-    }
-}
-fn fill_round(hdc: HDC, rect: RECT, color: u32, radius: i32) {
-    let brush = unsafe { CreateSolidBrush(color) };
-    let pen = unsafe { CreatePen(PS_SOLID, 1, color) };
-    let old_brush = unsafe { SelectObject(hdc, brush as _) };
-    let old_pen = unsafe { SelectObject(hdc, pen as _) };
-    unsafe {
-        RoundRect(
-            hdc,
-            rect.left,
-            rect.top,
-            rect.right,
-            rect.bottom,
-            radius,
-            radius,
-        );
-        SelectObject(hdc, old_brush);
-        SelectObject(hdc, old_pen);
-        DeleteObject(brush as _);
-        DeleteObject(pen as _);
-    }
-}
-fn stroke_border(hdc: HDC, client: RECT, color: u32, radius: i32) {
-    let pen = unsafe { CreatePen(PS_SOLID, 1, color) };
-    let old_pen = unsafe { SelectObject(hdc, pen as _) };
-    let old_brush = unsafe { SelectObject(hdc, GetStockObject(NULL_BRUSH)) };
-    unsafe {
-        RoundRect(
-            hdc,
-            client.left,
-            client.top,
-            client.right,
-            client.bottom,
-            radius,
-            radius,
-        );
-        SelectObject(hdc, old_pen);
-        SelectObject(hdc, old_brush);
-        DeleteObject(pen as _);
-    }
-}
-
 /// Resizes and repositions the box for the draft, code and candidates.
 pub(super) unsafe fn relayout(hwnd: HWND, state: &State) {
     let dpi = unsafe { ensure_fonts(hwnd, state) };
@@ -188,7 +87,8 @@ pub(super) unsafe fn relayout(hwnd: HWND, state: &State) {
     let composing = !composition.code.is_empty();
     let hdc = unsafe { GetDC(hwnd) };
     let old = unsafe { SelectObject(hdc, state.font.get() as _) };
-    let mut width = (unsafe { text_width(hdc, &draft) } + 24).min(DRAFT_MAX_W) + 2 * pad;
+    let mut width =
+        (unsafe { text_width(hdc, &draft) } + zoom(24)).min(zoom(DRAFT_MAX_W)) + 2 * pad;
     composition.hits.clear();
     if composing {
         let mut x = pad;
@@ -262,7 +162,7 @@ pub(super) unsafe fn relayout(hwnd: HWND, state: &State) {
         let mut rect = RECT {
             left: 0,
             top: 0,
-            right: edit_w - 10,
+            right: edit_w - zoom(10),
             bottom: 0,
         };
         DrawTextW(
@@ -295,7 +195,7 @@ pub(super) unsafe fn relayout(hwnd: HWND, state: &State) {
     }
 }
 pub(super) unsafe fn paint(hwnd: HWND, state: &State) {
-    let dpi = window_dpi(hwnd);
+    let dpi = box_dpi(hwnd);
     let pad = scale_px(PAD, dpi);
     let line_h = scale_px(LINE_H, dpi);
     let mut paint: PAINTSTRUCT = unsafe { std::mem::zeroed() };

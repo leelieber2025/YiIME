@@ -49,9 +49,9 @@ pub use dict::{
 pub use draft::Draft;
 #[cfg(feature = "engine")]
 pub use engine::{
-    CANDIDATE_PAGES, ComposeOptions, Composer, Flushed, LetterAction, LetterRules, Pick,
-    auto_commits_four, char_of_word, classify_letter, paging_direction, paging_direction_vk,
-    pushes_fifth, selection_index,
+    CANDIDATE_PAGES, CodeEdit, ComposeOptions, Composer, Flushed, LetterAction, LetterRules, Pick,
+    auto_commits_four, char_of_word, classify_letter, edit_code, paging_direction,
+    paging_direction_vk, pushes_fifth, selection_index,
 };
 pub use history::{HISTORY_CAP, HISTORY_FILE, History, HistoryEntry, history_label};
 pub use hotkey::{DEFAULT_PLAIN_TOGGLE, Hotkey, conflicts_with_builtin, parse_hotkey};
@@ -91,8 +91,8 @@ pub use service::{
 pub use settings::{
     AZURE_KEY_FILE, ApiSettings, DEFAULT_HISTORY_KEY, DEFAULT_URL, Engine, Flag, GOOGLE_KEY_FILE,
     KEY_FILE, LEGACY_MIGRATION_MARKER, MemoryStore, OptionStore, Options, PAGE_SIZE,
-    PAGE_SIZE_RANGE, PlainSealer, SETTINGS_BROKEN, SETTINGS_FILE, Sealer, UNKNOWN_ENGINE,
-    USER_WORDS_FILE, llm_url_allowed, parse_page_size, plain_cell,
+    PAGE_SIZE_RANGE, PlainSealer, SETTINGS_BROKEN, SETTINGS_FILE, Sealer, UI_SCALE, UI_SCALES,
+    UNKNOWN_ENGINE, USER_WORDS_FILE, llm_url_allowed, parse_page_size, plain_cell, scaled_dpi,
 };
 pub use shuangpin::Shuangpin;
 pub use style::{TranslationStyle, system_prompt};

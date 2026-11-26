@@ -1,18 +1,15 @@
 use super::*;
+use crate::candidate_draw::{
+    ACCENT, BACKGROUND, BORDER, DISABLED, DIVIDER, GRAY, HIGHLIGHT, INK, MUTED, apply_window_shape,
+    create_font, draw_text, fill_round, scale_px, stroke_border, text_width, window_dpi,
+};
 use std::path::PathBuf;
 use std::sync::Mutex;
-use windows_sys::Win32::Foundation::SIZE;
-use windows_sys::Win32::Graphics::Dwm::{
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUNDSMALL, DwmSetWindowAttribute,
-};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreatePen, CreateRoundRectRgn,
-    CreateSolidBrush, DEFAULT_CHARSET, DeleteObject, EndPaint, FillRect, GetDC, GetStockObject,
-    GetTextExtentPoint32W, GetTextMetricsW, HFONT, InvalidateRect, NULL_BRUSH, OUT_DEFAULT_PRECIS,
-    PAINTSTRUCT, PS_SOLID, ReleaseDC, RoundRect, SelectObject, SetBkMode, SetTextColor,
-    SetWindowRgn, TEXTMETRICW, TRANSPARENT, TextOutW, WHITE_BRUSH,
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, FillRect, GetDC, GetStockObject,
+    GetTextMetricsW, HFONT, InvalidateRect, PAINTSTRUCT, ReleaseDC, SelectObject, SetBkMode,
+    TEXTMETRICW, TRANSPARENT, WHITE_BRUSH,
 };
-use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CS_DROPSHADOW, CS_HREDRAW, CS_VREDRAW, GetClientRect, GetCursorPos, GetWindowRect,
     MA_NOACTIVATE, SW_SHOWNA, WM_LBUTTONDOWN, WM_MOUSEACTIVATE, WM_NCDESTROY, WM_PAINT,
@@ -24,16 +21,6 @@ use yiime_core::inline_ui::{
 
 const CANDIDATE_GUID: GUID = GUID::from_u128(0xd39fb88b_09bb_4ca2_a050_174b5ab3b7c0);
 const CANDIDATE_CLASS: &str = "YiIMECandidate";
-// Compact Microsoft Wubi (Win11) palette: light bar, gray pill, dark text, small gray hints.
-const INK: u32 = 0x0020_2020;
-const MUTED: u32 = 0x0070_7070;
-const GRAY: u32 = 0x0080_8080;
-const DISABLED: u32 = 0x00B0_B0B0;
-const HIGHLIGHT: u32 = 0x00EB_EBEB;
-const ACCENT: u32 = 0x005C_5C5C;
-const BACKGROUND: u32 = 0x00F7_F7F7;
-const BORDER: u32 = 0x00D8_D8D8;
-const DIVIDER: u32 = 0x00E0_E0E0;
 const FONT_PX: i32 = 14;
 const SMALL_FONT_PX: i32 = 11;
 const PAD_X: i32 = 8;
@@ -116,67 +103,8 @@ fn page_len() -> usize {
     page_size().max(1)
 }
 
-fn window_dpi(hwnd: HWND) -> u32 {
-    let dpi = if !hwnd.is_null() {
-        unsafe { GetDpiForWindow(hwnd) }
-    } else {
-        0
-    };
-    let dpi = if dpi == 0 {
-        unsafe { GetDpiForSystem() }
-    } else {
-        dpi
-    };
-    dpi.max(96)
-}
-
-fn scale_px(px: i32, dpi: u32) -> i32 {
-    (i64::from(px) * i64::from(dpi) / 96).max(1) as i32
-}
-
-unsafe fn create_ui_font(height: i32) -> HFONT {
-    // windows_gui/candidate.rs create_font: Microsoft YaHei UI, ClearType, default charset.
-    unsafe {
-        CreateFontW(
-            -height,
-            0,
-            0,
-            0,
-            400,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET as _,
-            OUT_DEFAULT_PRECIS as _,
-            CLIP_DEFAULT_PRECIS as _,
-            CLEARTYPE_QUALITY as _,
-            0,
-            wide("Microsoft YaHei UI").as_ptr(),
-        )
-    }
-}
-
-unsafe fn text_width(hdc: windows_sys::Win32::Graphics::Gdi::HDC, text: &str) -> i32 {
-    let units: Vec<u16> = text.encode_utf16().collect();
-    let mut size = SIZE { cx: 0, cy: 0 };
-    unsafe {
-        GetTextExtentPoint32W(hdc, units.as_ptr(), units.len() as i32, &mut size);
-    }
-    size.cx
-}
-
-unsafe fn draw_text(
-    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
-    x: i32,
-    y: i32,
-    color: u32,
-    text: &str,
-) {
-    let units: Vec<u16> = text.encode_utf16().collect();
-    unsafe {
-        SetTextColor(hdc, color);
-        TextOutW(hdc, x, y, units.as_ptr(), units.len() as i32);
-    }
+fn box_dpi(hwnd: HWND) -> u32 {
+    yiime_core::scaled_dpi(window_dpi(hwnd), ui_scale())
 }
 
 struct BarLayout {
@@ -300,13 +228,13 @@ fn store_hit_spans(view: &mut CandidateView, layout: &BarLayout, dpi: u32) {
 }
 
 fn measure_view(hwnd: HWND, view: &mut CandidateView) -> (i32, i32) {
-    let dpi = window_dpi(hwnd);
+    let dpi = box_dpi(hwnd);
     let hdc = unsafe { GetDC(hwnd) };
     if hdc.is_null() {
         return (scale_px(200, dpi), scale_px(26, dpi));
     }
-    let font = unsafe { create_ui_font(scale_px(FONT_PX, dpi)) };
-    let small = unsafe { create_ui_font(scale_px(SMALL_FONT_PX, dpi)) };
+    let font = unsafe { create_font(scale_px(FONT_PX, dpi)) };
+    let small = unsafe { create_font(scale_px(SMALL_FONT_PX, dpi)) };
     let layout = layout_bar(hdc, font, small, view, dpi);
     store_hit_spans(view, &layout, dpi);
     unsafe {
@@ -319,52 +247,6 @@ fn measure_view(hwnd: HWND, view: &mut CandidateView) -> (i32, i32) {
         ReleaseDC(hwnd, hdc);
     }
     (layout.width, layout.height)
-}
-
-fn apply_window_shape(hwnd: HWND, width: i32, height: i32) {
-    let preference = DWMWCP_ROUNDSMALL;
-    let rounded = unsafe {
-        DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
-            &preference as *const _ as _,
-            std::mem::size_of_val(&preference) as u32,
-        )
-    } >= 0;
-    if !rounded && width > 0 && height > 0 {
-        let radius = scale_px(8, window_dpi(hwnd));
-        let region = unsafe { CreateRoundRectRgn(0, 0, width, height, radius, radius) };
-        if !region.is_null() {
-            unsafe { SetWindowRgn(hwnd, region, 1) };
-        }
-    }
-}
-
-fn fill_round(
-    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
-    rect: windows_sys::Win32::Foundation::RECT,
-    color: u32,
-    radius: i32,
-) {
-    let brush = unsafe { CreateSolidBrush(color) };
-    let pen = unsafe { CreatePen(PS_SOLID, 1, color) };
-    let old_brush = unsafe { SelectObject(hdc, brush as _) };
-    let old_pen = unsafe { SelectObject(hdc, pen as _) };
-    unsafe {
-        RoundRect(
-            hdc,
-            rect.left,
-            rect.top,
-            rect.right,
-            rect.bottom,
-            radius,
-            radius,
-        )
-    };
-    unsafe { SelectObject(hdc, old_brush) };
-    unsafe { SelectObject(hdc, old_pen) };
-    unsafe { DeleteObject(brush as _) };
-    unsafe { DeleteObject(pen as _) };
 }
 
 fn log_hresult(action: &str, error: &windows::core::Error) {
@@ -961,9 +843,9 @@ fn paint_candidates(hwnd: HWND) {
         unsafe { EndPaint(hwnd, &paint) };
         return;
     };
-    let dpi = window_dpi(hwnd);
-    let font = unsafe { create_ui_font(scale_px(FONT_PX, dpi)) };
-    let small = unsafe { create_ui_font(scale_px(SMALL_FONT_PX, dpi)) };
+    let dpi = box_dpi(hwnd);
+    let font = unsafe { create_font(scale_px(FONT_PX, dpi)) };
+    let small = unsafe { create_font(scale_px(SMALL_FONT_PX, dpi)) };
     let layout = layout_bar(hdc, font, small, view, dpi);
     let old = unsafe { SelectObject(hdc, font as _) };
     let items = view.page_items();
@@ -1058,24 +940,9 @@ fn paint_candidates(hwnd: HWND) {
             "▾",
         )
     };
-    let border = unsafe { CreatePen(PS_SOLID, 1, BORDER) };
-    let empty = unsafe { GetStockObject(NULL_BRUSH) };
-    let old_pen = unsafe { SelectObject(hdc, border as _) };
-    let old_brush = unsafe { SelectObject(hdc, empty) };
+    stroke_border(hdc, client, BORDER, layout.radius);
     unsafe {
-        RoundRect(
-            hdc,
-            client.left,
-            client.top,
-            client.right,
-            client.bottom,
-            layout.radius,
-            layout.radius,
-        );
-        SelectObject(hdc, old_brush);
-        SelectObject(hdc, old_pen);
         SelectObject(hdc, old);
-        DeleteObject(border as _);
         if !font.is_null() {
             DeleteObject(font as _);
         }

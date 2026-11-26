@@ -204,6 +204,9 @@ pub(super) fn set_plain_mode(on: bool) -> bool {
 pub(super) fn page_size() -> usize {
     OPTIONS.page_size()
 }
+pub(super) fn ui_scale() -> u32 {
+    OPTIONS.ui_scale()
+}
 pub(super) fn shuangpin_scheme() -> Option<yiime_core::Shuangpin> {
     OPTIONS.shuangpin()
 }

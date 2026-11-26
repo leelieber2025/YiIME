@@ -1,6 +1,8 @@
 //! Windows candidate box, tray, settings and TSF companion process.
 use super::dictionary;
 mod candidate;
+#[path = "../../../windows/candidate_draw.rs"]
+mod candidate_draw;
 mod history;
 mod ipc;
 mod key;
@@ -22,18 +24,13 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS, HWND, LPARAM, LRESULT,
     LocalFree, POINT, RECT, SIZE, WPARAM,
 };
-use windows_sys::Win32::Graphics::Dwm::{
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUNDSMALL, DwmSetWindowAttribute,
-};
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, ClientToScreen,
-    CreateFontIndirectW, CreateFontW, CreatePen, CreateRoundRectRgn, CreateSolidBrush,
-    DEFAULT_CHARSET, DEFAULT_GUI_FONT, DT_CALCRECT, DT_EDITCONTROL, DT_NOPREFIX, DT_WORDBREAK,
+    BeginPaint, CLEARTYPE_QUALITY, COLOR_BTNFACE, ClientToScreen, CreateFontIndirectW,
+    CreateSolidBrush, DEFAULT_GUI_FONT, DT_CALCRECT, DT_EDITCONTROL, DT_NOPREFIX, DT_WORDBREAK,
     DeleteObject, DrawTextW, EndPaint, FillRect, GetDC, GetMonitorInfoW, GetStockObject,
     GetTextExtentPoint32W, GetTextMetricsW, HBRUSH, HDC, HFONT, InvalidateRect,
-    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, MonitorFromWindow, NULL_BRUSH,
-    OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, ReleaseDC, RoundRect, SelectObject, SetBkColor,
-    SetBkMode, SetTextColor, SetWindowRgn, TEXTMETRICW, TRANSPARENT, TextOutW,
+    MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, MonitorFromWindow, PAINTSTRUCT,
+    ReleaseDC, SelectObject, SetBkColor, SetBkMode, SetTextColor, TEXTMETRICW, TRANSPARENT,
 };
 use windows_sys::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
@@ -57,7 +54,7 @@ use windows_sys::Win32::UI::Controls::{
 };
 use windows_sys::Win32::UI::HiDpi::{
     AdjustWindowRectExForDpi, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem,
-    GetDpiForWindow, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
+    GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
 };
 use windows_sys::Win32::UI::Input::Ime::ImmAssociateContextEx;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -126,6 +123,7 @@ const LBL_STYLE: i32 = 248;
 const LBL_CUSTOM: i32 = 249;
 const LBL_HOTKEY: i32 = 250;
 const LBL_PAGE_SIZE: i32 = 251;
+const LBL_UI_SCALE: i32 = 254;
 const LBL_SCHEME: i32 = 252;
 const LBL_HISTORY_KEY: i32 = 253;
 const ID_OK: i32 = 1;
@@ -258,6 +256,7 @@ fn start_watchdog(hwnd: HWND, watchdog: yiime_core::Watchdog) {
 }
 const EN_CHANGE_CODE: u16 = 0x0300;
 const SETTINGS_PAGE_SIZE: i32 = 223;
+const SETTINGS_UI_SCALE: i32 = 234;
 const SETTINGS_ENGINE: i32 = 224;
 const SETTINGS_GOOGLE_KEY: i32 = 225;
 const SETTINGS_AZURE_KEY: i32 = 226;
@@ -282,16 +281,7 @@ const DRAFT_MAX_LINES: i32 = 8;
 const HINT: &str = "Enter 翻译上屏 · Shift+Enter 中文上屏 · Shift 夹英文 · Esc 取消";
 const ENGLISH_HINT: &str = "[英] 字母原样输入 · 单击 Shift 回中文 · Enter 翻译上屏";
 const PLAIN_HINT: &str = "普通五笔模式 · 空格/数字 选字上屏 · Enter 上屏字母 · Esc 取消";
-// COLORREF is 0x00BBGGRR.
-const BLUE: u32 = 0x00C0_6000;
-const MUTED: u32 = 0x0070_7070;
-const RED: u32 = 0x0000_00C0;
-const INK: u32 = 0x0020_2020;
-const HIGHLIGHT: u32 = 0x00EB_EBEB;
-const ACCENT: u32 = 0x005C_5C5C;
-const BACKGROUND: u32 = 0x00F7_F7F7;
-const BORDER: u32 = 0x00D8_D8D8;
-const SEPARATOR: u32 = 0x00E0_E0E0;
+use candidate_draw::{ACCENT, BACKGROUND, BLUE, BORDER, HIGHLIGHT, INK, MUTED, RED, SEPARATOR};
 
 /// Input-box state: composition lives in the core (`yiime_core::Composer`); this adds the
 /// candidate click areas.
