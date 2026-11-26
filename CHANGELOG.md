@@ -6,6 +6,8 @@
 
 ## [Unreleased]
 
+## [0.2.6]
+
 ### 新增
 
 - 设置里可以选择造字框大小：100%、125%、150%、175%、200%。五笔候选条和翻译框，以及框里的字，一起放大。
@@ -19,6 +21,7 @@
 - 单击 Shift 切英文时，如果字母没能上屏，编码和中/英模式都保持原样。
 - DeepInfra 只在接口明确拒绝 `reasoning_effort` 时去掉该参数再试一次。其他 400/422 错误不再把原文重发一遍。
 - 已经打开的设置窗口在保存时，只有改过「造字框大小」才会写回缩放比例。
+- 组字中只剩分隔符时单击 Shift 会结束组字再切英文；探测按键不再改变键盘的死键状态。
 
 ## [0.2.5] - 2026-11-25
 
@@ -348,6 +351,7 @@ Linux：
 - 命令行工具 `yiime`（`query` 查候选、`translate` 测试翻译），提供 tar.gz 与 .deb。
 
 [Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.5...HEAD
+[0.2.6]: https://github.com/leelieber2025/YiIME/compare/v0.2.5...HEAD
 [0.2.5]: https://github.com/leelieber2025/YiIME/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/leelieber2025/YiIME/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/leelieber2025/YiIME/compare/v0.2.2...v0.2.3

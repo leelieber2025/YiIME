@@ -62,6 +62,7 @@ pub use import::{
 pub use inline::ui as inline_ui;
 pub use inline::{
     SHIFT_TAP_MAX, ShiftTap, is_literal_in_english, is_numpad_digit, is_shift_key, literal_code,
+    shift_commit_text,
 };
 #[cfg(feature = "engine")]
 pub use keys::{

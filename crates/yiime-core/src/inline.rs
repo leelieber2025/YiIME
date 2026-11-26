@@ -58,6 +58,12 @@ pub fn literal_code(code: &str) -> Option<String> {
     (!letters.is_empty()).then_some(letters)
 }
 
+/// Letters to commit on a Shift tap that switches to English. Empty means the composition
+/// should still end: the code was empty or only `'` separators.
+pub fn shift_commit_text(code: &str) -> String {
+    literal_code(code).unwrap_or_default()
+}
+
 /// Characters typed as is in an English segment: printable characters and space
 /// (Enter/Esc/Backspace keep their usual handling).
 pub fn is_literal_in_english(ch: char) -> bool {
@@ -727,9 +733,7 @@ pub mod ui {
                     committed = text;
                 }
             }
-            if edit.auto
-                && let Some((text, _)) = first_for(&edit.code)
-            {
+            if let Some((text, _)) = edit.auto.then(|| first_for(&edit.code)).flatten() {
                 self.active = None;
                 return InlineKeyOutcome::Finish(committed + &text);
             }
@@ -845,10 +849,10 @@ pub mod ui {
             } else {
                 None
             };
-            if let Some(index) = selection
-                && let Some((text, rest)) = choice_at(index)
-            {
-                return Some(self.apply_choice(context, text, rest));
+            if let Some(index) = selection {
+                if let Some((text, rest)) = choice_at(index) {
+                    return Some(self.apply_choice(context, text, rest));
+                }
             }
             if ch == '\'' {
                 return Some(match with_separator(code, MAX_CODE_LEN) {
@@ -1076,6 +1080,9 @@ mod tests {
     fn literal_code_and_chars() {
         assert_eq!(literal_code("zhong'guo"), Some("zhongguo".to_owned()));
         assert_eq!(literal_code(""), None);
+        assert_eq!(shift_commit_text("zhong'guo"), "zhongguo");
+        assert_eq!(shift_commit_text("'"), "");
+        assert_eq!(shift_commit_text(""), "");
         assert!(is_literal_in_english(' '));
         assert!(is_literal_in_english('A'));
         assert!(is_literal_in_english(','));

@@ -278,11 +278,11 @@ impl Composer {
             }
         }
         self.set_code(input, edit.code, options, learned);
-        if edit.auto
-            && let Some(pick) = self.candidate_at(0)
-        {
-            picks.push(pick);
-            self.set_code(input, String::new(), options, learned);
+        if edit.auto {
+            if let Some(pick) = self.candidate_at(0) {
+                picks.push(pick);
+                self.set_code(input, String::new(), options, learned);
+            }
         }
         picks
     }

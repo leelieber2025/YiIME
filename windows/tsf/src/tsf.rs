@@ -1675,6 +1675,9 @@ impl TextService {
         }
         let layout = unsafe { GetKeyboardLayout(0) };
         let mut buffer = [0u16; 8];
+        // 0x4: do not change the thread keyboard state (dead keys). This is also called from
+        // OnTestKeyDown, so wFlags 0 would steal a pending dead key from the host.
+        const TOUNICODE_NO_STATE: u32 = 0x4;
         let count = unsafe {
             ToUnicodeEx(
                 vk as u32,
@@ -1682,22 +1685,11 @@ impl TextService {
                 state.as_ptr(),
                 buffer.as_mut_ptr(),
                 buffer.len() as i32,
-                0,
+                TOUNICODE_NO_STATE,
                 layout,
             )
         };
-        if count < 0 {
-            let _ = unsafe {
-                ToUnicodeEx(
-                    vk as u32,
-                    0,
-                    state.as_ptr(),
-                    buffer.as_mut_ptr(),
-                    buffer.len() as i32,
-                    0,
-                    layout,
-                )
-            };
+        if count <= 0 {
             return None;
         }
         let count = usize::try_from(count).ok()?;

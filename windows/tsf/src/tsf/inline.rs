@@ -1426,9 +1426,7 @@ impl InlineInput {
             .code(&context)
             .unwrap_or("")
             .to_owned();
-        let Some(text) = yiime_core::literal_code(&code) else {
-            return true;
-        };
+        let text = yiime_core::shift_commit_text(&code);
         let committed = self.ui.edit(&context, client_id, Action::Finish(text));
         if committed {
             let _ = self.ui.logical.borrow_mut().commit_raw(&context);
