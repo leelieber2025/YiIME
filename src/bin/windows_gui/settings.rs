@@ -1322,7 +1322,8 @@ pub(super) unsafe extern "system" fn settings_proc(
                     }
                     // Plain Wubi mode never translates, so API settings are not required. With
                     // Google selected the LLM is an optional fallback, but once a key is
-                    // entered the whole LLM configuration must be valid.
+                    // entered the whole LLM configuration must be valid. A fresh install's
+                    // default API URL with no model or key counts as unused.
                     let llm_blank = settings.llm_profiles().iter().all(LlmProfile::is_empty);
                     let api_check = if settings.keys_unreadable || (plain && llm_blank) {
                         Ok(())

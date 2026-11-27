@@ -259,8 +259,14 @@ static CACHE: Mutex<TranslationCache> = Mutex::new(TranslationCache::new());
 /// Recent translations. Each entry remembers the service that actually produced it, so a result
 /// from a fallback service is not handed out once fallback is turned off (that text came from a
 /// service the user no longer allows).
+struct CachedTranslation {
+    text: String,
+    /// Slot that produced an LLM result (`0` = 模型 1). `None` for other services.
+    llm_slot: Option<usize>,
+}
+
 struct TranslationCache {
-    entries: Vec<(CacheKey, Engine, String)>,
+    entries: Vec<(CacheKey, Engine, CachedTranslation)>,
 }
 
 impl TranslationCache {
@@ -272,21 +278,35 @@ impl TranslationCache {
 
     /// A cached result for `key`: one produced by `primary`, or by any service when
     /// `allow_fallback` is on.
-    fn get(&self, key: &CacheKey, primary: Engine, allow_fallback: bool) -> Option<&str> {
+    fn get(
+        &self,
+        key: &CacheKey,
+        primary: Engine,
+        allow_fallback: bool,
+    ) -> Option<(Engine, &CachedTranslation)> {
         self.entries
             .iter()
             .rev()
             .find(|(k, provider, _)| k == key && (allow_fallback || *provider == primary))
-            .map(|(_, _, text)| text.as_str())
+            .map(|(_, provider, hit)| (*provider, hit))
     }
 
-    fn put(&mut self, key: CacheKey, provider: Engine, text: String) {
+    fn put(&mut self, key: CacheKey, provider: Engine, text: String, llm_slot: Option<usize>) {
         self.entries
             .retain(|(k, other, _)| !(k == &key && *other == provider));
         if self.entries.len() >= CACHE_CAP {
             self.entries.remove(0);
         }
-        self.entries.push((key, provider, text));
+        self.entries
+            .push((key, provider, CachedTranslation { text, llm_slot }));
+    }
+}
+
+fn cache_hit_status(provider: Engine, llm_slot: Option<usize>) -> String {
+    if provider == Engine::Llm {
+        format!("缓存 · 模型 {}", llm_slot.unwrap_or(0) + 1)
+    } else {
+        format!("缓存 · {}", engine_status_name(provider))
     }
 }
 
@@ -338,12 +358,12 @@ pub fn translate(settings: &ApiSettings, source: &str) -> Outcome {
     let fallback = settings.allow_fallback;
     {
         let cache = CACHE.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(text) = cache.get(&key, engine, fallback) {
+        if let Some((provider, hit)) = cache.get(&key, engine, fallback) {
             return Outcome {
-                result: Ok(text.to_owned()),
+                result: Ok(hit.text.clone()),
                 attempts: Vec::new(),
                 fallback_hint: None,
-                status: None,
+                status: Some(cache_hit_status(provider, hit.llm_slot)),
             };
         }
     }
@@ -396,10 +416,12 @@ pub fn translate(settings: &ApiSettings, source: &str) -> Outcome {
         }
     };
     if let Ok(text) = &result {
-        CACHE
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .put(key, provider, text.clone());
+        CACHE.lock().unwrap_or_else(|p| p.into_inner()).put(
+            key,
+            provider,
+            text.clone(),
+            llm_slot.filter(|_| provider == Engine::Llm),
+        );
     }
     let status = result.as_ref().ok().map(|_| {
         success_status(
@@ -434,6 +456,22 @@ fn is_transient_llm_failure(fail: &Fail) -> bool {
 /// Wall-clock budget for trying the saved model list.
 const LLM_TOTAL_BUDGET: Duration = Duration::from_secs(30);
 const LLM_MIN_ATTEMPT: Duration = Duration::from_secs(4);
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LLM_TOTAL_BUDGET: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn llm_total_budget() -> Duration {
+    #[cfg(test)]
+    {
+        if let Some(budget) = TEST_LLM_TOTAL_BUDGET.with(|cell| cell.get()) {
+            return budget;
+        }
+    }
+    LLM_TOTAL_BUDGET
+}
 /// When a later ready profile exists, abandon a silent or busy model after this, not the full
 /// 20 s solo timeout — otherwise a hanging primary (e.g. DeepInfra 1017 at ~16–20 s) blocks
 /// a healthy backup.
@@ -495,7 +533,7 @@ fn run_llm(
     attempts: &mut Vec<Attempt>,
 ) -> (Result<String, String>, Option<String>, Option<usize>) {
     let profiles = settings.llm_profiles();
-    let deadline = Instant::now() + LLM_TOTAL_BUDGET;
+    let deadline = Instant::now() + llm_total_budget();
     let mut last_error: Option<Fail> = None;
     let mut tried = false;
     for (slot, profile) in profiles.iter().enumerate() {
@@ -516,7 +554,6 @@ fn run_llm(
         } else {
             LLM_TIMEOUT
         };
-        let timeout = cap.min(remaining);
         let started = Instant::now();
         let mut first_byte = None;
         let result = llm(
@@ -528,7 +565,8 @@ fn run_llm(
             &settings.custom,
             &mut first_byte,
             started,
-            timeout,
+            deadline,
+            cap,
             profile.disable_thinking,
             !has_later,
         );
@@ -634,6 +672,7 @@ fn run(
                 &settings.custom,
                 &mut first_byte,
                 started,
+                started + LLM_TIMEOUT,
                 LLM_TIMEOUT,
                 settings.disable_thinking,
                 true,
@@ -910,6 +949,7 @@ pub fn translate_openai_with(
         custom,
         &mut None,
         Instant::now(),
+        Instant::now() + LLM_TIMEOUT,
         LLM_TIMEOUT,
         disables_thinking(endpoint),
         true,
@@ -927,7 +967,8 @@ fn llm(
     custom: &str,
     first_byte: &mut Option<u128>,
     started: Instant,
-    timeout: Duration,
+    deadline: Instant,
+    cap: Duration,
     disable_thinking: bool,
     // When false (a later ready profile exists), a 429 is returned immediately so fallback can start.
     busy_retry: bool,
@@ -965,6 +1006,11 @@ fn llm(
     let post = |body: &Value| {
         let mut attempt = 0;
         loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out").into());
+            }
+            let timeout = cap.min(remaining);
             match agent
                 .post(endpoint)
                 .timeout(timeout)
@@ -975,6 +1021,10 @@ fn llm(
                     let delay = retry_after_delay(response.header("retry-after"))
                         .unwrap_or_else(|| busy_backoff(attempt))
                         .min(BUSY_RETRY_AFTER_MAX);
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if delay >= remaining {
+                        return Err(ureq::Error::Status(429, response));
+                    }
                     let _ = response.into_string();
                     if !delay.is_zero() {
                         std::thread::sleep(delay);
@@ -1250,7 +1300,7 @@ mod tests {
     /// Reads a whole HTTP request (headers and Content-Length body) and returns the body. Test
     /// servers must not reply and close before the request is read: Windows then resets the
     /// connection and the client sees a network error instead of the reply.
-    fn read_request(stream: &mut std::net::TcpStream) -> String {
+    fn read_full_request(stream: &mut std::net::TcpStream) -> String {
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
@@ -1267,12 +1317,20 @@ mod tests {
                     .and_then(|v| v.trim().parse::<usize>().ok())
                     .unwrap_or(0);
                 if data.len() >= at + 4 + length {
-                    return String::from_utf8_lossy(&data[at + 4..at + 4 + length]).into_owned();
+                    return String::from_utf8_lossy(&data[..at + 4 + length]).into_owned();
                 }
             }
             if n == 0 {
-                return String::new();
+                return String::from_utf8_lossy(&data).into_owned();
             }
+        }
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        let full = read_full_request(stream);
+        match full.split_once("\r\n\r\n") {
+            Some((_, body)) => body.to_owned(),
+            None => String::new(),
         }
     }
     #[test]
@@ -1590,6 +1648,7 @@ mod tests {
             "",
             &mut None,
             Instant::now(),
+            Instant::now() + Duration::from_millis(100),
             Duration::from_millis(100),
             false,
             true,
@@ -1804,18 +1863,25 @@ mod tests {
         let key = cache_key(&settings, "你好");
         let mut cache = TranslationCache::new();
         // Google failed and the LLM (fallback) answered.
-        cache.put(key.clone(), Engine::Llm, "Hello (LLM)".to_owned());
+        cache.put(key.clone(), Engine::Llm, "Hello (LLM)".to_owned(), Some(1));
         assert_eq!(
-            cache.get(&key, Engine::GoogleFree, true),
+            cache
+                .get(&key, Engine::GoogleFree, true)
+                .map(|(_, hit)| hit.text.as_str()),
             Some("Hello (LLM)")
         );
         // Fallback turned off: only results from the selected service count.
-        assert_eq!(cache.get(&key, Engine::GoogleFree, false), None);
-        cache.put(key.clone(), Engine::GoogleFree, "Hello".to_owned());
-        assert_eq!(cache.get(&key, Engine::GoogleFree, false), Some("Hello"));
+        assert!(cache.get(&key, Engine::GoogleFree, false).is_none());
+        cache.put(key.clone(), Engine::GoogleFree, "Hello".to_owned(), None);
+        assert_eq!(
+            cache
+                .get(&key, Engine::GoogleFree, false)
+                .map(|(_, hit)| hit.text.as_str()),
+            Some("Hello")
+        );
         // A different text or style is a different key.
         let other = cache_key(&settings, "再见");
-        assert_eq!(cache.get(&other, Engine::GoogleFree, true), None);
+        assert!(cache.get(&other, Engine::GoogleFree, true).is_none());
     }
 
     #[test]
@@ -1827,17 +1893,24 @@ mod tests {
                 cache_key(&settings, &i.to_string()),
                 Engine::Llm,
                 i.to_string(),
+                Some(0),
             );
         }
         assert_eq!(cache.entries.len(), CACHE_CAP);
-        assert_eq!(
-            cache.get(&cache_key(&settings, "0"), Engine::Llm, false),
-            None
+        assert!(
+            cache
+                .get(&cache_key(&settings, "0"), Engine::Llm, false)
+                .is_none()
         );
         let key = cache_key(&settings, "x");
-        cache.put(key.clone(), Engine::Llm, "a".to_owned());
-        cache.put(key.clone(), Engine::Llm, "b".to_owned());
-        assert_eq!(cache.get(&key, Engine::Llm, false), Some("b"));
+        cache.put(key.clone(), Engine::Llm, "a".to_owned(), Some(0));
+        cache.put(key.clone(), Engine::Llm, "b".to_owned(), Some(0));
+        assert_eq!(
+            cache
+                .get(&key, Engine::Llm, false)
+                .map(|(_, hit)| hit.text.as_str()),
+            Some("b")
+        );
         assert_eq!(
             cache.entries.iter().filter(|(k, _, _)| *k == key).count(),
             1
@@ -1889,9 +1962,10 @@ mod tests {
             .map_err(|_| "parse".to_owned())
             .and_then(|v| parse_google_free(&v));
         assert!(first.is_err());
-        assert_eq!(
-            cache.get(&cache_key(&settings, "你好世界"), Engine::GoogleFree, false),
-            None
+        assert!(
+            cache
+                .get(&cache_key(&settings, "你好世界"), Engine::GoogleFree, false)
+                .is_none()
         );
 
         let second = agent(true)
@@ -2421,5 +2495,188 @@ Connection: close
         );
         assert_eq!(handle.join().unwrap(), vec![("fast".into(), false)]);
         hang.join().unwrap();
+    }
+
+    fn with_llm_budget<T>(budget: Duration, f: impl FnOnce() -> T) -> T {
+        TEST_LLM_TOTAL_BUDGET.with(|cell| cell.set(Some(budget)));
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_LLM_TOTAL_BUDGET.with(|cell| cell.set(None));
+            }
+        }
+        let _reset = Reset;
+        f()
+    }
+
+    struct XorSealer;
+    impl crate::Sealer for XorSealer {
+        fn seal(&self, data: &[u8]) -> Option<Vec<u8>> {
+            Some(data.iter().map(|b| b ^ 0x5a).collect())
+        }
+        fn open(&self, data: &[u8]) -> Option<Vec<u8>> {
+            Some(data.iter().map(|b| b ^ 0x5a).collect())
+        }
+    }
+
+    fn auth_of(request: &str) -> Option<String> {
+        request.lines().find_map(|line| {
+            let line = line.trim();
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("authorization")
+                .then(|| value.trim().to_owned())
+        })
+    }
+
+    fn serve_one_ok() -> (String, std::thread::JoinHandle<String>) {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = server.accept().unwrap();
+            let request = read_full_request(&mut stream);
+            let reply = r#"{"choices":[{"finish_reason":"stop","message":{"content":"Hello"}}]}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            request
+        });
+        (format!("http://{addr}/v1/chat/completions"), handle)
+    }
+
+    #[test]
+    fn concurrent_reorder_does_not_send_the_other_models_key() {
+        let (url_b, handle_b) = serve_one_ok();
+        // A is only an identity; if a bad merge still put A first, this address fails fast.
+        let url_a = format!(
+            "http://127.0.0.1:1/yiime-unused-a-{}-{}/v1/chat/completions",
+            std::process::id(),
+            started_nanos()
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "yiime-key-merge-{}-{}",
+            std::process::id(),
+            started_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sealer = XorSealer;
+        let mut base = ApiSettings {
+            engine: Engine::Llm,
+            ..ApiSettings::default()
+        };
+        base.set_llm_profiles([
+            profile(&url_a, "model-a", "test-key-a", false),
+            profile(&url_b, "model-b", "test-key-b", false),
+            crate::LlmProfile::default(),
+        ]);
+        base.save(&dir, &sealer).unwrap();
+
+        let mut window1 = base.clone();
+        let mut profiles = window1.llm_profiles();
+        profiles.swap(0, 1);
+        window1.set_llm_profiles(profiles);
+        window1.save_merged(Some(&base), &dir, &sealer).unwrap();
+
+        let mut window2 = base.clone();
+        window2.key = "test-key-a-new".into();
+        let saved = window2.save_merged(Some(&base), &dir, &sealer).unwrap();
+        assert_eq!(saved.model, "model-b");
+        let same_key = saved.key == "test-key-b";
+        assert!(same_key, "profile B was given the other profile's key");
+
+        let outcome = translate(&saved, "你好");
+        assert_eq!(outcome.result.as_deref(), Ok("Hello"));
+        let request = handle_b.join().unwrap();
+        let auth = auth_of(&request);
+        let used_b = auth.as_deref() == Some("Bearer test-key-b");
+        let used_a = auth.as_deref() == Some("Bearer test-key-a")
+            || auth.as_deref() == Some("Bearer test-key-a-new");
+        assert!(used_b, "profile B did not receive its own key");
+        assert!(!used_a, "profile B received the other profile's key");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cache_hit_keeps_which_model_answered() {
+        let (url1, handle1) = model_script_server(&[BUSY]);
+        let (url2, handle2) = model_script_server(&[OK]);
+        let mut settings = ApiSettings {
+            engine: Engine::Llm,
+            ..ApiSettings::default()
+        };
+        settings.set_llm_profiles([
+            profile(&url1, "model-one", "test-key-1", false),
+            profile(&url2, "model-two", "test-key-2", false),
+            crate::LlmProfile::default(),
+        ]);
+        let first = translate(&settings, "同一段待译");
+        assert_eq!(first.result.as_deref(), Ok("Hello"));
+        assert_eq!(first.fallback_hint.as_deref(), Some("已切换到备用模型 2"));
+        assert_eq!(handle1.join().unwrap().len(), 1);
+        assert_eq!(handle2.join().unwrap().len(), 1);
+
+        let second = translate(&settings, "同一段待译");
+        assert_eq!(second.result.as_deref(), Ok("Hello"));
+        assert_eq!(second.status.as_deref(), Some("缓存 · 模型 2"));
+        assert!(second.attempts.is_empty());
+        assert!(second.fallback_hint.is_none());
+    }
+
+    fn started_nanos() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn llm_retries_stop_when_the_total_budget_runs_out() {
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        server.set_nonblocking(true).unwrap();
+        let addr = server.local_addr().unwrap();
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen_thread = seen.clone();
+        let handle = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                match server.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let _ = read_request(&mut stream);
+                        seen_thread.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let reply = r#"{"error":{"message":"busy","code":"engine_overloaded"}}"#;
+                        let resp = format!(
+                            "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 5\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                            reply.len()
+                        );
+                        let _ = stream.write_all(resp.as_bytes());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let url = format!("http://{addr}/v1/chat/completions");
+        let settings = llm_settings(&url, "only");
+        let started = Instant::now();
+        let outcome = with_llm_budget(Duration::from_millis(600), || translate(&settings, "你好"));
+        let elapsed = started.elapsed();
+        assert!(outcome.result.is_err());
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "translation ran past the total budget: {elapsed:?}"
+        );
+        handle.join().unwrap();
+        let seen = seen.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            seen <= 2,
+            "kept retrying after the budget ended ({seen} requests)"
+        );
     }
 }

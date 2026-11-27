@@ -334,7 +334,11 @@ pub struct LlmProfile {
 
 impl LlmProfile {
     pub fn is_empty(&self) -> bool {
-        self.url.trim().is_empty() && self.model.trim().is_empty() && self.key.trim().is_empty()
+        // The default OpenAI URL is a placeholder in a fresh install. With no model or key it
+        // is not a configured profile, so other settings can be saved without filling those in.
+        self.model.trim().is_empty()
+            && self.key.trim().is_empty()
+            && (self.url.trim().is_empty() || self.url.trim() == DEFAULT_URL)
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
@@ -503,12 +507,40 @@ fn open_key_bundle(blob: &serde_json::Value, sealer: &dyn Sealer) -> Option<[Str
     let bytes = serde_json::from_value::<Vec<u8>>(blob.clone()).ok()?;
     let value: serde_json::Value = serde_json::from_slice(&sealer.open(&bytes)?).ok()?;
     let arr = value.as_array()?;
-    // 4-element bundles from 0.2.5 and earlier are the primary LLM key plus the other services.
-    if arr.len() < 4 {
+    // Legacy 0.2.5 bundles have exactly four strings; current bundles have six. Wrong lengths
+    // or a non-string entry (null / number / object) are unreadable, so a later save will not
+    // invent empty keys and overwrite the original ciphertext.
+    if arr.len() != 4 && arr.len() != 6 {
+        return None;
+    }
+    if !arr.iter().all(|item| item.is_string()) {
         return None;
     }
     let at = |i: usize| arr.get(i).and_then(|v| v.as_str()).unwrap_or("").to_owned();
     Some([at(0), at(1), at(2), at(3), at(4), at(5)])
+}
+
+/// Primary and backup LLM URLs as stored on disk (top-level `url`, then `llm_models`).
+fn llm_urls_from_value(value: &serde_json::Value) -> [String; LLM_PROFILE_COUNT] {
+    let mut urls = [
+        value["url"].as_str().unwrap_or("").to_owned(),
+        String::new(),
+        String::new(),
+    ];
+    let Some(arr) = value.get("llm_models").and_then(|v| v.as_array()) else {
+        return urls;
+    };
+    for (i, item) in arr.iter().take(LLM_PROFILE_COUNT).enumerate() {
+        if !item.is_object() {
+            continue;
+        }
+        if let Some(url) = item.get("url").and_then(|v| v.as_str()) {
+            urls[i] = url.to_owned();
+        } else if i > 0 {
+            urls[i].clear();
+        }
+    }
+    urls
 }
 
 fn thinking_flag(value: &serde_json::Value, url: &str, key: &str) -> bool {
@@ -670,6 +702,97 @@ impl ApiSettings {
         self.set_llm_profiles(loaded);
     }
 
+    /// (url, model) identity of a configured profile. Unused slots do not match each other.
+    fn llm_identity(profile: &LlmProfile) -> Option<(String, String)> {
+        if profile.is_empty() {
+            None
+        } else {
+            Some((
+                profile.url.trim().to_owned(),
+                profile.model.trim().to_owned(),
+            ))
+        }
+    }
+
+    fn pick_profile_field(cur: &str, orig: &str, on_disk: &str) -> String {
+        if cur == orig {
+            on_disk.to_owned()
+        } else {
+            cur.to_owned()
+        }
+    }
+
+    fn merge_one_profile(cur: &LlmProfile, orig: &LlmProfile, on_disk: &LlmProfile) -> LlmProfile {
+        LlmProfile {
+            url: Self::pick_profile_field(&cur.url, &orig.url, &on_disk.url),
+            model: Self::pick_profile_field(&cur.model, &orig.model, &on_disk.model),
+            key: Self::pick_profile_field(&cur.key, &orig.key, &on_disk.key),
+            disable_thinking: if cur.disable_thinking == orig.disable_thinking {
+                on_disk.disable_thinking
+            } else {
+                cur.disable_thinking
+            },
+        }
+    }
+
+    /// Merge dialog edits with a concurrent save. `url` / `model` / `key` stay together: a key
+    /// typed in one window is applied to the same (url, model) on disk, even if the other window
+    /// reordered the list, instead of being written into a different slot.
+    fn merge_llm_profiles(
+        base: &[LlmProfile; LLM_PROFILE_COUNT],
+        current: &[LlmProfile; LLM_PROFILE_COUNT],
+        disk: &[LlmProfile; LLM_PROFILE_COUNT],
+    ) -> [LlmProfile; LLM_PROFILE_COUNT] {
+        if current == base {
+            return disk.clone();
+        }
+        if disk == base {
+            return current.clone();
+        }
+        let ids = |profiles: &[LlmProfile; LLM_PROFILE_COUNT]| {
+            [
+                Self::llm_identity(&profiles[0]),
+                Self::llm_identity(&profiles[1]),
+                Self::llm_identity(&profiles[2]),
+            ]
+        };
+        let this_reordered = ids(current) != ids(base);
+        let mut result = if this_reordered {
+            current.clone()
+        } else {
+            disk.clone()
+        };
+        for i in 0..LLM_PROFILE_COUNT {
+            let orig = &base[i];
+            let cur = &current[i];
+            if !this_reordered && cur == orig {
+                continue;
+            }
+            let Some(orig_id) = Self::llm_identity(orig) else {
+                continue;
+            };
+            let disk_prof = disk
+                .iter()
+                .find(|profile| Self::llm_identity(profile).as_ref() == Some(&orig_id));
+            let cur_prof = current
+                .iter()
+                .find(|profile| Self::llm_identity(profile).as_ref() == Some(&orig_id))
+                .unwrap_or(cur);
+            let Some(slot) = result
+                .iter()
+                .position(|profile| Self::llm_identity(profile).as_ref() == Some(&orig_id))
+            else {
+                // The other window replaced this identity; do not attach this window's key to a
+                // different profile.
+                continue;
+            };
+            if let Some(on_disk) = disk_prof {
+                result[slot] = Self::merge_one_profile(cur_prof, orig, on_disk);
+            }
+        }
+        result
+    }
+
     pub fn save(&self, dir: &Path, sealer: &dyn Sealer) -> std::io::Result<()> {
         self.save_merged(None, dir, sealer).map(|_| ())
     }
@@ -713,17 +836,11 @@ impl ApiSettings {
                         cur.clone()
                     }
                 };
-                let pick_profile =
-                    |cur: &LlmProfile, orig: &LlmProfile, on_disk: &LlmProfile| LlmProfile {
-                        url: pick_str(&cur.url, &orig.url, &on_disk.url),
-                        model: pick_str(&cur.model, &orig.model, &on_disk.model),
-                        key: pick_str(&cur.key, &orig.key, &on_disk.key),
-                        disable_thinking: if cur.disable_thinking == orig.disable_thinking {
-                            on_disk.disable_thinking
-                        } else {
-                            cur.disable_thinking
-                        },
-                    };
+                let profiles = Self::merge_llm_profiles(
+                    &base.llm_profiles(),
+                    &self.llm_profiles(),
+                    &disk.llm_profiles(),
+                );
                 Self {
                     engine: if self.engine == base.engine && !disk.unknown_engine {
                         disk.engine
@@ -735,26 +852,11 @@ impl ApiSettings {
                     } else {
                         self.allow_fallback
                     },
-                    url: pick_str(&self.url, &base.url, &disk.url),
-                    model: pick_str(&self.model, &base.model, &disk.model),
-                    key: pick_str(&self.key, &base.key, &disk.key),
-                    disable_thinking: if self.disable_thinking == base.disable_thinking {
-                        disk.disable_thinking
-                    } else {
-                        self.disable_thinking
-                    },
-                    backup_llm: [
-                        pick_profile(
-                            &self.backup_llm[0],
-                            &base.backup_llm[0],
-                            &disk.backup_llm[0],
-                        ),
-                        pick_profile(
-                            &self.backup_llm[1],
-                            &base.backup_llm[1],
-                            &disk.backup_llm[1],
-                        ),
-                    ],
+                    url: profiles[0].url.clone(),
+                    model: profiles[0].model.clone(),
+                    key: profiles[0].key.clone(),
+                    disable_thinking: profiles[0].disable_thinking,
+                    backup_llm: [profiles[1].clone(), profiles[2].clone()],
                     style: if self.style == base.style {
                         disk.style
                     } else {
@@ -824,8 +926,12 @@ impl ApiSettings {
                 ]
                 .iter()
                 .any(|k| !k.is_empty())
-                    || old["url"].as_str() != Some(merged.url.as_str())
-                    || merged.backup_llm.iter().any(|p| !p.url.trim().is_empty())
+                    || llm_urls_from_value(&old)
+                        != [
+                            merged.url.clone(),
+                            merged.backup_llm[0].url.clone(),
+                            merged.backup_llm[1].url.clone(),
+                        ]
                 {
                     return Err(std::io::Error::other(
                         "原密钥暂时无法解密，已保留原设置；请恢复密钥后再更改密钥或 API 地址",
@@ -1450,5 +1556,232 @@ mod tests {
         assert_eq!(llm_backup_hint(0), None);
         assert_eq!(llm_backup_hint(1).as_deref(), Some("已切换到备用模型 2"));
         assert_eq!(llm_backup_hint(2).as_deref(), Some("已切换到备用模型 3"));
+    }
+
+    /// Same check the settings window uses before writing API settings and other options.
+    fn dialog_api_check(settings: &ApiSettings, plain: bool) -> Result<(), &'static str> {
+        let llm_blank = settings.llm_profiles().iter().all(LlmProfile::is_empty);
+        if settings.keys_unreadable || (plain && llm_blank) {
+            Ok(())
+        } else if settings.engine != Engine::Llm && !llm_blank {
+            settings.validate().and_then(|_| settings.validate_llm())
+        } else {
+            settings.validate()
+        }
+    }
+
+    #[test]
+    fn placeholder_openai_url_is_unused_so_other_settings_can_be_saved() {
+        // Fresh install: default OpenAI URL, empty model/key. Choosing free Google and changing
+        // only an unrelated option (candidate page size is stored separately) must still save.
+        let mut settings = ApiSettings::default();
+        assert_eq!(settings.url, DEFAULT_URL);
+        assert!(settings.model.is_empty() && settings.key.is_empty());
+        assert!(settings.llm_profiles()[0].is_empty());
+        assert!(settings.llm_profiles().iter().all(LlmProfile::is_empty));
+        settings.engine = Engine::GoogleFree;
+        assert!(dialog_api_check(&settings, false).is_ok());
+        assert!(settings.validate().is_ok());
+        assert!(settings.validate_llm().is_err());
+
+        // A half-filled profile (URL plus model, no key) is still a configuration error.
+        settings.url = DEFAULT_URL.to_owned();
+        settings.model = "gpt-4o-mini".into();
+        assert!(!settings.llm_profiles()[0].is_empty());
+        assert!(dialog_api_check(&settings, false).is_err());
+
+        // A custom URL with no model or key is also not an unused slot.
+        let custom = LlmProfile {
+            url: "https://example.com/v1".into(),
+            ..LlmProfile::default()
+        };
+        assert!(!custom.is_empty());
+        assert!(custom.validate().is_err());
+    }
+
+    fn sample_profile(url: &str, model: &str, key: &str) -> LlmProfile {
+        LlmProfile {
+            url: url.to_owned(),
+            model: model.to_owned(),
+            key: key.to_owned(),
+            disable_thinking: false,
+        }
+    }
+
+    #[test]
+    fn save_merged_keeps_key_with_the_same_model_after_a_concurrent_reorder() {
+        let (dir, sealer) = xor_dir("llm-merge-reorder");
+        let mut base = ApiSettings {
+            engine: Engine::Llm,
+            ..ApiSettings::default()
+        };
+        base.set_llm_profiles([
+            sample_profile("https://a.example/v1", "model-a", "test-key-a"),
+            sample_profile("https://b.example/v1", "model-b", "test-key-b"),
+            LlmProfile::default(),
+        ]);
+        base.save(&dir, &sealer).unwrap();
+
+        // Window 1 moves B first and saves.
+        let mut window1 = base.clone();
+        let mut profiles = window1.llm_profiles();
+        profiles.swap(0, 1);
+        window1.set_llm_profiles(profiles);
+        window1.save_merged(Some(&base), &dir, &sealer).unwrap();
+
+        // Window 2 still shows A, B and only updates A's key.
+        let mut window2 = base.clone();
+        window2.key = "test-key-a-new".into();
+        let saved = window2.save_merged(Some(&base), &dir, &sealer).unwrap();
+        let loaded = ApiSettings::load(&dir, &sealer);
+        assert_eq!(saved, loaded);
+        let profiles = loaded.llm_profiles();
+        assert_eq!(profiles[0].url, "https://b.example/v1");
+        assert_eq!(profiles[0].model, "model-b");
+        assert_eq!(profiles[0].key, "test-key-b");
+        assert_eq!(profiles[1].url, "https://a.example/v1");
+        assert_eq!(profiles[1].model, "model-a");
+        assert_eq!(profiles[1].key, "test-key-a-new");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct LockedSealer;
+    impl Sealer for LockedSealer {
+        fn seal(&self, _: &[u8]) -> Option<Vec<u8>> {
+            None
+        }
+        fn open(&self, _: &[u8]) -> Option<Vec<u8>> {
+            None
+        }
+    }
+
+    fn sealed_keys_value(dir: &std::path::Path) -> serde_json::Value {
+        let raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join(SETTINGS_FILE)).unwrap()).unwrap();
+        raw.get("sealed_keys")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    fn overwrite_sealed_bundle(
+        dir: &std::path::Path,
+        sealer: &dyn Sealer,
+        keys: serde_json::Value,
+    ) {
+        let mut raw: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join(SETTINGS_FILE)).unwrap()).unwrap();
+        let sealed = sealer.seal(&serde_json::to_vec(&keys).unwrap()).unwrap();
+        raw.as_object_mut()
+            .unwrap()
+            .insert("sealed_keys".into(), serde_json::to_value(sealed).unwrap());
+        std::fs::write(dir.join(SETTINGS_FILE), serde_json::to_vec(&raw).unwrap()).unwrap();
+    }
+
+    fn settings_with_backups() -> ApiSettings {
+        let mut settings = ApiSettings {
+            engine: Engine::Llm,
+            url: "https://a.example/v1".into(),
+            model: "model-a".into(),
+            key: "test-key-a".into(),
+            custom: "old-style".into(),
+            ..ApiSettings::default()
+        };
+        settings.backup_llm = [
+            sample_profile("https://b.example/v1", "model-b", "test-key-b"),
+            sample_profile("https://c.example/v1", "model-c", "test-key-c"),
+        ];
+        settings
+    }
+
+    #[test]
+    fn decrypt_failure_with_backup_urls_still_saves_unrelated_settings() {
+        let (dir, sealer) = xor_dir("decrypt-backup-urls");
+        let original = settings_with_backups();
+        original.save(&dir, &sealer).unwrap();
+        let ciphertext = sealed_keys_value(&dir);
+
+        let mut draft = ApiSettings::load(&dir, &LockedSealer);
+        assert!(draft.keys_unreadable);
+        assert_eq!(draft.backup_llm[0].url, "https://b.example/v1");
+        assert_eq!(draft.backup_llm[1].url, "https://c.example/v1");
+        draft.custom = "new-style".into();
+        draft.save(&dir, &LockedSealer).unwrap();
+        assert_eq!(sealed_keys_value(&dir), ciphertext);
+        let roundtrip = ApiSettings::load(&dir, &sealer);
+        assert_eq!(roundtrip.key, original.key);
+        assert_eq!(roundtrip.backup_llm[0].key, original.backup_llm[0].key);
+        assert_eq!(roundtrip.backup_llm[1].key, original.backup_llm[1].key);
+        assert_eq!(roundtrip.custom, "new-style");
+
+        let mut draft = ApiSettings::load(&dir, &LockedSealer);
+        draft.backup_llm[0].url = "https://other.example/v1".into();
+        assert!(draft.save(&dir, &LockedSealer).is_err());
+        assert_eq!(sealed_keys_value(&dir), ciphertext);
+
+        let mut draft = ApiSettings::load(&dir, &LockedSealer);
+        draft.url.push_str("/changed");
+        assert!(draft.save(&dir, &LockedSealer).is_err());
+        assert_eq!(sealed_keys_value(&dir), ciphertext);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn four_and_six_string_key_bundles_are_readable() {
+        let (dir, sealer) = xor_dir("bundle-4-6");
+        settings_with_backups().save(&dir, &sealer).unwrap();
+
+        overwrite_sealed_bundle(
+            &dir,
+            &sealer,
+            serde_json::json!(["k-llm", "k-google", "k-azure", "k-deepl"]),
+        );
+        let four = ApiSettings::load(&dir, &sealer);
+        assert!(!four.keys_unreadable);
+        assert_eq!(four.key, "k-llm");
+        assert_eq!(four.google_key, "k-google");
+        assert_eq!(four.azure_key, "k-azure");
+        assert_eq!(four.deepl_key, "k-deepl");
+        assert!(four.backup_llm[0].key.is_empty());
+        assert!(four.backup_llm[1].key.is_empty());
+
+        overwrite_sealed_bundle(
+            &dir,
+            &sealer,
+            serde_json::json!(["k0", "g", "a", "d", "b1", "b2"]),
+        );
+        let six = ApiSettings::load(&dir, &sealer);
+        assert!(!six.keys_unreadable);
+        assert_eq!(six.key, "k0");
+        assert_eq!(six.google_key, "g");
+        assert_eq!(six.azure_key, "a");
+        assert_eq!(six.deepl_key, "d");
+        assert_eq!(six.backup_llm[0].key, "b1");
+        assert_eq!(six.backup_llm[1].key, "b2");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn malformed_key_bundles_stay_unreadable_and_are_not_overwritten() {
+        for (name, bundle) in [
+            (
+                "five",
+                serde_json::json!(["k-llm", "k-google", "k-azure", "k-deepl", "k-extra"]),
+            ),
+            (
+                "null",
+                serde_json::json!(["k-llm", null, "k-azure", "k-deepl"]),
+            ),
+        ] {
+            let (dir, sealer) = xor_dir(&format!("bundle-bad-{name}"));
+            settings_with_backups().save(&dir, &sealer).unwrap();
+            overwrite_sealed_bundle(&dir, &sealer, bundle);
+            let ciphertext = sealed_keys_value(&dir);
+            let mut draft = ApiSettings::load(&dir, &sealer);
+            assert!(draft.keys_unreadable, "{name} bundle should be unreadable");
+            draft.custom = "unrelated".into();
+            draft.save(&dir, &sealer).unwrap();
+            assert_eq!(sealed_keys_value(&dir), ciphertext);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
