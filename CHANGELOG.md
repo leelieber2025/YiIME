@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+## [0.2.7] - 2026-11-27
+
+**升级后请重启电脑。**
+
 ### 修复
 
 - 新安装后不必先填大模型，也可以保存造字框大小等其他设置。
@@ -365,7 +369,8 @@ Linux：
 
 - 命令行工具 `yiime`（`query` 查候选、`translate` 测试翻译），提供 tar.gz 与 .deb。
 
-[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.6...HEAD
+[Unreleased]: https://github.com/leelieber2025/YiIME/compare/v0.2.7...HEAD
+[0.2.7]: https://github.com/leelieber2025/YiIME/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/leelieber2025/YiIME/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/leelieber2025/YiIME/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/leelieber2025/YiIME/compare/v0.2.3...v0.2.4
